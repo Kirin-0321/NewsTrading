@@ -1,20 +1,10 @@
-# 项目代码 Review 报告（第二轮）
-
-> 注：第三轮 review 见 chat 记录；2026-05-22 P0 清理已完成（详见 `架构方案.md` Step 8）。
-> 清理小结：
-> - 🟠 H1/H2/H3/H5 全部修复
-> - 🟡 M1/M3 全部修复
-> - 仅剩 P1/P2 待办（见第三轮 review）
-
----
-
-
+# 项目代码 Review 报告（第三轮）
 
 > 评审者: 辉夜  
-> 评审时间: 2026-05-22  
-> 项目: A股新闻爬虫与 AI 分析系统 (`d:\爬虫`)  
-> 评审范围: 全量代码扫描（架构 / 代码 / 安全 / 性能 / 维护性）  
-> 代码规模: **35** 个 Python 文件，约 **9,291** 行  
+> 评审时间: 2026-05-23  
+> 项目: A股新闻爬虫与 AI 分析系统 (`e:\NewsTrading`)  
+> 评审范围: 全量代码 + `.huiye` 架构文档 + Git 追踪面  
+> 代码规模: **44** 个 Python 文件（不含 `.huiye` 调试脚本），约 **9,463** 行  
 
 ---
 
@@ -22,193 +12,173 @@
 
 | 等级 | 数量 | 说明 |
 |------|------|------|
-| 🔴 严重 (Critical) | 0 | 上一轮密钥泄漏问题已修复 |
-| 🟠 高危 (High) | 4 | 增量逻辑、命名误导、调度器、文档 |
-| 🟡 中危 (Medium) | 8 | 日志、注释不一致、性能、依赖 |
-| 🟢 建议 (Low) | 10 | 结构优化、测试、打包 |
+| 🔴 严重 (Critical) | 0 | 密钥未进 Git；增量逻辑已走 SQLite `published_ts` |
+| 🟠 高危 (High) | 3 | README/旧文档严重脱节；`schedule_tasks.json` 被 Git 追踪；零测试 |
+| 🟡 中危 (Medium) | 6 | print 日志、页面 eager load、Agent 未落地、裸 except 残留等 |
+| 🟢 建议 (Low) | 8 | 懒加载、文档索引、LICENSE 缺失等 |
 
-**与上轮对比**：C1/C2/C3、H1/H2/H3 均已修复；H6 部分重构；死代码 `analyze_news_impact.py` 已删除；Git 历史已重建且初始提交不含真实密钥。
-
-**当前最大风险**：`get_latest_news_from_db()` 用**文件修改时间**而非**新闻时间**判断增量边界，可能导致增量爬取漏采或重复采。
+**与第二轮对比**：P0 架构重构 **已完成**——`workflows/`、`db_helper`、JSON 主存储、双调度器、H1 增量 mtime 问题均已消除。当前主要债务是 **文档与 README 未同步**，以及 **工程化（测试/日志/Agent）** 缺口。
 
 ---
 
-## ✅ 已修复（上轮 → 本轮）
+## ✅ 已修复 / 已落地（第二轮 → 第三轮）
 
 | 编号 | 问题 | 现状 |
 |------|------|------|
-| C1 | API Key 泄漏到 Git | 历史重建；`git ls-files` 仅追踪 `ai_config.example.json` |
-| C2 | `.gitignore` 缺 config | 已加 `config/ai_config.json`、`.env` |
-| C3 | `get_default_config()` 重复 key | 已合并为单一 `prompt_templates` |
-| H1 | 硬编码 `F:\爬虫` | 已改为相对项目根目录 |
-| H2 | `headless` 参数无效 | 已传入 `fetch_page_with_scroll` / `crawl` |
-| H3 | `CrawlerWorker.stop()` 暴力 terminate | 已改为协作式 `request_stop()` + `driver.quit()` |
-| H6 | AI 调用 5 份重复代码 | `AINewsAnalyzer._stream_chat` / `NewsCleaner._call_provider` 已统一 |
-| M4 | `_load_workflow` 只认直接父类 | 已改为 `issubclass(item, WorkflowBase)` |
-| L4 | `analyze_news_impact.py` 死代码 | 已删除 |
+| H1 | 增量边界用文件 mtime | `RawStore.get_latest_news()` → `ORDER BY published_ts DESC` |
+| H2 | db_helper 命名误导 | 已删除；`services/storage/raw_store.py` |
+| H3 | 双调度器重叠 | 仅 `SchedulerService` + `scheduled_runner` |
+| H6 | AI 调用重复 | `_stream_chat` / `_call_provider` 统一 |
+| — | workflows 假编排 | 目录已删；三段式 `crawl_sync` / `clean_sync` / `analyze` |
+| M1 | data_page 去重注释错误 | 已无「10 分钟 + 80%」残留 |
+| M8 | sqlalchemy 未使用 | 已从 `requirements.txt` 移除 |
+| — | 存储层 | SQLite `data/news.db`（gitignore）；7218+ 条已迁移 |
 
-新增改进：`core/env_loader.py` 支持 `.env` 优先读取密钥；`db_helper.py` 顶部已注明「非 SQLite」。
+**新增能力（第三轮可见）**：
+- 题材预测库 `theme_predictions` + GUI「预测题材」页
+- 清洗标准 v1.4 + DeepSeek V4 分流（分析 v4-pro / 清洗 v4-flash）
+- 定时任务支持 `interval_hours` 与 `crawl_sync` 后自动 `clean_sync`
+- `agent/__init__.py` 导出 `crawl_sync` / `clean_sync` / `analyze_news` 函数级 API（非 MCP）
 
 ---
 
 ## 🟠 High（高危）
 
-### H1. `get_latest_news_from_db()` 增量边界逻辑有误
+### H1. README 与真实项目严重脱节 — **已修复（2026-05-23）**
 
-**位置**: `core/db_helper.py:32-43`
+已重写 `README.md`：启动脚本、依赖文件、SQLite 架构、`services/` 流水线、定时任务格式、`.env` 配置等与代码一致。仍缺独立 `LICENSE` 文件（README 已不再声称 MIT）。
 
-```python
-latest_file = max(files, key=os.path.getmtime)  # ← 按文件 mtime，不是新闻时间
-latest_news = news_list[0]                       # ← 假设第一条最新
-```
+### H2. `doc/` 大量文档仍描述已删除的 workflows
 
-**问题**:
-- 增量文件名如 `05-22-09——05-22-11.json` 的 mtime 不一定代表「最新新闻」
-- 合并/编辑旧文件会改变 mtime，导致增量起点错误
-- 自动停止可能过早结束或重复爬大量历史
+`doc/features/任务流*.md`、`doc/guides` 部分章节仍引用 `workflows/`、`WorkflowEngine`。代码已变，文档成为**主动误导**。
 
-**建议**: 遍历所有 `data/raw/*.json`，用 `parse_news_time()` 取全局最新一条。
+### H3. 零自动化测试
 
-### H2. `db_helper` 命名仍严重误导
-
-文件注释已说明「非 SQLite」，但函数名仍是 `get_latest_news_from_db` / `load_all_db_news` / `deduplicate_with_db`；README 仍写 SQLAlchemy；`requirements.txt` 仍含 `sqlalchemy>=2.0.0` 但代码零引用。
-
-**建议**: 重命名为 `news_storage.py` 或真正引入 SQLite 索引层。
-
-### H3. 双调度器职责重叠
-
-- `SchedulerService`（GUI 定时爬虫）：有 `start()` / `stop()`，1 秒轮询
-- `WorkflowEngine.start_interval_schedule()`：`while True` 永真循环，无 stop，60 秒轮询
-
-两者共用 `schedule` 库的全局 job 表，混用易出现任务重复或无法停止。
-
-### H4. README 与项目现状严重脱节
-
-| README 写法 | 实际 |
-|-------------|------|
-| `start.bat` / `install_pyqt.bat` | `启动.bat` / `install.bat` |
-| `requirements_pyqt.txt` | `requirements.txt` |
-| `F:\爬虫/` 目录结构 | 项目在 `D:\爬虫` |
-| SQLAlchemy + SQLite | 纯 JSON 文件存储 |
-| 多种调度模式 | 后端仅 `every().day.at()` |
-
-新用户按 README 操作会直接失败。
+`parse_news_time`、去重、增量截断、`ThemeExtractor` JSON 修复、清洗 `_parse_decisions` 兜底等核心逻辑均无 `tests/`。重构后风险靠人工点 GUI，不可接受（辉夜强迫症发作）。
 
 ---
 
 ## 🟡 Medium（中危）
 
-### M1. 语义去重参数注释仍不一致
+### M1. `core/` 仍以 `print()` 为主（约 60+ 处）
 
-- `semantic_dedup.py` / `news_cleaner.py` / `data_merger.py`：已统一为 **30 分钟 + 50%**
-- `gui/pages/data_page.py:376` 注释仍写「**10 分钟 + 80%**」，实际调用 `default_deduplicator`
+`news_crawler_scroll.py` 占大头。打包 EXE 无控制台时日志丢失；与 `SchedulerService` 的 logging 体系割裂。
 
-用户按 GUI 注释理解会与真实行为不符。
+### M2. `MainWindow` 启动时同步创建 7 个 Page
 
-### M2. 裸 `except:` 仍有多处（约 15 处）
+`DataPage` 等可能在 `__init__` 扫库/扫盘，拖慢冷启动。建议 `QStackedWidget` 懒加载。
 
-会吞掉 `KeyboardInterrupt`，调试困难。重灾区：`news_crawler_scroll.py`、`db_helper.py`、`semantic_dedup.py`、`crawler_worker.py:221`。
+### M3. Agent 仅函数导出，无 MCP Server
 
-### M3. `core/` 大量使用 `print()` 而非 logging
+`agent/__init__.py` 有 `crawl_sync` 等，但 `架构方案.md` Step 6 `mcp_server.py` 仍为 ⏳。外部 Agent 无法标准接入。
 
-`workflows/base.py` 已有 logging 体系，但 `news_crawler_scroll.py`（81 处 print）等未接入。打包 EXE 无控制台时日志丢失。
+### M4. 裸 `except:` 残留 3 处
 
-### M4. `MainWindow` 启动时同步创建 6 个 Page
+`gui/pages/export_page.py`（2）、`core/news_exporter.py`（1）。会吞 `KeyboardInterrupt`。
 
-`DataPage` 等会在 init 时扫磁盘，拖慢冷启动。建议懒加载。
+### M5. `AIConfig` 模块级单例 + GUI 明文写 Key
 
-### M5. `EnhancedNewsFlow.execute()` 与父类大量重复
+`ai_config = AIConfig()` import 即读盘；`set_api_key` 仍写 `config/ai_config.json`。`.env` 优先已做，但 GUI 保存路径仍有本地泄漏面。
 
-虽已继承 `DailyNewsFlow`，但 `execute()` 几乎完整复制 4 步流程，仅多 `_run_merger`。应改为 `super().execute()` 中间插入合并，或模板方法模式。
+### M6. `data/schedule_tasks.json` 被 Git 追踪
 
-### M6. `AIConfig` 模块级单例
+含个人任务名、`last_run`、调度间隔。应改为 `schedule_tasks.example.json` + gitignore 实文件。
 
-`core/ai_config.py` 末尾 `ai_config = AIConfig()`，import 即读盘写盘；配置损坏时 fallback 可能覆盖用户配置。
+### M7. 题材表 v2 迁移 = DROP 重建
 
-### M7. `set_api_key()` 仍明文写入 JSON
-
-环境变量优先读取已实现，但 GUI 保存 Key 时仍会落盘到 `config/ai_config.json`。本地使用可接受，分享/备份时有泄漏风险。
-
-### M8. `requirements.txt` 含未使用依赖
-
-`sqlalchemy>=2.0.0` 无任何 import，增加安装体积与误导。
+`database.py::_migrate_theme_tables_v2()` schema 不一致时清空三张表。设计合理但需在 UI/文档标明「升级丢历史题材」。
 
 ---
 
 ## 🟢 Low（建议）
 
-| # | 问题 | 位置 |
-|---|------|------|
-| L1 | 缺少 `core/__init__.py`，靠 `sys.path` 注入 | `core/` |
-| L2 | 打包路径逻辑分散在 `main.py`、`main_window.py`、`news_crawler_scroll.py` | 多处 `sys.frozen` |
-| L3 | `data/schedule_tasks.json` 被 git 追踪（含个人任务配置） | `data/` |
-| L4 | `chrome-win64/` 体积大，未在 `.gitignore`（若需分发应文档说明） | 根目录 |
-| L5 | 无 `tests/`、无 pytest、无 CI | 全项目 |
-| L6 | Windows 控制台 emoji 可能 UnicodeEncodeError | 多处 print |
-| L7 | `tools/` 脚本非正式测试，且与主流程耦合 | `tools/` |
-| L8 | 文档极多（`doc/` 60+ 文件）但与 README 不同步 | `doc/` vs `README.md` |
-| L9 | 增量文件命名规则多样（`05-22.json` vs `05-22-09——05-22-11.json` vs `*_new.json`） | `data/raw/` |
-| L10 | `WorkflowEngine` 与 GUI 定时任务 UI 能力不对等 | `schedule_page.py` |
+| # | 问题 |
+|---|------|
+| L1 | 缺少 `core/__init__.py`，依赖 `sys.path.insert` |
+| L2 | 打包路径逻辑分散（`main.py` / `main_window.py` / crawler） |
+| L3 | `chrome-win64/` 体积大，需在 README 说明分发方式 |
+| L4 | `tools/` 为手工脚本，非 pytest |
+| L5 | `.huiye/_debug_*` 调试产物可考虑 gitignore |
+| L6 | Windows 控制台 emoji 可能 `UnicodeEncodeError` |
+| L7 | `news_exporter.py` 与 ExportPage 功能重叠（架构方案已标注评估） |
+| L8 | 无 `pyproject.toml` / ruff / mypy，代码风格靠自觉 |
 
 ---
 
-## 📐 架构评价
+## 📐 架构评价（第三轮）
+
+### 当前数据流（准确版）
+
+```mermaid
+flowchart TB
+    subgraph trigger [触发]
+        GUI[PyQt5 GUI]
+        SCH[SchedulerService]
+        AG[agent 函数 API]
+    end
+
+    subgraph services [services 层]
+        CS[crawl_sync_service]
+        CLS[clean_sync_service]
+        AS[analysis_service]
+        SR[scheduled_runner]
+    end
+
+    subgraph storage [SQLite data/news.db]
+        RAW[(raw_news)]
+        CUR[(curated_news)]
+        REJ[(rejected_news)]
+        THM[(theme_predictions)]
+    end
+
+    subgraph core [core 底层]
+        CR[news_crawler_scroll]
+        CL[news_cleaner]
+        AI[ai_news_analyzer]
+        TE[theme_extractor]
+    end
+
+    GUI --> CS & CLS & AS
+    SCH --> SR --> CS & CLS & AS
+    AG --> CS & CLS & AS
+
+    CS --> CR
+    CS --> RAW
+    CLS --> CL
+    CLS --> CUR & REJ
+    AS --> AI
+    AS --> TE
+    AS --> THM
+    RAW --> CLS
+    CUR --> AS
+```
 
 ### 优点
 
-1. **三层分离清晰**：`gui/` ↔ `core/` ↔ `workflows/`
-2. **PyQt5 + QThread + Signal** 后台任务模式正确
-3. **WorkflowBase** 抽象合理（logger / history / params）
-4. **多 AI 服务商** 配置与调用已初步统一
-5. **安全基线改善**：`.env` + example 配置 + gitignore + 历史重建
+1. **三段流水线清晰**：①爬取 ②清洗 ③分析，职责边界明确  
+2. **Storage 抽象落地**：`RawStore` / `CuratedStore` / `ThemeStore`，增量查询正确  
+3. **GUI 与定时任务共用 services**：避免双份业务逻辑  
+4. **安全基线合格**：`.env` + example + gitignore；`git ls-files` 不追踪真实 `ai_config.json`  
+5. **AI 场景分流合理**：分析用思考模式，清洗用 flash，成本可控  
 
 ### 缺点
 
-1. **存储层薄弱**：JSON 文件当数据库，每次去重全量加载所有 raw 文件，数据量增长后 O(n) 恶化
-2. **配置体系四套并存**：`core/config.py` + `ai_config.json` + `cleaning_criteria.json` + `workflows/configs/`
-3. **文档债务**：README 过时，`doc/` 丰富但无人维护索引
-4. **测试为零**：核心逻辑（增量、去重、时间解析）无自动化保障
-
-### 数据流（简图）
-
-```
-GUI CrawlerPage
-  → CrawlerWorker (QThread)
-    → NewsCrawler.run()
-      → GuZhangNewsCrawlerScroll.crawl()
-        → data/raw/*.json
-
-增量模式:
-  get_latest_news_from_db() → set_auto_stop() → 滚动中检测 → deduplicate_with_db()
-
-工作流:
-  WorkflowEngine → DailyNewsFlow / EnhancedNewsFlow
-    → crawler → cleaner → [merger] → exporter → AINewsAnalyzer
-```
+1. **文档债务 > 代码债务**：README + `doc/` 仍像 v1.x  
+2. **可观测性弱**：print 与 logging 混用  
+3. **Agent / 测试 / CI 空白**：个人项目可忍，若要对外分享则硬伤  
 
 ---
 
 ## 🎯 建议修复顺序
 
-**优先（影响正确性）**:
-1. H1 — 修复 `get_latest_news_from_db` 按新闻时间取最新
-2. M1 — 统一 `data_page` 去重注释或暴露可配置参数
-
-**本周（维护性）**:
-3. H2 + M8 — 重命名 storage 层 / 移除 sqlalchemy
-4. H4 — 更新 README 与真实文件名、架构描述
-5. H3 — 合并或明确分离两套调度器
-
-**有空再做**:
-6. M3 — core 模块接入 logging
-7. M4 — GUI 页面懒加载
-8. M5 — 精简 EnhancedNewsFlow
-9. L5 — 补核心路径单元测试（`parse_news_time`、去重、增量截断）
+```
+H1（README 重写） → H2（doc 归档或加「已废弃」横幅） → H3（核心路径 pytest）
+→ M6（schedule_tasks 示例化） → M1（crawler 接 logging） → M2（页面懒加载）
+→ M3（MCP，按需） → M4/M5 → L 系列
+```
 
 ---
 
-## 修复优先级
+## 一句话（辉夜）
 
-```
-H1 → M1 → H4 → H2/H3 → M2/M3 → M4/M5 → L系列
-```
+**代码架构已经从「JSON 散装 + 假工作流」进化到能用的三段式 SQLite 流水线**；再不改 README，主人就是在用 2026 年的车身配 2024 年的说明书开车。

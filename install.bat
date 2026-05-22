@@ -16,7 +16,7 @@ echo 安装完成！
 echo ========================================
 echo.
 echo 使用说明：
-echo 1. 双击 start.bat 启动程序
+echo 1. 双击 启动.bat 启动程序
 echo 2. 或使用命令: python main.py
 echo.
 
