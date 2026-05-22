@@ -433,47 +433,6 @@ class GuZhangNewsCrawlerScroll:
             'source': source,
         }
     
-    def save_as_json(self, news_list: List[Dict]) -> str:
-        """保存为JSON"""
-        # 获取第一条和最后一条新闻的时间
-        if news_list:
-            sorted_news = sorted(news_list, key=lambda x: x.get('timestamp', 0))
-            first_time = sorted_news[0].get('datetime', '')
-            last_time = sorted_news[-1].get('datetime', '')
-            
-            if first_time and last_time:
-                # 解析时间：2025-12-20 09:30:00 -> 12-20-09
-                first_dt = datetime.strptime(first_time, '%Y-%m-%d %H:%M:%S')
-                last_dt = datetime.strptime(last_time, '%Y-%m-%d %H:%M:%S')
-                
-                first_str = first_dt.strftime('%m-%d-%H')
-                last_str = last_dt.strftime('%m-%d-%H')
-                
-                filename_base = f'{first_str}——{last_str}'
-            else:
-                filename_base = datetime.now().strftime('%Y-%m-%d')
-        else:
-            filename_base = datetime.now().strftime('%Y-%m-%d')
-        
-        data = {
-            'date': datetime.now().strftime('%Y-%m-%d'),
-            'crawl_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-            'crawl_method': 'scroll',
-            'total': len(news_list),
-            'time_range': {
-                'start': sorted_news[0].get('datetime', '') if news_list else '',
-                'end': sorted_news[-1].get('datetime', '') if news_list else ''
-            },
-            'news': news_list
-        }
-        
-        filename = os.path.join(self.save_dir, 'raw', f'{filename_base}.json')
-        with open(filename, 'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] ✓ JSON已保存: {filename}")
-        return filename
-    
     def save_as_markdown(self, news_list: List[Dict]) -> str:
         """保存为Markdown格式"""
         # 获取第一条和最后一条新闻的时间
@@ -848,30 +807,23 @@ class GuZhangNewsCrawlerScroll:
         
         # 统计跨天信息（仅用于日志显示）
         news_by_date = self.split_news_by_date(news_list)
-        
-        # 保存数据（所有新闻保存为单个JSON文件，不分割）
-        print(f"\n[{datetime.now().strftime('%H:%M:%S')}] 保存所有新闻到单个文件...\n")
-        json_file = self.save_as_json(news_list)
-        all_files = [json_file]
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] ✓ 已保存: {len(news_list)} 条（跨 {len(news_by_date)} 天）")
-        
+
         elapsed = time.time() - start_time
-        
+
         print("\n" + "=" * 60)
         print(f"✓ 爬取完成！")
         print(f"  - 新闻总数: {len(news_list)} 条")
         print(f"  - 跨天数: {len(news_by_date)} 天")
         print(f"  - 总耗时: {elapsed:.2f} 秒")
         print(f"  - 平均速度: {len(news_list)/elapsed:.1f} 条/秒")
-        print(f"  - 保存文件数: {len(all_files)} 个")
         print("=" * 60 + "\n")
-        
+
         return {
-            'success': True, 
-            'total': len(news_list), 
+            'success': True,
+            'total': len(news_list),
             'days': len(news_by_date),
-            'files': all_files,
-            'elapsed': elapsed
+            'news_list': news_list,
+            'elapsed': elapsed,
         }
 
 
@@ -923,7 +875,7 @@ class NewsCrawler:
             headless: 无头模式
             
         Returns:
-            生成的文件列表
+            爬取结果 dict
         """
         base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
         try:
@@ -963,9 +915,8 @@ class NewsCrawler:
         )
         
         if result['success']:
-            return result.get('files', [])
-        else:
-            raise Exception(result.get('error', '爬取失败'))
+            return result
+        raise Exception(result.get('error', '爬取失败'))
 
 
 def main(scroll_times=36, wait_seconds=6, headless=True):
@@ -978,7 +929,7 @@ def main(scroll_times=36, wait_seconds=6, headless=True):
         headless: 无头模式
         
     Returns:
-        生成的文件列表
+        爬取结果 dict（含 news_list、total 等）
     """
     crawler = NewsCrawler()
     return crawler.run(scroll_times=scroll_times, wait_seconds=wait_seconds, headless=headless)
@@ -1014,9 +965,9 @@ if __name__ == "__main__":
     
     # 执行爬取
     try:
-        files = main(scroll_times=args.times, wait_seconds=args.wait)
+        result = main(scroll_times=args.times, wait_seconds=args.wait)
         print("\n🎉 成功！")
-        print(f"生成文件: {files}")
+        print(f"爬取 {result.get('total', 0)} 条新闻")
     except Exception as e:
         print(f"\n❌ 失败: {str(e)}")
 

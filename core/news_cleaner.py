@@ -27,100 +27,54 @@ class NewsCleaner:
         # 加载AI配置
         from core.ai_config import AIConfig
         self.config = AIConfig()
-    
-    def clean_news_files(
+
+    def clean_news_list(
         self,
-        file_paths: List[str],
+        news_list: List[Dict],
         batch_size: int = 100,
         auto_merge: bool = True,
-        progress_callback: Optional[Callable] = None
+        progress_callback: Optional[Callable] = None,
     ) -> Dict:
         """
-        清洗新闻文件
-        
+        清洗内存中的新闻列表（供 SQLite 同步服务使用）。
+
         参数:
-            file_paths: 文件路径列表
+            news_list: 新闻 dict 列表
             batch_size: 每批处理数量
-            auto_merge: 是否自动合并去重
-            progress_callback: 进度回调函数
-            
+            auto_merge: 是否语义去重
+            progress_callback: 进度回调
+
         返回:
-            {
-                'kept': [...],
-                'removed': [...],
-                'metadata': {...}
-            }
+            {'kept': [...], 'removed': [...], 'metadata': {...}}
         """
-        # 1. 加载文件
-        if progress_callback:
-            progress_callback("正在加载文件...")
-        all_news = self._load_files(file_paths)
-        
+        all_news = list(news_list)
         if progress_callback:
             progress_callback(f"已加载 {len(all_news)} 条新闻")
-        
-        # 2. 合并去重
+
         if auto_merge:
-            if progress_callback:
-                progress_callback("正在合并去重...")
             before_count = len(all_news)
             all_news = self._deduplicate(all_news)
-            after_count = len(all_news)
             if progress_callback:
                 progress_callback(
-                    f"去重完成：{before_count} → {after_count} 条"
-                    f"（去除 {before_count - after_count} 条重复）"
+                    f"去重完成：{before_count} → {len(all_news)} 条"
                 )
-        
-        # 3. AI分批清洗
+
         if progress_callback:
             progress_callback("开始AI清洗...")
-        
+
         kept, removed = self._ai_clean_batches(
             all_news, batch_size, progress_callback
         )
-        
-        # 4. 按时间排序（处理缺失时间字段的情况）
-        kept.sort(key=lambda x: x.get('time', ''))
-        removed.sort(key=lambda x: x.get('time', ''))
-        
-        # 5. 生成元数据
+        kept.sort(key=lambda x: x.get("datetime") or x.get("time", ""))
+        removed.sort(key=lambda x: x.get("datetime") or x.get("time", ""))
+
         metadata = self._generate_metadata(
-            file_paths, len(all_news), kept, removed
+            ["<memory>"], len(all_news), kept, removed
         )
-        
-        return {
-            'kept': kept,
-            'removed': removed,
-            'metadata': metadata
-        }
-    
-    def _load_files(self, file_paths: List[str]) -> List[Dict]:
-        """加载新闻文件"""
-        all_news = []
-        
-        for file_path in file_paths:
-            try:
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                    
-                    # 处理不同的JSON结构
-                    if isinstance(data, list):
-                        all_news.extend(data)
-                    elif isinstance(data, dict):
-                        if 'news' in data:
-                            all_news.extend(data['news'])
-                        elif 'data' in data:
-                            all_news.extend(data['data'])
-                    
-            except Exception as e:
-                print(f"加载文件失败 {file_path}: {e}")
-                continue
-        
-        return all_news
-    
+        return {"kept": kept, "removed": removed, "metadata": metadata}
+
     def _deduplicate(self, news_list: List[Dict]) -> List[Dict]:
-        """去重新闻（使用 semantic_dedup 默认：30 分钟窗口 + 50% 相似度）"""
+        """去重新闻（30 分钟窗口 + 30% 标题/正文双路相似度）"""
         from core.semantic_dedup import semantic_deduplicate
         return semantic_deduplicate(news_list)
     
@@ -323,46 +277,3 @@ class NewsCleaner:
             'criteria': self.criteria[:200] + '...',  # 只保存前200字符
             'ai_provider': self.ai_provider
         }
-    
-    def save_results(self, results: Dict, output_dir: str = 'data/cleaned') -> tuple:
-        """
-        保存清洗结果
-        
-        返回:
-            (kept_file, removed_file)
-        """
-        os.makedirs(output_dir, exist_ok=True)
-        
-        metadata = results['metadata']
-        time_range = metadata['time_range']
-        
-        # 生成文件名
-        try:
-            if time_range.get('start') and time_range.get('end'):
-                start_dt = datetime.strptime(time_range['start'], '%Y-%m-%d %H:%M:%S')
-                end_dt = datetime.strptime(time_range['end'], '%Y-%m-%d %H:%M:%S')
-                filename_prefix = f"{start_dt.strftime('%m-%d-%H')}_{end_dt.strftime('%m-%d-%H')}"
-            else:
-                filename_prefix = datetime.now().strftime('%m-%d-%H-%M')
-        except Exception as e:
-            print(f"时间解析失败: {e}")
-            filename_prefix = datetime.now().strftime('%m-%d-%H-%M')
-        
-        # 保存kept（已保留）
-        kept_file = os.path.join(output_dir, f"{filename_prefix}_clear.json")
-        with open(kept_file, 'w', encoding='utf-8') as f:
-            json.dump({
-                'metadata': metadata,
-                'news': results['kept']
-            }, f, ensure_ascii=False, indent=2)
-        
-        # 保存removed（已去除）
-        removed_file = os.path.join(output_dir, f"{filename_prefix}_removed.json")
-        with open(removed_file, 'w', encoding='utf-8') as f:
-            json.dump({
-                'metadata': metadata,
-                'news': results['removed']
-            }, f, ensure_ascii=False, indent=2)
-        
-        return kept_file, removed_file
-

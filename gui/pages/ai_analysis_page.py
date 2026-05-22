@@ -4,10 +4,11 @@ AI分析页面
 
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                              QPushButton, QGroupBox, QComboBox, QLineEdit,
-                             QTextBrowser, QFileDialog, QMessageBox,
-                             QRadioButton, QButtonGroup)
+                             QTextBrowser, QMessageBox,
+                             QDateTimeEdit)
+from PyQt5.QtCore import QDateTime
 from PyQt5.QtGui import QTextCursor
-from datetime import datetime
+from datetime import datetime, timedelta
 import os
 
 from gui.utils.styles import (BUTTON_PRIMARY, BUTTON_SUCCESS, BUTTON_DANGER,
@@ -70,9 +71,15 @@ class AIAnalysisPage(QWidget):
 
         layout.addStretch()
         
-        # 加载配置和模板数据（必须在所有UI组件创建完成后）
+        # 加载配置和模板数据（必须在所有 UI 组件创建完成后）
         self.load_config()
         self.load_template_list()
+
+    def showEvent(self, event):
+        """页面显示时刷新统计"""
+        super().showEvent(event)
+        if hasattr(self, "_refresh_db_stats"):
+            self._refresh_db_stats()
 
     def create_config_group(self):
         """创建AI配置组"""
@@ -140,7 +147,6 @@ class AIAnalysisPage(QWidget):
         template_label.setMinimumWidth(120)
         self.template_combo = QComboBox()
         self.template_combo.setStyleSheet(COMBOBOX_STYLE)
-        self.load_templates()
         template_layout.addWidget(template_label)
         template_layout.addWidget(self.template_combo, 1)
         layout.addLayout(template_layout)
@@ -167,23 +173,32 @@ class AIAnalysisPage(QWidget):
         group.setLayout(layout)
         return group
 
+    def load_template_list(self):
+        """加载分析模板列表（config/ai_config.json）"""
+        try:
+            from core.ai_config import AIConfig
+
+            config = AIConfig()
+            templates = config.get_prompt_templates()
+
+            self.template_combo.clear()
+            for key, template in templates.items():
+                display_name = template.get("name", key)
+                self.template_combo.addItem(display_name, key)
+
+            current = config.get_current_prompt_template()
+            for i in range(self.template_combo.count()):
+                if self.template_combo.itemData(i) == current:
+                    self.template_combo.setCurrentIndex(i)
+                    break
+
+        except Exception as e:
+            print(f"加载分析模板失败: {e}")
+            QMessageBox.critical(self, "错误", f"加载分析模板失败: {str(e)}")
+
     def load_templates(self):
-        """加载模板列表"""
-        from core.ai_config import AIConfig
-        config = AIConfig()
-
-        self.template_combo.clear()
-        templates = config.get_template_names()
-
-        for template_id, name in templates:
-            self.template_combo.addItem(name, template_id)
-
-        # 选中当前模板
-        current = config.get_current_template()
-        for i in range(self.template_combo.count()):
-            if self.template_combo.itemData(i) == current:
-                self.template_combo.setCurrentIndex(i)
-                break
+        """兼容旧调用，统一走 load_template_list。"""
+        self.load_template_list()
 
     def new_template(self):
         """新建模板"""
@@ -286,49 +301,120 @@ class AIAnalysisPage(QWidget):
                 QMessageBox.warning(self, "失败", "删除失败")
 
     def create_source_group(self):
-        """创建数据源选择组"""
+        """创建数据源选择组（SQLite）"""
         group = QGroupBox("📂 数据源")
         layout = QVBoxLayout()
 
-        # 单选按钮组
-        self.source_group = QButtonGroup()
+        layout.addWidget(QLabel("SQLite 数据库"))
 
-        # 选项1：使用导出文件
-        self.export_radio = QRadioButton("使用导出文件（推荐）")
-        self.export_radio.setChecked(True)
-        self.source_group.addButton(self.export_radio, 1)
-        layout.addWidget(self.export_radio)
+        sqlite_layout = QVBoxLayout()
+        sqlite_layout.setContentsMargins(30, 0, 0, 0)
 
-        export_layout = QHBoxLayout()
-        export_layout.setContentsMargins(30, 0, 0, 0)
-        self.export_path_input = QLineEdit()
-        self.export_path_input.setStyleSheet(INPUT_STYLE)
-        self.export_path_input.setPlaceholderText(
-            "选择导出目录中的JSON/MD/TXT文件...")
-        self.export_browse_btn = QPushButton("📁 浏览...")
-        self.export_browse_btn.clicked.connect(self.browse_export_file)
-        export_layout.addWidget(self.export_path_input, 1)
-        export_layout.addWidget(self.export_browse_btn)
-        layout.addLayout(export_layout)
+        row1 = QHBoxLayout()
+        row1.addWidget(QLabel("数据表:"))
+        self.db_source_combo = QComboBox()
+        self.db_source_combo.addItem("精选库 (curated)", "curated")
+        self.db_source_combo.addItem("原始库 (raw)", "raw")
+        self.db_source_combo.setStyleSheet(COMBOBOX_STYLE)
+        self.db_source_combo.currentIndexChanged.connect(self._on_db_source_changed)
+        row1.addWidget(self.db_source_combo, 1)
+        sqlite_layout.addLayout(row1)
 
-        # 选项2：使用影响分析结果
-        self.impact_radio = QRadioButton("使用影响分析结果（节省token）")
-        self.source_group.addButton(self.impact_radio, 2)
-        layout.addWidget(self.impact_radio)
+        row2 = QHBoxLayout()
+        row2.addWidget(QLabel("快捷范围:"))
+        self.range_preset_combo = QComboBox()
+        self.range_preset_combo.addItems([
+            "最近 24 小时", "最近 48 小时", "最近 7 天", "全部数据", "自定义",
+        ])
+        self.range_preset_combo.setStyleSheet(COMBOBOX_STYLE)
+        self.range_preset_combo.currentIndexChanged.connect(self._on_range_preset_changed)
+        row2.addWidget(self.range_preset_combo, 1)
+        sqlite_layout.addLayout(row2)
 
-        impact_layout = QHBoxLayout()
-        impact_layout.setContentsMargins(30, 0, 0, 0)
-        self.impact_path_input = QLineEdit()
-        self.impact_path_input.setStyleSheet(INPUT_STYLE)
-        self.impact_path_input.setPlaceholderText("选择影响分析报告文件...")
-        self.impact_browse_btn = QPushButton("📁 浏览...")
-        self.impact_browse_btn.clicked.connect(self.browse_impact_file)
-        impact_layout.addWidget(self.impact_path_input, 1)
-        impact_layout.addWidget(self.impact_browse_btn)
-        layout.addLayout(impact_layout)
+        row3 = QHBoxLayout()
+        row3.addWidget(QLabel("起始:"))
+        self.start_datetime = QDateTimeEdit(QDateTime.currentDateTime().addSecs(-86400))
+        self.start_datetime.setCalendarPopup(True)
+        self.start_datetime.setDisplayFormat("yyyy-MM-dd HH:mm")
+        row3.addWidget(self.start_datetime, 1)
+        row3.addWidget(QLabel("结束:"))
+        self.end_datetime = QDateTimeEdit(QDateTime.currentDateTime())
+        self.end_datetime.setCalendarPopup(True)
+        self.end_datetime.setDisplayFormat("yyyy-MM-dd HH:mm")
+        row3.addWidget(self.end_datetime, 1)
+        sqlite_layout.addLayout(row3)
+
+        self.db_stats_label = QLabel("")
+        self.db_stats_label.setStyleSheet("color: #8c8c8c; font-size: 12px;")
+        sqlite_layout.addWidget(self.db_stats_label)
+        layout.addLayout(sqlite_layout)
 
         group.setLayout(layout)
         return group
+
+    def _get_source_store(self, source=None):
+        from services.storage import get_raw_store, get_curated_store
+        source = source or self.db_source_combo.currentData()
+        return get_curated_store() if source == "curated" else get_raw_store()
+
+    def _get_source_time_bounds(self, source=None):
+        return self._get_source_store(source).get_time_bounds()
+
+    def _on_db_source_changed(self, _index=None):
+        self._refresh_db_stats()
+
+    def _on_range_preset_changed(self, index):
+        if index == 3:
+            start, end = self._get_source_time_bounds()
+            if start and end:
+                self.start_datetime.setDateTime(QDateTime(start))
+                self.end_datetime.setDateTime(QDateTime(end))
+            return
+        if index == 4:
+            return
+        now = QDateTime.currentDateTime()
+        self.end_datetime.setDateTime(now)
+        if index == 0:
+            self.start_datetime.setDateTime(now.addSecs(-86400))
+        elif index == 1:
+            self.start_datetime.setDateTime(now.addSecs(-86400 * 2))
+        elif index == 2:
+            self.start_datetime.setDateTime(now.addDays(-7))
+
+    def _refresh_db_stats(self):
+        try:
+            from services.storage import get_raw_store, get_curated_store
+            raw = get_raw_store()
+            curated = get_curated_store()
+            source = self.db_source_combo.currentData()
+            store = curated if source == "curated" else raw
+            label = "精选库" if source == "curated" else "原始库"
+            start, end = store.get_time_bounds()
+            if start and end:
+                span = (
+                    f"{label} {store.count()} 条 | "
+                    f"数据时间 {start.strftime('%m-%d %H:%M')} ~ "
+                    f"{end.strftime('%m-%d %H:%M')}"
+                )
+            else:
+                span = f"{label} 暂无数据"
+            self.db_stats_label.setText(
+                f"原始库 {raw.count()} 条 | 精选库 {curated.count()} 条 | "
+                f"待清洗 {raw.count_uncleaned()} 条 | {span}"
+            )
+        except Exception as e:
+            self.db_stats_label.setText(f"数据库: {e}")
+
+    def _format_time_bounds_hint(self, source):
+        start, end = self._get_source_time_bounds(source)
+        if not start or not end:
+            return "当前数据源为空"
+        name = "精选库" if source == "curated" else "原始库"
+        return (
+            f"{name} 实际数据时间：\n"
+            f"{start.strftime('%Y-%m-%d %H:%M')} ~ "
+            f"{end.strftime('%Y-%m-%d %H:%M')}"
+        )
 
     def create_params_group(self):
         """创建分析参数组"""
@@ -564,109 +650,81 @@ class AIAnalysisPage(QWidget):
             QMessageBox.critical(self, "错误", f"测试失败: {str(e)}")
             self.add_progress(f"❌ 测试失败: {str(e)}")
 
-    def browse_export_file(self):
-        """浏览导出文件"""
-        default_dir = os.path.join(os.getcwd(), 'data', 'exports')
-        file_path, _ = QFileDialog.getOpenFileName(
-            self,
-            "选择导出文件",
-            default_dir,
-            "数据文件 (*.json *.md *.txt);;所有文件 (*.*)"
-        )
-        if file_path:
-            self.export_path_input.setText(file_path)
-
-    def browse_impact_file(self):
-        """浏览影响分析文件"""
-        default_dir = os.path.join(os.getcwd(), 'data', 'analysis')
-        file_path, _ = QFileDialog.getOpenFileName(
-            self,
-            "选择影响分析报告",
-            default_dir,
-            "Markdown文件 (*.md);;所有文件 (*.*)"
-        )
-        if file_path:
-            self.impact_path_input.setText(file_path)
-
     def start_analysis(self):
         """开始分析"""
         if self.worker and self.worker.isRunning():
             QMessageBox.warning(self, "警告", "分析正在进行中！")
             return
 
-        # 获取数据源
-        if self.export_radio.isChecked():
-            file_path = self.export_path_input.text().strip()
-        elif self.impact_radio.isChecked():
-            file_path = self.impact_path_input.text().strip()
-        else:
-            QMessageBox.warning(self, "警告", "请选择数据源")
-            return
-
-        if not file_path or not os.path.exists(file_path):
-            QMessageBox.warning(self, "警告", "请选择有效的数据文件")
-            return
-
-        # 检查配置
         api_key = self.api_key_input.text().strip()
         if not api_key:
             QMessageBox.warning(self, "警告", "请先配置API Key")
             return
 
-        # 禁用按钮
+        sqlite_source = self.db_source_combo.currentData()
+        sqlite_start = self.start_datetime.dateTime().toPyDateTime()
+        sqlite_end = self.end_datetime.dateTime().toPyDateTime()
+        if sqlite_start >= sqlite_end:
+            QMessageBox.warning(self, "警告", "起始时间必须早于结束时间")
+            return
+        from services.analysis_service import AnalysisService
+        count = len(AnalysisService().load_news(
+            sqlite_source, sqlite_start, sqlite_end
+        ))
+        if count == 0:
+            hint = self._format_time_bounds_hint(sqlite_source)
+            QMessageBox.warning(
+                self,
+                "警告",
+                f"选定时间范围内没有新闻数据。\n\n{hint}\n\n"
+                "请将快捷范围改为「全部数据」，或手动调整起止时间。",
+            )
+            return
+
         self.analyze_btn.setEnabled(False)
         self.open_report_btn.setEnabled(False)
-
-        # 清空显示
         self.progress_browser.clear()
         self.result_browser.clear()
 
-        # 添加日志
+        self.add_progress("=" * 60)
+        self.add_progress(f"开始分析 - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         self.add_progress("=" * 60)
         self.add_progress(
-            f"开始分析 - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        self.add_progress("=" * 60)
-        self.add_progress(f"数据文件: {os.path.basename(file_path)}")
+            f"数据源: SQLite {self.db_source_combo.currentText()} | "
+            f"{sqlite_start.strftime('%Y-%m-%d %H:%M')} ~ "
+            f"{sqlite_end.strftime('%Y-%m-%d %H:%M')}"
+        )
 
-        # 获取参数
         provider_map = {
-            'OpenAI': 'openai',
-            'DeepSeek': 'deepseek',
-            '智谱AI': 'zhipu',
-            '通义千问': 'qwen',
-            '火山引擎': 'volcengine'
+            'OpenAI': 'openai', 'DeepSeek': 'deepseek', '智谱AI': 'zhipu',
+            '通义千问': 'qwen', '火山引擎': 'volcengine',
         }
         provider = provider_map.get(self.provider_combo.currentText())
-        
         template_id = self.template_combo.currentData()
-        
-        # 获取盘后总结（可选）
         market_summary = self.summary_input.toPlainText().strip()
 
-        # 保存当前模板为默认
         if template_id:
             from core.ai_config import AIConfig
-            config = AIConfig()
-            config.set_current_template(template_id)
+            cfg = AIConfig()
+            cfg.set_current_prompt_template(template_id)
+            cfg.set_current_template(template_id)
 
-        # 创建工作线程（参数已在模板中定义）
         self.worker = AIAnalysisWorker(
-            file_path=file_path,
             provider=provider,
             max_sectors='auto',
             stocks_per_sector='auto',
             max_news=5000,
             template_id=template_id,
-            market_summary=market_summary
+            market_summary=market_summary,
+            sqlite_source=sqlite_source,
+            sqlite_start=sqlite_start,
+            sqlite_end=sqlite_end,
         )
 
-        # 连接信号
         self.worker.finished.connect(self.on_analysis_finished)
         self.worker.error.connect(self.on_analysis_error)
         self.worker.progress.connect(self.add_progress)
         self.worker.streaming.connect(self.add_streaming_content)
-
-        # 启动线程
         self.worker.start()
 
     def on_analysis_finished(self, result):
@@ -755,28 +813,6 @@ class AIAnalysisPage(QWidget):
         else:
             QMessageBox.warning(self, "警告", "报告文件不存在！")
 
-    def load_template_list(self):
-        """加载模板列表"""
-        try:
-            from core.ai_config import AIConfig
-            config = AIConfig()
-            templates = config.get_prompt_templates()
-            
-            self.template_combo.clear()
-            for key, template in templates.items():
-                display_name = template.get('name', key)
-                self.template_combo.addItem(display_name, key)
-            
-            # 设置当前选中的模板
-            current = config.get_current_prompt_template()
-            for i in range(self.template_combo.count()):
-                if self.template_combo.itemData(i) == current:
-                    self.template_combo.setCurrentIndex(i)
-                    break
-                    
-        except Exception as e:
-            print(f"加载模板列表失败: {e}")
-
     def update_template_description(self):
         """更新模板说明"""
         try:
@@ -798,4 +834,6 @@ class AIAnalysisPage(QWidget):
         """刷新页面"""
         self.load_config()
         self.load_template_list()
+        if hasattr(self, "_refresh_db_stats"):
+            self._refresh_db_stats()
 

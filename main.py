@@ -15,6 +15,10 @@ from core.env_loader import load_dotenv  # noqa: E402
 
 load_dotenv(os.path.join(_ROOT, ".env"))
 
+from services.storage.database import init_database  # noqa: E402
+
+init_database()
+
 from PyQt5.QtWidgets import QApplication  # noqa: E402
 from PyQt5.QtGui import QFont, QIcon  # noqa: E402
 from gui.main_window import MainWindow  # noqa: E402

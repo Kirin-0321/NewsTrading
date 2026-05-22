@@ -1,177 +1,239 @@
 """
 语义去重工具
-使用时间窗口 + 标题相似度进行智能去重
+时间窗口 + 标题/标题+正文 双路相似度（阈值可分别设置）
 """
 
+import re
 from datetime import datetime
 from difflib import SequenceMatcher
-from typing import List, Dict, Optional
+from typing import Dict, List, Optional, Tuple
 
 
 class SemanticDeduplicator:
     """语义去重器"""
-    
-    def __init__(self, time_window_minutes=10, similarity_threshold=0.8):
+
+    def __init__(
+        self,
+        time_window_minutes: int = 30,
+        title_threshold: float = 0.60,
+        merged_threshold: float = 0.55,
+        similarity_threshold: Optional[float] = None,
+    ):
         """
-        初始化语义去重器
-        
-        参数:
+        Args:
             time_window_minutes: 时间窗口（分钟）
-            similarity_threshold: 相似度阈值（0-1）
+            title_threshold: 标题相似度阈值 0~1
+            merged_threshold: 标题+正文合并相似度阈值 0~1
+            similarity_threshold: 兼容旧参数，若传入则两路共用同一阈值
         """
         self.time_window_minutes = time_window_minutes
-        self.similarity_threshold = similarity_threshold
-    
+        if similarity_threshold is not None:
+            self.title_threshold = similarity_threshold
+            self.merged_threshold = similarity_threshold
+        else:
+            self.title_threshold = title_threshold
+            self.merged_threshold = merged_threshold
+
+    @property
+    def similarity_threshold(self) -> float:
+        """兼容旧代码读取单一阈值。"""
+        return self.title_threshold
+
     @staticmethod
     def calculate_similarity(str1: str, str2: str) -> float:
-        """
-        计算两个字符串的相似度（0-1之间）
-        使用SequenceMatcher算法
-        """
+        """计算两个字符串的相似度（SequenceMatcher，0~1）。"""
+        if not str1 or not str2:
+            return 0.0
         return SequenceMatcher(None, str1, str2).ratio()
-    
+
     @staticmethod
-    def parse_datetime(dt_str: str) -> Optional[datetime]:
-        """解析日期时间字符串"""
-        if not dt_str:
-            return None
-        
-        try:
-            # 尝试多种时间格式
-            formats = [
-                '%Y-%m-%d %H:%M:%S',
-                '%Y-%m-%d %H:%M',
-                '%m-%d %H:%M',
-            ]
-            
-            for fmt in formats:
+    def _normalize_text(text: str) -> str:
+        """压缩空白，便于比较。"""
+        if not text:
+            return ""
+        return re.sub(r"\s+", " ", str(text).strip())
+
+    def _has_content(self, news: Dict) -> bool:
+        """是否有正文（非空）。"""
+        return bool(self._normalize_text(news.get("content", "")))
+
+    def _merged_text(self, news: Dict) -> str:
+        """标题 + 正文前缀合并文本。"""
+        title = self._normalize_text(news.get("title", ""))
+        content = self._normalize_text(news.get("content", ""))
+        if content:
+            content = content[:500]
+        if title and content:
+            return f"{title} {content}"
+        return title or content
+
+    def _news_time(self, news: Dict) -> Optional[datetime]:
+        time_str = news.get("datetime") or news.get("time", "")
+        if not time_str:
+            ts = news.get("timestamp")
+            if ts:
                 try:
-                    dt = datetime.strptime(dt_str, fmt)
-                    # 如果没有年份，使用当前年份
-                    if '%Y' not in fmt:
-                        dt = dt.replace(year=datetime.now().year)
-                    return dt
-                except:
-                    continue
-            
+                    return datetime.fromtimestamp(int(ts))
+                except (TypeError, ValueError, OSError):
+                    return None
             return None
-        except:
-            return None
-    
-    def deduplicate(self, news_list: List[Dict]) -> List[Dict]:
+
+        formats = ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%m-%d %H:%M"]
+        for fmt in formats:
+            try:
+                dt = datetime.strptime(time_str, fmt)
+                if "%Y" not in fmt:
+                    dt = dt.replace(year=datetime.now().year)
+                return dt
+            except ValueError:
+                continue
+        return None
+
+    def _in_time_window(self, time_a: datetime, time_b: datetime) -> bool:
+        diff_minutes = abs((time_a - time_b).total_seconds()) / 60
+        return diff_minutes <= self.time_window_minutes
+
+    def is_similar(self, news_a: Dict, news_b: Dict) -> bool:
         """
-        语义去重
-        
-        参数:
-            news_list: 新闻列表
-        
-        返回:
-            去重后的新闻列表
+        判断两条新闻是否相似。
+        - 标题相似度 >= title_threshold → 重复
+        - 双方均有正文且合并相似度 >= merged_threshold → 重复
+        """
+        title_a = self._normalize_text(news_a.get("title", ""))
+        title_b = self._normalize_text(news_b.get("title", ""))
+        if title_a and title_b:
+            if self.calculate_similarity(title_a, title_b) >= self.title_threshold:
+                return True
+
+        if not (self._has_content(news_a) and self._has_content(news_b)):
+            return False
+
+        merge_a = self._merged_text(news_a)
+        merge_b = self._merged_text(news_b)
+        if merge_a and merge_b:
+            if self.calculate_similarity(merge_a, merge_b) >= self.merged_threshold:
+                return True
+        return False
+
+    def similarity_detail(self, news_a: Dict, news_b: Dict) -> Dict:
+        """返回两条新闻的相似度明细。"""
+        title_a = self._normalize_text(news_a.get("title", ""))
+        title_b = self._normalize_text(news_b.get("title", ""))
+        merge_a = self._merged_text(news_a)
+        merge_b = self._merged_text(news_b)
+
+        title_sim = self.calculate_similarity(title_a, title_b) if title_a and title_b else 0.0
+        both_have_content = self._has_content(news_a) and self._has_content(news_b)
+        merge_sim = (
+            self.calculate_similarity(merge_a, merge_b)
+            if both_have_content and merge_a and merge_b
+            else 0.0
+        )
+
+        reasons = []
+        if title_sim >= self.title_threshold:
+            reasons.append("title")
+        if both_have_content and merge_sim >= self.merged_threshold:
+            reasons.append("merged")
+
+        return {
+            "title_similarity": round(title_sim, 4),
+            "merged_similarity": round(merge_sim, 4),
+            "is_duplicate": bool(reasons),
+            "match_reason": "+".join(reasons) if reasons else "",
+        }
+
+    def is_duplicate_of_any(
+        self,
+        news: Dict,
+        news_time: datetime,
+        others: List[Tuple[Dict, datetime]],
+    ) -> bool:
+        """是否与给定列表中（时间窗口内）任一条重复。"""
+        for other, other_time in others:
+            if not self._in_time_window(news_time, other_time):
+                continue
+            if self.is_similar(news, other):
+                return True
+        return False
+
+    def deduplicate(
+        self,
+        news_list: List[Dict],
+        reference_pool: Optional[List[Dict]] = None,
+    ) -> List[Dict]:
+        """
+        语义去重。
+
+        Args:
+            news_list: 待去重列表
+            reference_pool: 参照池（如库内已有新闻），与之相似者会被剔除
         """
         if not news_list:
             return []
-        
-        # 1. 提取时间并排序
-        news_with_time = []
-        news_without_time = []
-        
+
+        ref_with_time: List[Tuple[Dict, datetime]] = []
+        for item in reference_pool or []:
+            dt = self._news_time(item)
+            if dt:
+                ref_with_time.append((item, dt))
+
+        news_with_time: List[Tuple[Dict, datetime]] = []
+        news_without_time: List[Dict] = []
+
         for news in news_list:
-            # 获取时间字符串（优先datetime，其次time）
-            time_str = news.get('datetime') or news.get('time', '')
-            dt = self.parse_datetime(time_str)
-            
+            dt = self._news_time(news)
             if dt:
                 news_with_time.append((news, dt))
             else:
-                # 没有时间的新闻单独处理
                 news_without_time.append(news)
-        
-        # 按时间排序
+
         news_with_time.sort(key=lambda x: x[1])
-        
-        # 2. 时间窗口 + 相似度去重
-        unique_news = []
-        
-        for i, (current_news, current_time) in enumerate(news_with_time):
-            current_title = current_news.get('title', '')
-            
-            # 检查是否与前面的新闻重复
-            is_duplicate = False
-            
-            # 向前查找时间窗口内的新闻
-            for j in range(i - 1, -1, -1):
-                prev_news, prev_time = news_with_time[j]
-                
-                # 超出时间窗口，停止查找
-                time_diff_minutes = (current_time - prev_time).total_seconds() / 60
-                if time_diff_minutes > self.time_window_minutes:
-                    break
-                
-                # 计算标题相似度
-                prev_title = prev_news.get('title', '')
-                similarity = self.calculate_similarity(current_title, prev_title)
-                
-                # 如果相似度超过阈值，判定为重复
-                if similarity >= self.similarity_threshold:
-                    is_duplicate = True
-                    break
-            
-            # 不重复则保留
-            if not is_duplicate:
-                unique_news.append(current_news)
-        
-        # 3. 添加没有时间的新闻（这些新闻无法语义去重，保持原样）
+
+        unique_news: List[Dict] = []
+        kept_with_time: List[Tuple[Dict, datetime]] = list(ref_with_time)
+
+        for current_news, current_time in news_with_time:
+            if self.is_duplicate_of_any(current_news, current_time, kept_with_time):
+                continue
+            unique_news.append(current_news)
+            kept_with_time.append((current_news, current_time))
+
         unique_news.extend(news_without_time)
-        
         return unique_news
-    
-    def deduplicate_with_stats(self, news_list: List[Dict]) -> tuple:
-        """
-        语义去重并返回统计信息
-        
-        参数:
-            news_list: 新闻列表
-        
-        返回:
-            (去重后的新闻列表, 原始数量, 去重后数量, 去除数量)
-        """
+
+    def deduplicate_with_stats(
+        self,
+        news_list: List[Dict],
+        reference_pool: Optional[List[Dict]] = None,
+    ) -> tuple:
         original_count = len(news_list)
-        unique_news = self.deduplicate(news_list)
+        unique_news = self.deduplicate(news_list, reference_pool=reference_pool)
         final_count = len(unique_news)
         removed_count = original_count - final_count
-        
         return unique_news, original_count, final_count, removed_count
 
 
-# 全局默认去重器实例（30 分钟窗口 + 50% 标题相似度）
 default_deduplicator = SemanticDeduplicator(
     time_window_minutes=30,
-    similarity_threshold=0.5,
+    title_threshold=0.60,
+    merged_threshold=0.55,
 )
 
 
-def semantic_deduplicate(news_list: List[Dict]) -> List[Dict]:
-    """
-    便捷函数：使用默认配置进行语义去重
-    
-    参数:
-        news_list: 新闻列表
-    
-    返回:
-        去重后的新闻列表
-    """
-    return default_deduplicator.deduplicate(news_list)
+def semantic_deduplicate(
+    news_list: List[Dict],
+    reference_pool: Optional[List[Dict]] = None,
+) -> List[Dict]:
+    """使用默认配置进行语义去重。"""
+    return default_deduplicator.deduplicate(news_list, reference_pool=reference_pool)
 
 
-def semantic_deduplicate_with_stats(news_list: List[Dict]) -> tuple:
-    """
-    便捷函数：使用默认配置进行语义去重并返回统计
-    
-    参数:
-        news_list: 新闻列表
-    
-    返回:
-        (去重后的新闻列表, 原始数量, 去重后数量, 去除数量)
-    """
-    return default_deduplicator.deduplicate_with_stats(news_list)
-
+def semantic_deduplicate_with_stats(
+    news_list: List[Dict],
+    reference_pool: Optional[List[Dict]] = None,
+) -> tuple:
+    """语义去重并返回统计。"""
+    return default_deduplicator.deduplicate_with_stats(
+        news_list, reference_pool=reference_pool
+    )

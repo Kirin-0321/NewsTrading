@@ -18,11 +18,11 @@ a = Analysis(
     datas=[
         ('core', 'core'),
         ('gui', 'gui'),
+        ('services', 'services'),
         ('config', 'config'),
         ('doc', 'doc'),
         ('Typora', 'Typora'),  # 打包Typora (Markdown阅读器)
         ('data', 'data'),  # 打包data目录
-        ('workflows', 'workflows'),  # 打包workflows目录
         ('模板', '模板'),  # 打包提示词模板
         ('图标.ico', '.'),  # 打包程序图标
         ('盘后总结', '盘后总结'),  # 打包盘后总结示例

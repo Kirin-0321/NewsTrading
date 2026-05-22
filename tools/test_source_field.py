@@ -156,31 +156,24 @@ def test_with_selenium():
 
 
 def analyze_existing_data():
-    """分析现有数据，看看是否所有来源都为空"""
+    """分析 SQLite 原始库中的来源字段"""
     print("\n" + "=" * 60)
-    print("测试3: 分析现有JSON数据")
+    print("测试3: 分析 SQLite 原始库")
     print("=" * 60)
-    
-    raw_dir = 'data/raw'
-    if not os.path.exists(raw_dir):
-        print(f"❌ 目录不存在: {raw_dir}")
+
+    try:
+        from services.storage import get_raw_store
+
+        store = get_raw_store()
+        news_list = store.get_all_news()[:500]
+        if not news_list:
+            print("❌ 原始库为空")
+            return
+
+        print(f"抽样 {len(news_list)} 条新闻")
+    except Exception as e:
+        print(f"❌ 读取 SQLite 失败: {e}")
         return
-    
-    json_files = [f for f in os.listdir(raw_dir) if f.endswith('.json')]
-    if not json_files:
-        print("❌ 未找到JSON文件")
-        return
-    
-    # 分析最新的文件
-    latest_file = sorted(json_files)[-1]
-    filepath = os.path.join(raw_dir, latest_file)
-    
-    print(f"分析文件: {latest_file}")
-    
-    with open(filepath, 'r', encoding='utf-8') as f:
-        data = json.load(f)
-    
-    news_list = data.get('news', []) if isinstance(data, dict) else data
     
     # 统计来源情况
     source_count = {'有来源': 0, '无来源': 0}

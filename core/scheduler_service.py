@@ -1,6 +1,6 @@
 """
 定时任务调度服务
-使用schedule库实现定时任务
+支持 crawl_sync / clean_sync / analyze 三种任务类型
 """
 
 import schedule
@@ -11,6 +11,8 @@ from datetime import datetime
 from threading import Thread
 from typing import Callable, Optional
 import logging
+
+from services.scheduled_runner import run_task_async, normalize_task
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -82,31 +84,47 @@ class SchedulerService:
     
     def _schedule_task(self, task):
         """调度单个任务"""
-        task_time = task.get('time', '09:00')
+        task = normalize_task(task)
         task_id = task.get('id')
-        
+        task_type = task.get('type', 'crawl_sync')
+        interval_hours = task.get('interval_hours')
+
         def job():
             """任务执行函数"""
             try:
-                logger.info(f"⏰ 开始执行定时任务: {task.get('name')}")
-                
-                # 更新上次执行时间
+                logger.info(
+                    "⏰ 开始执行定时任务: %s [%s]",
+                    task.get('name'),
+                    task_type,
+                )
                 self._update_task_last_run(task_id)
-                
-                # 执行任务（调用爬虫）
+
                 if self.on_task_run:
                     self.on_task_run(task)
                 else:
-                    logger.warning("未设置任务执行回调")
-                
-                logger.info(f"✅ 任务执行完成: {task.get('name')}")
-                
+                    run_task_async(task)
+
+                logger.info("✅ 任务已触发: %s", task.get('name'))
             except Exception as e:
-                logger.error(f"❌ 任务执行失败: {task.get('name')}, 错误: {e}")
-        
-        # 使用schedule库调度任务
-        schedule.every().day.at(task_time).do(job).tag(task_id)
-        logger.info(f"📌 已调度任务: {task.get('name')} at {task_time}")
+                logger.error("❌ 任务执行失败: %s, 错误: %s", task.get('name'), e)
+
+        if interval_hours:
+            schedule.every(int(interval_hours)).hours.do(job).tag(task_id)
+            logger.info(
+                "📌 已调度: %s (%s) 每 %s 小时",
+                task.get('name'),
+                task_type,
+                interval_hours,
+            )
+        else:
+            task_time = task.get('time', '09:00')
+            schedule.every().day.at(task_time).do(job).tag(task_id)
+            logger.info(
+                "📌 已调度: %s (%s) at %s",
+                task.get('name'),
+                task_type,
+                task_time,
+            )
     
     def _update_task_last_run(self, task_id):
         """更新任务的上次执行时间"""

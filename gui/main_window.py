@@ -153,31 +153,35 @@ class MainWindow(QMainWindow):
                 page.refresh()
     
     def on_scheduled_task(self, task):
-        """定时任务触发时的回调"""
-        try:
-            # 获取爬虫页面
-            crawler_page = self.pages.get('crawler')
-            if not crawler_page:
-                return
-            
-            # 获取任务参数
-            scroll_times = task.get('scroll_times', 36)
-            wait_seconds = task.get('wait_seconds', 6)
-            max_no_change = task.get('max_no_change', 3)
-            
-            # 触发爬虫（在主线程中执行）
-            from PyQt5.QtCore import QMetaObject, Q_ARG
-            QMetaObject.invokeMethod(
-                crawler_page,
-                'start_crawler_from_schedule',
-                Qt.QueuedConnection,
-                Q_ARG(int, scroll_times),
-                Q_ARG(int, wait_seconds),
-                Q_ARG(int, max_no_change)
-            )
-            
-        except Exception as e:
-            print(f"定时任务执行失败: {e}")
+        """定时任务触发：按 type 分发到 services 或 GUI"""
+        from services.scheduled_runner import normalize_task, run_task_async
+
+        task = normalize_task(task)
+        task_type = task.get("type", "crawl_sync")
+
+        if task_type == "crawl_sync":
+            crawler_page = self.pages.get("crawler")
+            if crawler_page:
+                params = task.get("params") or {}
+                from PyQt5.QtCore import QMetaObject, Q_ARG, Qt
+                QMetaObject.invokeMethod(
+                    crawler_page,
+                    "start_crawler_from_schedule",
+                    Qt.QueuedConnection,
+                    Q_ARG(int, params.get("scroll_times", 36)),
+                    Q_ARG(int, params.get("wait_seconds", 6)),
+                    Q_ARG(int, params.get("max_no_change", 3)),
+                )
+            return
+
+        def _on_done(outcome):
+            name = task.get("name", "任务")
+            if outcome.get("ok"):
+                print(f"[定时任务] {name} 完成: {outcome.get('result')}")
+            else:
+                print(f"[定时任务] {name} 失败: {outcome.get('error')}")
+
+        run_task_async(task, on_complete=_on_done)
     
     def closeEvent(self, event):
         """窗口关闭事件"""

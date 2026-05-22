@@ -3,18 +3,16 @@
 """
 
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
-                             QPushButton, QGroupBox, QListWidget, QComboBox,
-                             QSpinBox, QTextBrowser, QFileDialog, QMessageBox,
-                             QProgressBar, QListWidgetItem, QCheckBox,
-                             QAbstractItemView)
+                             QPushButton, QGroupBox, QSpinBox, QTextBrowser,
+                             QMessageBox, QProgressBar, QCheckBox)
 from PyQt5.QtCore import Qt, pyqtSlot
 from PyQt5.QtGui import QTextCursor
 from datetime import datetime
 import os
 import json
 
-from gui.utils.styles import (BUTTON_PRIMARY, BUTTON_SUCCESS, BUTTON_DANGER,
-                              COMBOBOX_STYLE, INPUT_STYLE, TEXTBROWSER_STYLE)
+from gui.utils.styles import (BUTTON_PRIMARY, BUTTON_SUCCESS,
+                              INPUT_STYLE, TEXTBROWSER_STYLE)
 from gui.workers.news_cleaning_worker import NewsCleaningWorker
 
 
@@ -24,7 +22,6 @@ class NewsCleaningPage(QWidget):
     def __init__(self):
         super().__init__()
         self.worker = None
-        self.selected_files = []
         self.init_ui()
     
     def init_ui(self):
@@ -65,43 +62,26 @@ class NewsCleaningPage(QWidget):
     
     def create_source_group(self):
         """创建数据源选择组"""
-        group = QGroupBox("📂 数据源选择")
+        group = QGroupBox("📂 数据源（SQLite 原始库）")
         layout = QVBoxLayout()
-        
-        # 数据类型选择
-        type_layout = QHBoxLayout()
-        type_label = QLabel("数据类型:")
-        type_label.setMinimumWidth(80)
-        self.type_combo = QComboBox()
-        self.type_combo.addItems(["原始数据", "导出数据"])
-        self.type_combo.setStyleSheet(COMBOBOX_STYLE)
-        type_layout.addWidget(type_label)
-        type_layout.addWidget(self.type_combo)
-        type_layout.addStretch()
-        layout.addLayout(type_layout)
-        
-        # 文件选择
-        btn_layout = QHBoxLayout()
-        self.select_files_btn = QPushButton("📁 选择文件...")
-        self.select_files_btn.clicked.connect(self.select_files)
-        self.clear_files_btn = QPushButton("🗑️ 清空")
-        self.clear_files_btn.clicked.connect(self.clear_files)
-        btn_layout.addWidget(self.select_files_btn)
-        btn_layout.addWidget(self.clear_files_btn)
-        btn_layout.addStretch()
-        layout.addLayout(btn_layout)
-        
-        # 文件列表
-        self.file_list = QListWidget()
-        self.file_list.setMaximumHeight(150)
-        self.file_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        layout.addWidget(self.file_list)
-        
-        # 自动合并去重选项
-        self.auto_merge_check = QCheckBox("☑ 自动合并去重")
+
+        sqlite_row = QHBoxLayout()
+        sqlite_row.addWidget(QLabel("最多处理:"))
+        self.sqlite_limit_spin = QSpinBox()
+        self.sqlite_limit_spin.setRange(10, 2000)
+        self.sqlite_limit_spin.setValue(500)
+        self.sqlite_limit_spin.setSuffix(" 条")
+        sqlite_row.addWidget(self.sqlite_limit_spin)
+        self.uncleaned_label = QLabel("")
+        self.uncleaned_label.setStyleSheet("color: #8c8c8c;")
+        sqlite_row.addWidget(self.uncleaned_label)
+        sqlite_row.addStretch()
+        layout.addLayout(sqlite_row)
+
+        self.auto_merge_check = QCheckBox("自动合并去重（批次内）")
         self.auto_merge_check.setChecked(True)
         layout.addWidget(self.auto_merge_check)
-        
+
         group.setLayout(layout)
         return group
     
@@ -182,16 +162,16 @@ class NewsCleaningPage(QWidget):
         
         # 操作按钮
         btn_layout = QHBoxLayout()
-        self.view_kept_btn = QPushButton("📄 查看保留新闻")
+        self.view_kept_btn = QPushButton("📄 查看精选库")
         self.view_kept_btn.setStyleSheet(BUTTON_SUCCESS)
         self.view_kept_btn.setEnabled(False)
         self.view_kept_btn.clicked.connect(self.view_kept_news)
-        
-        self.view_removed_btn = QPushButton("📄 查看去除新闻")
+
+        self.view_removed_btn = QPushButton("📄 查看剔除记录")
         self.view_removed_btn.setEnabled(False)
         self.view_removed_btn.clicked.connect(self.view_removed_news)
-        
-        self.use_for_analysis_btn = QPushButton("🤖 用于AI分析")
+
+        self.use_for_analysis_btn = QPushButton("🤖 用于 AI 分析")
         self.use_for_analysis_btn.setStyleSheet(BUTTON_PRIMARY)
         self.use_for_analysis_btn.setEnabled(False)
         self.use_for_analysis_btn.clicked.connect(self.use_for_analysis)
@@ -209,6 +189,15 @@ class NewsCleaningPage(QWidget):
         """页面显示时加载配置"""
         super().showEvent(event)
         self.load_config()
+        self._refresh_uncleaned_count()
+
+    def _refresh_uncleaned_count(self):
+        try:
+            from services.storage import get_raw_store
+            n = get_raw_store().count_uncleaned()
+            self.uncleaned_label.setText(f"当前待清洗: {n} 条")
+        except Exception as e:
+            self.uncleaned_label.setText(str(e))
     
     def load_config(self):
         """加载配置（使用AI分析中保存的配置）"""
@@ -265,48 +254,16 @@ class NewsCleaningPage(QWidget):
             print(f"加载清洗标准失败: {e}")
             self.criteria_text.setPlainText(f"加载失败: {e}")
             self.current_criteria = ""
-    
-    def select_files(self):
-        """选择文件"""
-        data_type = self.type_combo.currentText()
-        
-        if data_type == "原始数据":
-            default_dir = os.path.join(os.getcwd(), 'data', 'raw')
-        else:
-            default_dir = os.path.join(os.getcwd(), 'data', 'exports')
-        
-        file_paths, _ = QFileDialog.getOpenFileNames(
-            self,
-            "选择文件（可多选）",
-            default_dir,
-            "JSON文件 (*.json);;所有文件 (*.*)"
-        )
-        
-        if file_paths:
-            for file_path in file_paths:
-                # 避免重复添加
-                if file_path not in self.selected_files:
-                    self.selected_files.append(file_path)
-                    # 显示文件名和大小
-                    filename = os.path.basename(file_path)
-                    filesize = os.path.getsize(file_path) / (1024 * 1024)  # MB
-                    item_text = f"{filename} ({filesize:.1f}MB)"
-                    self.file_list.addItem(item_text)
-    
-    def clear_files(self):
-        """清空文件列表"""
-        self.selected_files.clear()
-        self.file_list.clear()
-    
+
     def start_cleaning(self):
         """开始清洗"""
         if self.worker and self.worker.isRunning():
             QMessageBox.warning(self, "警告", "清洗正在进行中！")
             return
-        
-        # 检查是否选择了文件
-        if not self.selected_files:
-            QMessageBox.warning(self, "警告", "请先选择要清洗的文件")
+
+        from services.storage import get_raw_store
+        if get_raw_store().count_uncleaned() == 0:
+            QMessageBox.information(self, "提示", "没有待清洗的原始新闻")
             return
         
         # 检查AI配置
@@ -329,8 +286,7 @@ class NewsCleaningPage(QWidget):
         
         # 禁用按钮
         self.clean_btn.setEnabled(False)
-        self.select_files_btn.setEnabled(False)
-        
+
         # 清空显示
         self.progress_browser.clear()
         self.result_browser.clear()
@@ -340,17 +296,16 @@ class NewsCleaningPage(QWidget):
         self.add_progress("=" * 60)
         self.add_progress(f"开始清洗 - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         self.add_progress("=" * 60)
-        self.add_progress(f"文件数量: {len(self.selected_files)}")
         self.add_progress(f"AI服务商: {current_provider}")
         self.add_progress(f"每批数量: {self.batch_spin.value()} 条")
-        
-        # 创建工作线程
+        self.add_progress(f"数据源: SQLite 原始库（最多 {self.sqlite_limit_spin.value()} 条）")
+
         self.worker = NewsCleaningWorker(
-            file_paths=self.selected_files,
             criteria=self.current_criteria,
             ai_provider=current_provider,
             batch_size=self.batch_spin.value(),
-            auto_merge=self.auto_merge_check.isChecked()
+            auto_merge=self.auto_merge_check.isChecked(),
+            sqlite_limit=self.sqlite_limit_spin.value(),
         )
         
         # 连接信号
@@ -382,38 +337,28 @@ class NewsCleaningPage(QWidget):
         self.add_progress("✅ 清洗完成！")
         self.add_progress("=" * 60)
         
-        statistics = result['statistics']
-        
-        # 显示结果
+        statistics = result["statistics"]
         result_text = f"""
-清洗完成！
+清洗完成！（已写入 SQLite）
 
 📊 统计信息
 ────────────────────────
-原始数量: {statistics['source_count']} 条
-已保留:   {statistics['kept_count']} 条 ({statistics['kept_percent']}%)
-已去除:   {statistics['removed_count']} 条 ({statistics['removed_percent']}%)
+处理数量: {statistics['source_count']} 条
+AI 保留:   {statistics['kept_count']} 条 ({statistics['kept_percent']}%)
+AI 剔除:   {statistics['removed_count']} 条 ({statistics['removed_percent']}%)
 
-💾 保存文件
+💾 入库
 ────────────────────────
-已保留: {os.path.basename(result['kept_file'])}
-已去除: {os.path.basename(result['removed_file'])}
-
-文件位置: data/cleaned/
+精选库新增: {statistics.get('inserted_curated', 0)} 条
+剔除记录新增: {statistics.get('inserted_rejected', 0)} 条
         """.strip()
-        
         self.result_browser.setPlainText(result_text)
-        
-        # 保存文件路径供后续使用
-        self.last_kept_file = result['kept_file']
-        self.last_removed_file = result['removed_file']
-        
-        # 启用按钮
+
         self.clean_btn.setEnabled(True)
-        self.select_files_btn.setEnabled(True)
         self.view_kept_btn.setEnabled(True)
         self.view_removed_btn.setEnabled(True)
         self.use_for_analysis_btn.setEnabled(True)
+        self._refresh_uncleaned_count()
     
     @pyqtSlot(str)
     def on_cleaning_error(self, error_msg):
@@ -423,10 +368,9 @@ class NewsCleaningPage(QWidget):
         self.add_progress("=" * 60)
         
         self.clean_btn.setEnabled(True)
-        self.select_files_btn.setEnabled(True)
-        
+
         QMessageBox.critical(self, "错误", error_msg)
-    
+
     def add_progress(self, message):
         """添加进度信息"""
         timestamp = datetime.now().strftime("%H:%M:%S")
@@ -434,35 +378,24 @@ class NewsCleaningPage(QWidget):
         self.progress_browser.moveCursor(QTextCursor.End)
     
     def view_kept_news(self):
-        """查看保留的新闻"""
-        if hasattr(self, 'last_kept_file') and os.path.exists(self.last_kept_file):
-            os.startfile(self.last_kept_file)
-        else:
-            QMessageBox.warning(self, "提示", "保留文件不存在")
-    
+        """提示前往数据管理查看精选库"""
+        QMessageBox.information(
+            self, "提示", "保留新闻已写入 SQLite 精选库，请前往【数据管理】→ 精选库查看。"
+        )
+
     def view_removed_news(self):
-        """查看去除的新闻"""
-        if hasattr(self, 'last_removed_file') and os.path.exists(self.last_removed_file):
-            os.startfile(self.last_removed_file)
-        else:
-            QMessageBox.warning(self, "提示", "去除文件不存在")
-    
+        """提示前往数据管理查看剔除记录"""
+        QMessageBox.information(
+            self, "提示", "剔除记录已写入 SQLite，请前往【数据管理】→ 剔除记录查看。"
+        )
+
     def use_for_analysis(self):
-        """将清洗后的数据用于AI分析"""
-        if hasattr(self, 'last_kept_file') and os.path.exists(self.last_kept_file):
-            # 切换到AI分析页面并自动填充文件路径
-            try:
-                main_window = self.window()
-                if hasattr(main_window, 'switch_to_ai_analysis'):
-                    main_window.switch_to_ai_analysis(self.last_kept_file)
-                else:
-                    QMessageBox.information(
-                        self, "提示",
-                        f"清洗文件已保存：\n{self.last_kept_file}\n\n"
-                        "请前往【AI分析】页面，选择此文件进行分析"
-                    )
-            except Exception as e:
-                QMessageBox.warning(self, "提示", f"跳转失败: {e}")
-        else:
-            QMessageBox.warning(self, "提示", "保留文件不存在")
+        """提示前往 AI 分析"""
+        QMessageBox.information(
+            self, "提示",
+            "请前往【AI 分析】页面，选择 SQLite 精选库作为数据源。"
+        )
+
+    def refresh(self):
+        self._refresh_uncleaned_count()
 

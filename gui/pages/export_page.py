@@ -13,8 +13,6 @@ from gui.utils.styles import *
 import os
 import json
 from datetime import datetime
-from collections import OrderedDict
-
 
 class ExportPage(QWidget):
     """数据导出页面"""
@@ -123,8 +121,8 @@ class ExportPage(QWidget):
         source_layout.addWidget(QLabel("数据来源:"))
         
         self.source_group = QButtonGroup()
-        self.raw_radio = QRadioButton("原始数据 (data/raw)")
-        self.cleaned_radio = QRadioButton("清洗后数据 (data/cleaned)")
+        self.raw_radio = QRadioButton("原始库 (SQLite)")
+        self.cleaned_radio = QRadioButton("精选库 (SQLite)")
         self.raw_radio.setChecked(True)
         
         self.source_group.addButton(self.raw_radio)
@@ -208,7 +206,7 @@ class ExportPage(QWidget):
         self.export_data(save_dir)
     
     def export_data(self, save_dir):
-        """导出数据（读取JSON、去重、合并）"""
+        """导出数据（从 SQLite 读取、去重、导出）"""
         # 检查至少选择一种类型
         if not (self.export_json.isChecked() or self.export_md.isChecked() or self.export_txt.isChecked()):
             QMessageBox.warning(self, "警告", "请至少选择一种导出类型！")
@@ -225,11 +223,13 @@ class ExportPage(QWidget):
             start = self.start_datetime.dateTime().toPyDateTime()
             end = self.end_datetime.dateTime().toPyDateTime()
             
-            progress.setLabelText("正在读取JSON文件...")
+            progress.setLabelText("正在从 SQLite 读取数据...")
             progress.setValue(10)
-            
-            # 读取并合并所有JSON数据
-            merged_news = self.load_and_merge_json(start, end)
+
+            from core.news_exporter import NewsExporter
+
+            source = "cleaned" if self.cleaned_radio.isChecked() else "raw"
+            merged_news = NewsExporter().load_from_store(source, start, end)
             
             if not merged_news:
                 if self.cleaned_radio.isChecked():
@@ -317,133 +317,7 @@ class ExportPage(QWidget):
             QMessageBox.critical(self, "错误", f"导出失败: {str(e)}\n\n详细错误请查看控制台")
             import traceback
             print(traceback.format_exc())
-    
-    def load_and_merge_json(self, start_datetime, end_datetime):
-        """读取并合并时间范围内的所有JSON数据（去重，智能筛选）"""
-        # 根据选择确定数据源目录和文件模式
-        if self.cleaned_radio.isChecked():
-            source_dir = 'data/cleaned'
-            file_pattern = '_clear.json'  # 只读取_clear文件
-        else:
-            source_dir = 'data/raw'
-            file_pattern = '.json'  # 所有json文件
-        
-        if not os.path.exists(source_dir):
-            return []
-        
-        # 用于去重的字典（key: 新闻唯一标识, value: 新闻数据）
-        news_dict = OrderedDict()
-        all_news_dict = OrderedDict()  # 存储所有新闻（用于备选）
-        
-        # 遍历所有JSON文件
-        for filename in os.listdir(source_dir):
-            if not filename.endswith(file_pattern):
-                continue
-            
-            filepath = os.path.join(source_dir, filename)
-            
-            try:
-                with open(filepath, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                
-                # 处理不同的JSON结构
-                # 1. 清洗数据结构：{'metadata': {...}, 'news': [...]}
-                # 2. 原始列表结构：[...]
-                # 3. 原始字典结构：{'news': [...]}
-                if isinstance(data, dict) and 'metadata' in data and 'news' in data:
-                    news_list = data['news']
-                elif isinstance(data, list):
-                    news_list = data
-                else:
-                    news_list = data.get('news', [])
-                
-                for news in news_list:
-                    # 获取时间字符串
-                    time_str = self.get_news_time_str(news)
-                    
-                    # 解析新闻时间
-                    news_time = self.parse_news_time(time_str)
-                    if not news_time:
-                        # 即使无法解析时间，也保存到all_news_dict
-                        unique_key = f"unknown_{news.get('title', '')}"
-                        if unique_key not in all_news_dict:
-                            all_news_dict[unique_key] = news
-                        continue
-                    
-                    # 生成唯一标识（时间+标题）
-                    unique_key = f"{time_str}_{news.get('title', '')}"
-                    
-                    # 存储所有新闻（用于备选）
-                    if unique_key not in all_news_dict:
-                        all_news_dict[unique_key] = news
-                    
-                    # 检查是否在时间范围内（宽松匹配）
-                    # 只要新闻时间与目标时间段有交集就包含
-                    if start_datetime <= news_time <= end_datetime:
-                        # 去重：只保留第一次出现的
-                        if unique_key not in news_dict:
-                            news_dict[unique_key] = news
-                
-            except Exception as e:
-                print(f"读取文件 {filename} 失败: {e}")
-                continue
-        
-        # 如果严格匹配有结果，返回严格匹配的
-        if news_dict:
-            merged_news = list(news_dict.values())
-            # 应用语义去重（5分钟窗口 + 60%相似度）
-            from core.semantic_dedup import semantic_deduplicate
-            merged_news = semantic_deduplicate(merged_news)
-            merged_news.sort(key=lambda x: self.parse_news_time(self.get_news_time_str(x)) or datetime.min, reverse=True)
-            return merged_news
-        
-        # 如果严格匹配没有结果，使用宽松策略
-        print(f"严格匹配没有结果，使用宽松策略...")
-        
-        # 策略1: 找出最接近的新闻（时间上最近的）
-        news_with_time = []
-        for news in all_news_dict.values():
-            time_str = self.get_news_time_str(news)
-            news_time = self.parse_news_time(time_str)
-            if news_time:
-                news_with_time.append((news, news_time))
-        
-        if not news_with_time:
-            # 如果所有新闻都没有有效时间，返回所有新闻
-            print("没有找到有效时间的新闻，返回所有数据")
-            all_news = list(all_news_dict.values())
-            # 应用语义去重（5分钟窗口 + 60%相似度）
-            from core.semantic_dedup import semantic_deduplicate
-            all_news = semantic_deduplicate(all_news)
-            return all_news
-        
-        # 按时间排序
-        news_with_time.sort(key=lambda x: x[1], reverse=True)
-        
-        # 找出在目标时间前后的新闻（扩展时间范围）
-        result_news = []
-        for news, news_time in news_with_time:
-            # 如果新闻时间在目标时间段附近（前后扩展50%）
-            time_range = end_datetime - start_datetime
-            extended_start = start_datetime - time_range * 0.5
-            extended_end = end_datetime + time_range * 0.5
-            
-            if extended_start <= news_time <= extended_end:
-                result_news.append(news)
-        
-        # 如果扩展后还是没有，就返回最新的新闻
-        if not result_news:
-            print("扩展时间范围后仍无结果，返回最新的新闻")
-            # 返回最新的一批新闻（最多100条）
-            result_news = [news for news, _ in news_with_time[:100]]
-        
-        # 应用语义去重（5分钟窗口 + 60%相似度）
-        from core.semantic_dedup import semantic_deduplicate
-        result_news = semantic_deduplicate(result_news)
-        
-        print(f"宽松策略找到 {len(result_news)} 条新闻")
-        return result_news
-    
+
     def get_news_time_str(self, news):
         """获取新闻的时间字符串（优先使用datetime，其次time）"""
         return news.get('datetime') or news.get('time', '')

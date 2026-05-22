@@ -6,7 +6,6 @@
 import os
 import json
 from datetime import datetime
-from collections import OrderedDict
 from typing import List, Dict, Tuple
 
 
@@ -42,11 +41,11 @@ class NewsExporter:
             }
         """
         try:
-            # 加载并合并数据
-            news_list = self.load_and_merge_json(
+            # 从 SQLite 加载数据
+            news_list = self.load_from_store(
                 source=source,
                 start_datetime=start_datetime,
-                end_datetime=end_datetime
+                end_datetime=end_datetime,
             )
             
             if not news_list:
@@ -92,81 +91,31 @@ class NewsExporter:
                 'error': str(e)
             }
     
-    def load_and_merge_json(self, 
-                           source: str,
-                           start_datetime: datetime,
-                           end_datetime: datetime) -> List[Dict]:
-        """读取并合并时间范围内的所有JSON数据"""
-        # 确定数据源目录和文件模式
-        if source == 'cleaned':
-            source_dir = 'data/cleaned'
-            file_pattern = '_clear.json'
+    def load_from_store(
+        self,
+        source: str,
+        start_datetime: datetime,
+        end_datetime: datetime,
+    ) -> List[Dict]:
+        """从 SQLite 读取时间范围内的新闻并语义去重。"""
+        from core.semantic_dedup import semantic_deduplicate
+        from services.storage import get_raw_store, get_curated_store
+
+        if source == "cleaned":
+            store = get_curated_store()
         else:
-            source_dir = 'data/raw'
-            file_pattern = '.json'
-        
-        if not os.path.exists(source_dir):
+            store = get_raw_store()
+
+        news_list = store.get_news_in_range(start_datetime, end_datetime)
+        if not news_list:
             return []
-        
-        news_dict = OrderedDict()
-        all_news_dict = OrderedDict()
-        
-        # 遍历所有JSON文件
-        for filename in os.listdir(source_dir):
-            if not filename.endswith(file_pattern):
-                continue
-            
-            filepath = os.path.join(source_dir, filename)
-            
-            try:
-                with open(filepath, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                
-                # 处理不同的JSON结构
-                if isinstance(data, dict) and 'metadata' in data and 'news' in data:
-                    news_list = data['news']
-                elif isinstance(data, list):
-                    news_list = data
-                else:
-                    news_list = data.get('news', [])
-                
-                for news in news_list:
-                    time_str = self._get_news_time_str(news)
-                    news_time = self._parse_news_time(time_str)
-                    
-                    if not news_time:
-                        unique_key = f"unknown_{news.get('title', '')}"
-                        if unique_key not in all_news_dict:
-                            all_news_dict[unique_key] = news
-                        continue
-                    
-                    unique_key = f"{time_str}_{news.get('title', '')}"
-                    
-                    if unique_key not in all_news_dict:
-                        all_news_dict[unique_key] = news
-                    
-                    if start_datetime <= news_time <= end_datetime:
-                        if unique_key not in news_dict:
-                            news_dict[unique_key] = news
-                
-            except Exception as e:
-                print(f"读取文件 {filename} 失败: {e}")
-                continue
-        
-        # 如果有严格匹配结果
-        if news_dict:
-            merged_news = list(news_dict.values())
-            # 语义去重
-            from core.semantic_dedup import semantic_deduplicate
-            merged_news = semantic_deduplicate(merged_news)
-            # 按时间倒序排序
-            merged_news.sort(
-                key=lambda x: self._parse_news_time(self._get_news_time_str(x)) or datetime.min,
-                reverse=True
-            )
-            return merged_news
-        
-        return []
+
+        news_list = semantic_deduplicate(news_list)
+        news_list.sort(
+            key=lambda x: self._parse_news_time(self._get_news_time_str(x)) or datetime.min,
+            reverse=True,
+        )
+        return news_list
     
     def save_markdown(self, news_list: List[Dict], filepath: str, 
                      source: str, time_range: Tuple[datetime, datetime]):

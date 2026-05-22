@@ -228,21 +228,23 @@ class DataLoader:
 
 
 if __name__ == '__main__':
-    # 测试数据加载器
     loader = DataLoader()
 
-    # 测试JSON
-    json_file = 'data/raw/12-21.json'
-    if os.path.exists(json_file):
-        result = loader.load(json_file)
-        print(f"JSON格式: {result['count']}条新闻")
+    from services.storage import get_raw_store
+
+    news_list = get_raw_store().get_all_news()[:10]
+    if news_list:
+        result = {
+            'news_list': news_list,
+            'count': len(news_list),
+            'time_range': (news_list[-1].get('datetime'), news_list[0].get('datetime')),
+        }
+        print(f"SQLite 原始库抽样: {result['count']} 条新闻")
         print(f"时间范围: {result['time_range']}")
 
-        # 格式化为AI输入
-        ai_input = loader.format_for_ai(
-            result['news_list'][:10],
-            'json'
-        )
+        ai_input = loader.format_for_ai(news_list, 'json')
         print(f"AI输入预览:\n{ai_input[:500]}...")
         print(f"估算tokens: {loader.estimate_tokens(ai_input)}")
+    else:
+        print("原始库为空，跳过测试")
 

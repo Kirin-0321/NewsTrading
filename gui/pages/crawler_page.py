@@ -338,22 +338,26 @@ class CrawlerPage(QWidget):
         self.progress_label.setText(message)
         self.news_count_label.setText(f"已获取: {news_count} 条新闻")
     
-    def on_crawler_finished(self, files):
-        """爬虫完成"""
-        self.add_log("=" * 60)
-        self.add_log(f"爬取完成！生成了 {len(files)} 个文件")
-        self.add_log("=" * 60)
-        
-        # 更新历史记录
-        files_text = "\n".join([os.path.basename(f) for f in files])
-        self.history_label.setText(f"最近生成的文件:\n{files_text}")
-        
+    def on_crawler_finished(self, stats):
+        """爬虫完成（stats 为 SQLite 入库统计）"""
+        if isinstance(stats, dict):
+            inserted = stats.get("inserted", 0)
+            skipped = stats.get("skipped", 0)
+            self.add_log("=" * 60)
+            self.add_log(f"爬取完成！新增入库 {inserted} 条，跳过 {skipped} 条")
+            self.add_log("=" * 60)
+            self.history_label.setText(
+                f"最近爬取:\n新增 {inserted} 条 | 跳过 {skipped} 条\n存储: SQLite 原始库"
+            )
+            msg = f"爬取完成！\n新增入库 {inserted} 条\n跳过重复 {skipped} 条"
+        else:
+            self.add_log("=" * 60)
+            self.add_log("爬取完成")
+            self.add_log("=" * 60)
+            msg = "爬取完成"
+
         self.reset_buttons()
-        
-        QMessageBox.information(
-            self, "成功",
-            f"爬取完成！\n生成了 {len(files)} 个文件"
-        )
+        QMessageBox.information(self, "成功", msg)
     
     def on_crawler_error(self, error_msg):
         """爬虫出错"""
