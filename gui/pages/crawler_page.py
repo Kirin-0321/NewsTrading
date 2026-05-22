@@ -339,17 +339,44 @@ class CrawlerPage(QWidget):
         self.news_count_label.setText(f"已获取: {news_count} 条新闻")
     
     def on_crawler_finished(self, stats):
-        """爬虫完成（stats 为 SQLite 入库统计）"""
+        """爬虫完成（stats 含入库与清洗统计）"""
         if isinstance(stats, dict):
             inserted = stats.get("inserted", 0)
             skipped = stats.get("skipped", 0)
             self.add_log("=" * 60)
             self.add_log(f"爬取完成！新增入库 {inserted} 条，跳过 {skipped} 条")
+            clean_ok = stats.get("clean_ok", False)
+            clean_stats = stats.get("clean") or {}
+            if clean_ok:
+                processed = clean_stats.get("processed", 0)
+                kept = clean_stats.get(
+                    "inserted_curated", clean_stats.get("kept", 0)
+                )
+                removed = clean_stats.get(
+                    "inserted_rejected", clean_stats.get("removed", 0)
+                )
+                if processed:
+                    self.add_log(
+                        f"清洗完成！处理 {processed} 条，"
+                        f"保留 {kept} 条，剔除 {removed} 条"
+                    )
+                    clean_msg = (
+                        f"\n清洗：处理 {processed} 条\n"
+                        f"保留 {kept} 条，剔除 {removed} 条"
+                    )
+                else:
+                    self.add_log("清洗完成：暂无待清洗新闻")
+                    clean_msg = "\n清洗：暂无待清洗新闻"
+            else:
+                clean_error = stats.get("clean_error") or "未知错误"
+                self.add_log(f"清洗失败: {clean_error}")
+                clean_msg = f"\n清洗失败: {clean_error}"
             self.add_log("=" * 60)
             self.history_label.setText(
-                f"最近爬取:\n新增 {inserted} 条 | 跳过 {skipped} 条\n存储: SQLite 原始库"
+                f"最近爬取:\n新增 {inserted} 条 | 跳过 {skipped} 条\n"
+                f"存储: SQLite 原始库"
             )
-            msg = f"爬取完成！\n新增入库 {inserted} 条\n跳过重复 {skipped} 条"
+            msg = f"爬取完成！\n新增入库 {inserted} 条\n跳过重复 {skipped} 条{clean_msg}"
         else:
             self.add_log("=" * 60)
             self.add_log("爬取完成")
@@ -357,7 +384,10 @@ class CrawlerPage(QWidget):
             msg = "爬取完成"
 
         self.reset_buttons()
-        QMessageBox.information(self, "成功", msg)
+        if isinstance(stats, dict) and stats.get("clean_ok") is False:
+            QMessageBox.warning(self, "部分完成", msg)
+        else:
+            QMessageBox.information(self, "成功", msg)
     
     def on_crawler_error(self, error_msg):
         """爬虫出错"""

@@ -96,13 +96,14 @@ class CuratedStore:
             for news in items:
                 rid = f"rej_{news_item_id(news)}"
                 raw_id = str(news.get("raw_id") or news.get("id") or "")
+                item_reason = news.get("removal_reason") or reason
                 cur = conn.execute(
                     """
                     INSERT OR IGNORE INTO rejected_news
                     (id, raw_id, title, rejected_at, reason)
                     VALUES (?, ?, ?, ?, ?)
                     """,
-                    (rid, raw_id, news.get("title") or "", rejected_at, reason),
+                    (rid, raw_id, news.get("title") or "", rejected_at, item_reason),
                 )
                 if cur.rowcount > 0:
                     count += 1

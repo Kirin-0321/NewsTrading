@@ -104,8 +104,16 @@ class CleanSyncService:
                 "removed": len(removed),
                 "inserted_curated": kept_count,
                 "inserted_rejected": removed_count,
+                "error_skipped": clean_result.get("metadata", {}).get("error_skipped", 0),
             }
-            log(f"清洗完成: 保留 {kept_count}，剔除 {removed_count}")
+            skipped = result.stats["error_skipped"]
+            if skipped:
+                log(
+                    f"清洗完成: 保留 {kept_count}，剔除 {removed_count}，"
+                    f"审核跳过 {skipped} 条"
+                )
+            else:
+                log(f"清洗完成: 保留 {kept_count}，剔除 {removed_count}")
 
         except Exception as e:
             result.error = str(e)
