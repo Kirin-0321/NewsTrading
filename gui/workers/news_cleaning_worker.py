@@ -69,12 +69,6 @@ class NewsCleaningWorker(QThread):
             inserted = curated_store.upsert_cleaned(kept, provider=self.ai_provider)
             rejected = curated_store.save_rejected(removed)
 
-            if uncleaned:
-                times = [raw_store.parse_time(n) for n in uncleaned]
-                times = [t for t in times if t]
-                if times:
-                    curated_store.set_clean_watermark(max(times))
-
             source_count = len(uncleaned)
             kept_count = len(kept)
             removed_count = len(removed)

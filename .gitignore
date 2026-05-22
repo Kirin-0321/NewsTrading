@@ -15,14 +15,8 @@ env/
 # 数据文件
 Typora/
 chrome-win64/
-data/raw/*.json
-data/summaries/*.md
-data/summaries/*.txt
-data/analysis/*.md
 data/exports/*
 data/AI_analysis/
-data/raw/OLD/
-data/cleaned/*.json
 分析数据/盘后总结/
 !data/**/.gitkeep
 
@@ -33,7 +27,6 @@ data/cleaned/*.json
 
 # 日志
 logs/*.log
-logs/workflows/
 .mypy_cache/
 
 # 本地快捷方式与空占位

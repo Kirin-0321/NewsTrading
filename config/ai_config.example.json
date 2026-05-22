@@ -71,5 +71,13 @@
     "stocks_per_sector": 5,
     "detail_level": "standard",
     "max_input_tokens": 15000
+  },
+  "theme_extraction": {
+    "enabled": true,
+    "auto_run": true,
+    "provider": "deepseek",
+    "model": "deepseek-v4-flash",
+    "temperature": 0.2,
+    "max_tokens": 32768
   }
 }

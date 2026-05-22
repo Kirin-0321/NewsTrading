@@ -25,6 +25,7 @@ class AIAnalysisWorker(QThread):
         sqlite_source=None,
         sqlite_start=None,
         sqlite_end=None,
+        extract_themes=None,
     ):
         super().__init__()
         self.provider = provider
@@ -36,6 +37,7 @@ class AIAnalysisWorker(QThread):
         self.sqlite_source = sqlite_source
         self.sqlite_start = sqlite_start
         self.sqlite_end = sqlite_end
+        self.extract_themes = extract_themes
 
     def run(self):
         try:
@@ -62,6 +64,7 @@ class AIAnalysisWorker(QThread):
                 stocks_per_sector=self.stocks_per_sector,
                 max_news=self.max_news,
                 market_summary=self.market_summary,
+                extract_themes=self.extract_themes,
                 progress_callback=progress_callback,
             )
             if result.ok:
@@ -71,6 +74,8 @@ class AIAnalysisWorker(QThread):
                     "report_file": result.report_path,
                     "news_count": result.news_count,
                     "time_range": result.time_range,
+                    "theme_count": result.theme_count,
+                    "theme_error": result.theme_error,
                 })
             else:
                 self.error.emit(result.error or "分析失败")

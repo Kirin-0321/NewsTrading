@@ -1,0 +1,652 @@
+{
+  "themes": [
+    {
+      "theme_name": "具身智能/机器人",
+      "theme_category": "科技AI",
+      "strength_score": 78,
+      "strength_level": "强",
+      "priority_rank": 1,
+      "duration": "中期",
+      "expectation_gap": "中",
+      "sentiment": "利好",
+      "is_cold": 0,
+      "reason": "全球具身智能专利爆发，中国贡献过半；智元西南基地首批200台人形机器人下线；Figure人形机器人无故障工作200小时，产业从0到1加速确认。",
+      "catalyst": "智元机器人量产下线、Figure应用突破",
+      "resonance_count": 3,
+      "risk_note": null,
+      "raw_excerpt": "全球具身智能专利累计近20万件，中国贡献过半；智元西南具身智能基地首批200台人形机器人正式下线；Figure人形机器人无故障工作200小时，累计处理25万件包裹。",
+      "stocks": [
+        {
+          "name": "绿的谐波",
+          "code": "688017.SH",
+          "role": "上游",
+          "elasticity": 3,
+          "reason": "谐波减速器核心零部件，受益于量产降本"
+        },
+        {
+          "name": "拓普集团",
+          "code": "601689.SH",
+          "role": "核心",
+          "elasticity": null,
+          "reason": "汽车零部件转机器人，技术同源，产能复用"
+        },
+        {
+          "name": "三花智控",
+          "code": "002050.SZ",
+          "role": "核心",
+          "elasticity": null,
+          "reason": "热管理核心供应商，受益于机器人量产"
+        },
+        {
+          "name": "鸣志电器",
+          "code": "603728.SH",
+          "role": "上游",
+          "elasticity": 3,
+          "reason": "电机龙头，人形机器人量产带动需求爆发"
+        },
+        {
+          "name": "优必选(港股)",
+          "code": null,
+          "role": "中游",
+          "elasticity": 3,
+          "reason": "人形机器人整机制造商，产品落地"
+        }
+      ],
+      "news": [
+        {
+          "ref": "新闻8",
+          "title": null,
+          "relation_type": "主因"
+        },
+        {
+          "ref": "新闻109",
+          "title": null,
+          "relation_type": "主因"
+        },
+        {
+          "ref": "新闻127",
+          "title": null,
+          "relation_type": "共振"
+        }
+      ]
+    },
+    {
+      "theme_name": "AI算力/基础设施",
+      "theme_category": "科技AI",
+      "strength_score": 75,
+      "strength_level": "强",
+      "priority_rank": 2,
+      "duration": "中期",
+      "expectation_gap": "中",
+      "sentiment": "利好",
+      "is_cold": 0,
+      "reason": "华为发布AI DC数据基础设施全栈方案，加速企业AI落地；英伟达Rubin生态圈成本暴增，拉动HBM、PCB等需求；国内算力基建确定性受益。",
+      "catalyst": "华为AI DC方案发布、英伟达Rubin生态圈",
+      "resonance_count": 3,
+      "risk_note": null,
+      "raw_excerpt": "华为发布AI DC数据基础设施全栈方案，加速企业AI落地；英伟达Rubin生态圈：内存、PCB、ABF等成本暴增。",
+      "stocks": [
+        {
+          "name": "高新发展",
+          "code": "000628.SZ",
+          "role": "中游",
+          "elasticity": 3,
+          "reason": "华为昇腾核心合作伙伴，受益于国产算力基建"
+        },
+        {
+          "name": "英维克",
+          "code": "002837.SZ",
+          "role": "上游",
+          "elasticity": null,
+          "reason": "液冷散热趋势，受益于AI数据中心需求"
+        },
+        {
+          "name": "沪电股份",
+          "code": "002463.SZ",
+          "role": "上游",
+          "elasticity": 3,
+          "reason": "PCB龙头，Rubin架构对HDI板需求激增"
+        },
+        {
+          "name": "中际旭创",
+          "code": "300308.SZ",
+          "role": "上游",
+          "elasticity": 3,
+          "reason": "光模块龙头，800G/1.6T需求增长"
+        },
+        {
+          "name": "工业富联",
+          "code": "601138.SH",
+          "role": "中游",
+          "elasticity": 3,
+          "reason": "AI服务器整机制造商，受益于出货量增长"
+        },
+        {
+          "name": "网宿科技",
+          "code": "300017.SZ",
+          "role": "下游",
+          "elasticity": null,
+          "reason": "CDN向边缘计算转型，算力网络部署经验复用"
+        }
+      ],
+      "news": [
+        {
+          "ref": "新闻106",
+          "title": null,
+          "relation_type": "主因"
+        },
+        {
+          "ref": "新闻148",
+          "title": null,
+          "relation_type": "共振"
+        },
+        {
+          "ref": "新闻149",
+          "title": null,
+          "relation_type": "共振"
+        }
+      ]
+    },
+    {
+      "theme_name": "特高压/智能电网",
+      "theme_category": "新能源",
+      "strength_score": 73,
+      "strength_level": "强",
+      "priority_rank": 3,
+      "duration": "长期",
+      "expectation_gap": "中",
+      "sentiment": "利好",
+      "is_cold": 0,
+      "reason": "国家发改委明确十五五期间拟投超5万亿建设新型电网；甘浙特高压受端配套工程首条送出线路贯通，长周期景气确立。",
+      "catalyst": "发改委5万亿电网规划、特高压线路贯通",
+      "resonance_count": 3,
+      "risk_note": null,
+      "raw_excerpt": "国家发改委：“十五五”拟投超5万亿建设新型电网；甘浙特高压受端配套工程首条送出线路贯通。",
+      "stocks": [
+        {
+          "name": "国电南瑞",
+          "code": "600406.SH",
+          "role": "核心",
+          "elasticity": null,
+          "reason": "二次设备龙头，确定性最高"
+        },
+        {
+          "name": "中国西电",
+          "code": "601179.SH",
+          "role": "核心",
+          "elasticity": null,
+          "reason": "主设备商，直接受益于特高压建设"
+        },
+        {
+          "name": "许继电气",
+          "code": "000400.SZ",
+          "role": "上游",
+          "elasticity": 2,
+          "reason": "换流阀等核心设备，受益于特高压线路采购"
+        },
+        {
+          "name": "平高电气",
+          "code": "600312.SH",
+          "role": "上游",
+          "elasticity": 2,
+          "reason": "开关设备龙头，特高压线路建设直接拉动"
+        }
+      ],
+      "news": [
+        {
+          "ref": "新闻118",
+          "title": null,
+          "relation_type": "主因"
+        },
+        {
+          "ref": "新闻117",
+          "title": null,
+          "relation_type": "共振"
+        },
+        {
+          "ref": "新闻143",
+          "title": null,
+          "relation_type": "共振"
+        }
+      ]
+    },
+    {
+      "theme_name": "智慧城市/民生IT",
+      "theme_category": "基建",
+      "strength_score": 70,
+      "strength_level": "强",
+      "priority_rank": 4,
+      "duration": "长期",
+      "expectation_gap": "高",
+      "sentiment": "利好",
+      "is_cold": 0,
+      "reason": "国务院印发《关于推行常住地提供基本公共服务的实施意见》，将驱动教育、医疗、政务信息化投入长期增长，市场认知不足。",
+      "catalyst": "国务院公共服务新政",
+      "resonance_count": null,
+      "risk_note": null,
+      "raw_excerpt": "国务院印发《关于推行常住地提供基本公共服务的实施意见》，全面推进公共服务均等化。利好智慧城市、教育医疗IT。",
+      "stocks": [
+        {
+          "name": "太极股份",
+          "code": "002368.SZ",
+          "role": "下游",
+          "elasticity": 2,
+          "reason": "政务云龙头，公共服务新政催生数字政务需求"
+        },
+        {
+          "name": "卫宁健康",
+          "code": "300253.SZ",
+          "role": "下游",
+          "elasticity": 2,
+          "reason": "医疗IT龙头，常住地医保服务均等化驱动系统升级"
+        },
+        {
+          "name": "佳发教育",
+          "code": "300559.SZ",
+          "role": "下游",
+          "elasticity": null,
+          "reason": "教育信息化标的，低估值修复，随迁子女教育政策推动"
+        },
+        {
+          "name": "科大讯飞",
+          "code": "002230.SZ",
+          "role": "下游",
+          "elasticity": 2,
+          "reason": "教育信息化核心，AI平台受益于公共服务数字化"
+        },
+        {
+          "name": "创业慧康",
+          "code": "300451.SZ",
+          "role": "下游",
+          "elasticity": 2,
+          "reason": "医疗IT，常住地医疗服务均等化带来增量"
+        }
+      ],
+      "news": [
+        {
+          "ref": "新闻40",
+          "title": null,
+          "relation_type": "主因"
+        }
+      ]
+    },
+    {
+      "theme_name": "金融IT/券商",
+      "theme_category": "金融",
+      "strength_score": 65,
+      "strength_level": "强",
+      "priority_rank": 5,
+      "duration": "中期",
+      "expectation_gap": "中",
+      "sentiment": "利好",
+      "is_cold": 0,
+      "reason": "八部门联合整治非法跨境证券活动，设置2年过渡期，利好资金回流A股及合规券商，同时带来系统升级需求。",
+      "catalyst": "八部门整治非法跨境证券",
+      "resonance_count": null,
+      "risk_note": null,
+      "raw_excerpt": "中国证监会牵头八部门开展非法跨境证券期货基金经营活动综合整治，设置2年过渡期。利好境内券商、金融IT。",
+      "stocks": [
+        {
+          "name": "恒生电子",
+          "code": "600570.SH",
+          "role": "核心",
+          "elasticity": 2,
+          "reason": "金融IT龙头，券商合规与交易系统升级改造需求"
+        },
+        {
+          "name": "顶点软件",
+          "code": "603383.SH",
+          "role": "核心",
+          "elasticity": 2,
+          "reason": "金融IT提供商，系统升级受益"
+        },
+        {
+          "name": "东方财富",
+          "code": "300059.SZ",
+          "role": "核心",
+          "elasticity": null,
+          "reason": "境内券商龙头，资金回流利好"
+        },
+        {
+          "name": "中信证券",
+          "code": "600030.SH",
+          "role": "核心",
+          "elasticity": null,
+          "reason": "头部券商，市场份额提升"
+        }
+      ],
+      "news": [
+        {
+          "ref": "新闻75",
+          "title": null,
+          "relation_type": "主因"
+        }
+      ]
+    },
+    {
+      "theme_name": "光伏",
+      "theme_category": "新能源",
+      "strength_score": 60,
+      "strength_level": "强",
+      "priority_rank": 6,
+      "duration": "中期",
+      "expectation_gap": "中",
+      "sentiment": "利好",
+      "is_cold": 0,
+      "reason": "First Solar核心电池专利在华被认定无效，利好国内光伏企业出海，降低诉讼风险。",
+      "catalyst": "First Solar专利在华被判无效",
+      "resonance_count": null,
+      "risk_note": null,
+      "raw_excerpt": "光伏专利战关键转折：First Solar一核心电池专利在华被认定无效。",
+      "stocks": [
+        {
+          "name": "晶科能源",
+          "code": "688223.SH",
+          "role": "核心",
+          "elasticity": null,
+          "reason": "光伏组件龙头，出海受益"
+        },
+        {
+          "name": "隆基绿能",
+          "code": "601012.SH",
+          "role": "核心",
+          "elasticity": null,
+          "reason": "光伏龙头，受益于专利壁垒降低"
+        },
+        {
+          "name": "天合光能",
+          "code": "688599.SH",
+          "role": "核心",
+          "elasticity": null,
+          "reason": "光伏组件龙头，出海知识产权环境改善"
+        }
+      ],
+      "news": [
+        {
+          "ref": "新闻142",
+          "title": null,
+          "relation_type": "主因"
+        }
+      ]
+    },
+    {
+      "theme_name": "量子计算",
+      "theme_category": "科技AI",
+      "strength_score": 65,
+      "strength_level": "强",
+      "priority_rank": 7,
+      "duration": "长期",
+      "expectation_gap": "高",
+      "sentiment": "利好",
+      "is_cold": 0,
+      "reason": "特朗普政府计划向9家量子计算公司注资20亿美元，政府持有少数股权，引发中美前沿科技竞赛预期，催化国内量子计算产业政策预期。",
+      "catalyst": "美国政府20亿美元注资量子计算",
+      "resonance_count": null,
+      "risk_note": null,
+      "raw_excerpt": "特朗普政府计划向9家量子计算公司注资20亿美元，政府持有少数股权。",
+      "stocks": [
+        {
+          "name": "国盾量子",
+          "code": "688027.SH",
+          "role": "核心",
+          "elasticity": null,
+          "reason": "量子计算龙头，直接受益于国内政策联动预期"
+        },
+        {
+          "name": "科大国创",
+          "code": "300520.SZ",
+          "role": "核心",
+          "elasticity": null,
+          "reason": "量子计算概念股，主题催化"
+        }
+      ],
+      "news": [
+        {
+          "ref": "新闻42",
+          "title": null,
+          "relation_type": "主因"
+        }
+      ]
+    },
+    {
+      "theme_name": "智能驾驶",
+      "theme_category": "科技AI",
+      "strength_score": 55,
+      "strength_level": "中",
+      "priority_rank": null,
+      "duration": "短期",
+      "expectation_gap": null,
+      "sentiment": "利好",
+      "is_cold": 0,
+      "reason": "比亚迪官宣5月28日举办智能化战略发布会，市场期待智驾平权新技术突破。",
+      "catalyst": "比亚迪智能化战略发布会",
+      "resonance_count": null,
+      "risk_note": null,
+      "raw_excerpt": "比亚迪官宣5月28日举办智能化战略发布会。",
+      "stocks": [
+        {
+          "name": "比亚迪",
+          "code": "002594.SZ",
+          "role": "核心",
+          "elasticity": null,
+          "reason": "智能驾驶发布会直接催化"
+        },
+        {
+          "name": "德赛西威",
+          "code": "002920.SZ",
+          "role": "核心",
+          "elasticity": null,
+          "reason": "智能驾驶零部件龙头，受益于行业推进"
+        },
+        {
+          "name": "经纬恒润",
+          "code": "688326.SH",
+          "role": "核心",
+          "elasticity": null,
+          "reason": "智能驾驶解决方案提供商"
+        }
+      ],
+      "news": [
+        {
+          "ref": "新闻86",
+          "title": null,
+          "relation_type": "主因"
+        }
+      ]
+    },
+    {
+      "theme_name": "半导体封测",
+      "theme_category": "科技AI",
+      "strength_score": 55,
+      "strength_level": "中",
+      "priority_rank": null,
+      "duration": "中期",
+      "expectation_gap": null,
+      "sentiment": "利好",
+      "is_cold": 0,
+      "reason": "华天科技控股子公司拟30亿元投资集成电路封测项目，反映行业景气度回升，下游需求旺盛。",
+      "catalyst": "华天科技30亿封测投资",
+      "resonance_count": null,
+      "risk_note": null,
+      "raw_excerpt": "华天科技控股子公司拟30亿元投资集成电路封测项目。",
+      "stocks": [
+        {
+          "name": "华天科技",
+          "code": "002185.SZ",
+          "role": "核心",
+          "elasticity": null,
+          "reason": "直接受益于封测扩产"
+        },
+        {
+          "name": "长电科技",
+          "code": "600584.SH",
+          "role": "核心",
+          "elasticity": null,
+          "reason": "封测龙头，行业景气回升"
+        },
+        {
+          "name": "通富微电",
+          "code": "002156.SZ",
+          "role": "核心",
+          "elasticity": null,
+          "reason": "封测大厂，受益于需求增长"
+        }
+      ],
+      "news": [
+        {
+          "ref": "新闻51",
+          "title": null,
+          "relation_type": "主因"
+        }
+      ]
+    },
+    {
+      "theme_name": "小家电出口",
+      "theme_category": "消费",
+      "strength_score": 50,
+      "strength_level": "中",
+      "priority_rank": null,
+      "duration": "中期",
+      "expectation_gap": null,
+      "sentiment": "利好",
+      "is_cold": 0,
+      "reason": "中国向美国出口小家电回暖，部分订单从东南亚回流，显示中国供应链韧性。",
+      "catalyst": "小家电订单回流",
+      "resonance_count": null,
+      "risk_note": null,
+      "raw_excerpt": "中国向美国出口小家电回暖，部分订单从东南亚回流。",
+      "stocks": [
+        {
+          "name": "新宝股份",
+          "code": "002705.SZ",
+          "role": "核心",
+          "elasticity": null,
+          "reason": "小家电出口龙头，订单回暖受益"
+        },
+        {
+          "name": "比依股份",
+          "code": "603908.SH",
+          "role": "核心",
+          "elasticity": null,
+          "reason": "小家电出口企业，边际改善"
+        },
+        {
+          "name": "奥马电器",
+          "code": "002668.SZ",
+          "role": "核心",
+          "elasticity": null,
+          "reason": "冰箱出口龙头，受益于外需回暖"
+        }
+      ],
+      "news": [
+        {
+          "ref": "新闻17",
+          "title": null,
+          "relation_type": "主因"
+        }
+      ]
+    },
+    {
+      "theme_name": "创新药",
+      "theme_category": "医药",
+      "strength_score": 40,
+      "strength_level": "中",
+      "priority_rank": null,
+      "duration": "长期",
+      "expectation_gap": null,
+      "sentiment": "利好",
+      "is_cold": 0,
+      "reason": "2025年商业健康险对创新药械支付达152亿元，同比增长23%，商保支付占比提升，为创新药提供新增量。",
+      "catalyst": "商业健康险支付数据",
+      "resonance_count": null,
+      "risk_note": null,
+      "raw_excerpt": "2025年商业健康险对创新药械支付达152亿元，同比增长23%。",
+      "stocks": [],
+      "news": [
+        {
+          "ref": "新闻120",
+          "title": null,
+          "relation_type": "主因"
+        }
+      ]
+    },
+    {
+      "theme_name": "种业",
+      "theme_category": "消费",
+      "strength_score": 35,
+      "strength_level": "弱",
+      "priority_rank": null,
+      "duration": "长期",
+      "expectation_gap": null,
+      "sentiment": "利好",
+      "is_cold": 0,
+      "reason": "杂交水稻研究取得多项阶段性成果，保障粮食安全长期逻辑。",
+      "catalyst": "杂交水稻技术成果",
+      "resonance_count": null,
+      "risk_note": null,
+      "raw_excerpt": "杂交水稻研究取得多项阶段性成果。",
+      "stocks": [],
+      "news": [
+        {
+          "ref": "新闻45",
+          "title": null,
+          "relation_type": "主因"
+        }
+      ]
+    },
+    {
+      "theme_name": "原油/石油石化",
+      "theme_category": "周期",
+      "strength_score": 20,
+      "strength_level": "弱",
+      "priority_rank": null,
+      "duration": "短期",
+      "expectation_gap": "低",
+      "sentiment": "利空",
+      "is_cold": 1,
+      "reason": "中东冲突持续但被反复定价，油价波动受地缘影响已钝化，追高风险极大。",
+      "catalyst": null,
+      "resonance_count": null,
+      "risk_note": "强制冷处理：油价跳升、美军增兵等若无质变变量，避免追高。",
+      "raw_excerpt": "原油/黄金/军工均按规则强制冷处理，跌出核心推荐。",
+      "stocks": [],
+      "news": []
+    },
+    {
+      "theme_name": "黄金/贵金属",
+      "theme_category": "周期",
+      "strength_score": 20,
+      "strength_level": "弱",
+      "priority_rank": null,
+      "duration": "短期",
+      "expectation_gap": "低",
+      "sentiment": "利空",
+      "is_cold": 1,
+      "reason": "黄金价格高位，避险逻辑钝化，边际刺激递减，追高风险极大。",
+      "catalyst": null,
+      "resonance_count": null,
+      "risk_note": "强制冷处理：黄金价格高位，边际刺激递减，避免追高。",
+      "raw_excerpt": "黄金/贵金属...强制冷处理。",
+      "stocks": [],
+      "news": []
+    },
+    {
+      "theme_name": "军工",
+      "theme_category": "军工",
+      "strength_score": 20,
+      "strength_level": "弱",
+      "priority_rank": null,
+      "duration": "短期",
+      "expectation_gap": "低",
+      "sentiment": "利空",
+      "is_cold": 1,
+      "reason": "地缘冲突脱敏，传统军工刺激边际递减，缺乏预期差，不建议追高。",
+      "catalyst": null,
+      "resonance_count": null,
+      "risk_note": "强制冷处理：地缘冲突脱敏，除非重大超预期升级，否则不建议追高。",
+      "raw_excerpt": "军工（传统方向）...地缘冲突脱敏。",
+      "stocks": [],
+      "news": []
+    }
+  ]
+}

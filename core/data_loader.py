@@ -1,250 +1,117 @@
 """
-数据加载器
-支持加载JSON、Markdown、TXT三种格式的数据
+分析阶段的数据加载器。
+
+仅支持 JSON 格式：services.analysis_service 会从 SQLite 取数后写入临时 JSON，
+再交由 AINewsAnalyzer 走本加载器读取并格式化。
 """
 
-import os
 import json
-import re
-from typing import List, Dict, Optional
+import os
+from typing import Dict, List, Optional
 
 
 class DataLoader:
-    """统一的数据加载器"""
-
-    def __init__(self):
-        self.supported_formats = ['.json', '.md', '.txt']
-
-    def detect_format(self, file_path: str) -> str:
-        """自动识别文件格式"""
-        ext = os.path.splitext(file_path)[1].lower()
-
-        if ext == '.json':
-            return 'json'
-        elif ext == '.md':
-            return 'markdown'
-        elif ext == '.txt':
-            return 'txt'
-        else:
-            raise ValueError(f"不支持的文件格式: {ext}")
+    """JSON 新闻数据加载与 AI 输入格式化。"""
 
     def load(self, file_path: str) -> Dict:
         """
-        根据格式自动加载数据
-        返回: {
-            'format': 'json/markdown/txt',
-            'news_list': [...],
-            'count': 100,
-            'time_range': {'start': '...', 'end': '...'}
-        }
+        加载 JSON 文件，返回:
+            {
+                'format': 'json',
+                'news_list': [...],
+                'count': int,
+                'time_range': {'start': str | None, 'end': str | None}
+            }
         """
         if not os.path.exists(file_path):
             raise FileNotFoundError(f"文件不存在: {file_path}")
 
-        format_type = self.detect_format(file_path)
+        ext = os.path.splitext(file_path)[1].lower()
+        if ext != '.json':
+            raise ValueError(f"仅支持 JSON 格式，收到: {ext}")
 
-        if format_type == 'json':
-            return self.load_json(file_path)
-        elif format_type == 'markdown':
-            return self.load_markdown(file_path)
-        elif format_type == 'txt':
-            return self.load_txt(file_path)
-
-    def load_json(self, file_path: str) -> Dict:
-        """加载JSON格式"""
         with open(file_path, 'r', encoding='utf-8') as f:
             data = json.load(f)
 
-        # 统一格式化为新闻列表
         if isinstance(data, list):
             news_list = data
         elif isinstance(data, dict):
             news_list = data.get('news', [])
         else:
-            raise ValueError("不支持的JSON结构")
-
-        # 提取时间范围
-        time_range = self._extract_time_range(news_list)
+            raise ValueError("不支持的 JSON 结构")
 
         return {
             'format': 'json',
             'news_list': news_list,
             'count': len(news_list),
-            'time_range': time_range
+            'time_range': self._extract_time_range(news_list),
         }
 
-    def load_markdown(self, file_path: str) -> Dict:
-        """加载Markdown格式"""
-        with open(file_path, 'r', encoding='utf-8') as f:
-            content = f.read()
-
-        news_list = []
-
-        # 解析Markdown格式
-        # 匹配 ## 数字. 标题 格式
-        pattern = r'##\s+\d+\.\s+(.+?)\n\n\*\*时间\*\*:\s*(.+?)\n\*\*来源\*\*:\s*(.+?)(?:\n\n\*\*内容\*\*:\n(.+?))?(?=\n---|\Z)'
-
-        matches = re.finditer(pattern, content, re.DOTALL)
-
-        for match in matches:
-            title = match.group(1).strip()
-            datetime_str = match.group(2).strip()
-            source = match.group(3).strip()
-            content_text = match.group(4).strip() if match.group(4) else ""
-
-            news_list.append({
-                'title': title,
-                'datetime': datetime_str,
-                'source': source,
-                'content': content_text
-            })
-
-        # 提取时间范围
-        time_range = self._extract_time_range(news_list)
-
-        return {
-            'format': 'markdown',
-            'news_list': news_list,
-            'count': len(news_list),
-            'time_range': time_range
-        }
-
-    def load_txt(self, file_path: str) -> Dict:
-        """加载TXT格式（极简标题列表）"""
-        news_list = []
-
-        with open(file_path, 'r', encoding='utf-8') as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-
-                # 解析格式: 时间 | 标题
-                if ' | ' in line:
-                    parts = line.split(' | ', 1)
-                    if len(parts) == 2:
-                        news_list.append({
-                            'datetime': parts[0].strip(),
-                            'title': parts[1].strip()
-                        })
-
-        # 提取时间范围
-        time_range = self._extract_time_range(news_list)
-
-        return {
-            'format': 'txt',
-            'news_list': news_list,
-            'count': len(news_list),
-            'time_range': time_range
-        }
-
-    def _extract_time_range(self, news_list: List[Dict]) -> Dict:
-        """提取新闻的时间范围"""
-        if not news_list:
+    @staticmethod
+    def _extract_time_range(news_list: List[Dict]) -> Dict:
+        """从新闻列表提取最早/最晚时间。"""
+        times = [
+            n.get('datetime') or n.get('time', '')
+            for n in news_list
+            if n.get('datetime') or n.get('time')
+        ]
+        if not times:
             return {'start': None, 'end': None}
-
-        times = []
-        for news in news_list:
-            time_str = news.get('datetime') or news.get('time', '')
-            if time_str:
-                times.append(time_str)
-
-        if times:
-            return {
-                'start': min(times),
-                'end': max(times)
-            }
-        else:
-            return {'start': None, 'end': None}
+        return {'start': min(times), 'end': max(times)}
 
     def format_for_ai(
         self,
         news_list: List[Dict],
-        format_type: str,
-        max_items: Optional[int] = None
+        format_type: str = 'json',
+        max_items: Optional[int] = None,
     ) -> str:
         """
-        格式化数据供AI分析使用
+        将新闻列表格式化为 AI prompt 文本：「N. 【时间】标题\\n   内容」。
+
+        重要：必须给每条新闻打 1-based 序号前缀。
+        AI 在报告中以「[新闻X](#新闻X)」格式引用，下游
+        AINewsAnalyzer._extract_referenced_news 通过 ``news_list[X - 1]``
+        反查原文，序号必须与 news_list 索引严格对齐，否则报告
+        引用与底部原文将错乱。
+
+        Args:
+            news_list: 新闻列表
+            format_type: 已退化为占位参数（兼容旧签名），统一输出带编号格式
+            max_items: 截断条数（可选）
         """
-        # 限制数量
         if max_items and len(news_list) > max_items:
             news_list = news_list[:max_items]
 
-        if format_type == 'txt':
-            # TXT格式：只发送时间和标题
-            lines = []
-            for news in news_list:
-                time_str = news.get('datetime', '')
-                title = news.get('title', '')
-                lines.append(f"{time_str} | {title}")
-            return '\n'.join(lines)
+        items = []
+        for idx, news in enumerate(news_list, 1):
+            time_str = news.get('datetime') or news.get('time', '')
+            title = news.get('title', '')
+            content = news.get('content', '')
+            item = f"{idx}. 【{time_str}】{title}"
+            if content:
+                item += f"\n   {content}"
+            items.append(item)
+        return '\n\n'.join(items)
 
-        elif format_type == 'json':
-            # JSON格式：发送标题+内容
-            items = []
-            for news in news_list:
-                time_str = news.get('datetime', '')
-                title = news.get('title', '')
-                content = news.get('content', '')
-
-                item = f"【{time_str}】{title}"
-                if content:
-                    item += f"\n{content}"
-
-                items.append(item)
-            return '\n\n'.join(items)
-
-        elif format_type == 'markdown':
-            # Markdown格式：保持格式
-            items = []
-            for idx, news in enumerate(news_list, 1):
-                time_str = news.get('datetime', '')
-                title = news.get('title', '')
-                content = news.get('content', '')
-
-                item = f"{idx}. 【{time_str}】{title}"
-                if content:
-                    item += f"\n   {content}"
-
-                items.append(item)
-            return '\n\n'.join(items)
-
-        else:
-            return str(news_list)
-
-    def estimate_tokens(self, text: str) -> int:
+    @staticmethod
+    def estimate_tokens(text: str) -> int:
         """
-        估算文本的token数量
-        中文: 1字符 ≈ 2 tokens
-        英文: 1单词 ≈ 1.3 tokens
-        粗略估算: len(text) / 2
+        粗略估算 token 数：中文 ≈ 2 token/字，英文 ≈ 0.25 token/字符。
         """
-        # 简单估算
         chinese_count = sum(1 for c in text if '\u4e00' <= c <= '\u9fff')
         english_count = len(text) - chinese_count
-
-        estimated_tokens = chinese_count * 2 + english_count / 4
-        return int(estimated_tokens)
+        return int(chinese_count * 2 + english_count / 4)
 
 
 if __name__ == '__main__':
-    loader = DataLoader()
-
     from services.storage import get_raw_store
 
     news_list = get_raw_store().get_all_news()[:10]
     if news_list:
-        result = {
-            'news_list': news_list,
-            'count': len(news_list),
-            'time_range': (news_list[-1].get('datetime'), news_list[0].get('datetime')),
-        }
-        print(f"SQLite 原始库抽样: {result['count']} 条新闻")
-        print(f"时间范围: {result['time_range']}")
-
-        ai_input = loader.format_for_ai(news_list, 'json')
+        loader = DataLoader()
+        ai_input = loader.format_for_ai(news_list)
+        print(f"SQLite 原始库抽样: {len(news_list)} 条")
         print(f"AI输入预览:\n{ai_input[:500]}...")
         print(f"估算tokens: {loader.estimate_tokens(ai_input)}")
     else:
         print("原始库为空，跳过测试")
-

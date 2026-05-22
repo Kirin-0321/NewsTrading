@@ -110,6 +110,7 @@ class CuratedStore:
         return count
 
     def get_meta(self, key: str) -> Optional[str]:
+        """读取 sync_meta 通用键值，未来扩展用。"""
         with get_connection() as conn:
             row = conn.execute(
                 "SELECT value FROM sync_meta WHERE key = ?", (key,)
@@ -117,6 +118,7 @@ class CuratedStore:
         return row["value"] if row else None
 
     def set_meta(self, key: str, value: str) -> None:
+        """写入 sync_meta 通用键值，未来扩展用。"""
         with get_connection() as conn:
             conn.execute(
                 """
@@ -125,18 +127,6 @@ class CuratedStore:
                 """,
                 (key, value),
             )
-
-    def get_clean_watermark(self) -> Optional[datetime]:
-        val = self.get_meta("clean_watermark_ts")
-        if not val:
-            return None
-        try:
-            return datetime.fromtimestamp(int(val))
-        except (TypeError, ValueError, OSError):
-            return None
-
-    def set_clean_watermark(self, ts: datetime) -> None:
-        self.set_meta("clean_watermark_ts", str(int(ts.timestamp())))
 
     def get_daily_stats(self) -> List[Dict]:
         with get_connection() as conn:

@@ -1,12 +1,14 @@
 """
 ② 数据清理服务：从未清洗原始数据 → AI 清洗 → 精选库 / 剔除库
+
+未清洗判定基于 raw LEFT JOIN curated/rejected（见 RawStore.get_uncleaned_news），
+无需额外维护时间水位线。
 """
 
 import json
 import os
 from dataclasses import dataclass, field
-from datetime import datetime
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, Optional
 
 from services.storage import get_raw_store, get_curated_store
 
@@ -49,13 +51,33 @@ class CleanSyncService:
             batch_size: AI 批大小
             provider: AI 服务商
             limit: 单次最多处理条数
-            progress_callback: 文本进度回调
+            progress_callback: 文本进度回调，签名 ``Callable[[str], None]``。
+                NewsCleaner 内部既会 1 参（普通日志）也会 5 参（批次进度）地调
+                progress_callback，本方法会将 5 参合并为单字符串再上抛，
+                保证对外契约始终是单参文本。
 
         Returns:
             CleanSyncResult
         """
         result = CleanSyncResult()
         log = progress_callback or (lambda _m: None)
+
+        # 适配 NewsCleaner 的双签名回调，统一为单参字符串
+        def _adapter(*args):
+            if not progress_callback:
+                return
+            if len(args) == 1:
+                progress_callback(args[0])
+                return
+            if len(args) == 5:
+                batch_info, current, total, kept, removed = args
+                progress_callback(
+                    f"{batch_info}: {current}/{total} "
+                    f"(保留 {kept}, 剔除 {removed})"
+                )
+                return
+            # 其他签名兜底，避免再次出现 TypeError
+            progress_callback(" | ".join(str(a) for a in args))
 
         try:
             from core.news_cleaner import NewsCleaner
@@ -77,7 +99,7 @@ class CleanSyncService:
                 uncleaned,
                 batch_size=batch_size,
                 auto_merge=False,
-                progress_callback=progress_callback,
+                progress_callback=_adapter,
             )
 
             kept = clean_result.get("kept", [])
@@ -85,14 +107,6 @@ class CleanSyncService:
 
             kept_count = self.curated_store.upsert_cleaned(kept, provider=provider)
             removed_count = self.curated_store.save_rejected(removed)
-
-            if uncleaned:
-                last_ts = max(
-                    (self.raw_store.parse_time(n) for n in uncleaned),
-                    key=lambda x: x or datetime.min,
-                )
-                if last_ts:
-                    self.curated_store.set_clean_watermark(last_ts)
 
             result.processed = len(uncleaned)
             result.kept = kept_count

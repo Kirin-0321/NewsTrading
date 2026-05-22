@@ -101,19 +101,14 @@ cd /d "dist\新闻爬虫系统"
 if not exist "data" (
     echo     [提示] data目录未打包，正在创建...
     mkdir "data"
-    mkdir "data\raw"
-    mkdir "data\cleaned"
     mkdir "data\exports"
     mkdir "data\AI_analysis"
-    mkdir "data\summaries"
-    mkdir "data\analysis"
 ) else (
     echo     [完成] data目录已打包
 )
 
 if not exist "logs" (
     mkdir "logs"
-    mkdir "logs\workflows"
 )
 
 echo     [完成] 目录结构检查完成
@@ -139,8 +134,7 @@ echo   - 新闻爬虫系统.exe      (主程序)
 echo   - chrome-win64\         (Chrome浏览器)
 echo   - Typora\               (Markdown阅读器)
 echo   - config\               (AI配置、清洗规则)
-echo   - data\                 (数据目录)
-echo   - workflows\            (工作流配置)
+echo   - data\                 (数据目录, 含 SQLite 主库 news.db)
 echo   - 模板\                 (提示词模板)
 echo   - 盘后总结\             (盘后总结示例)
 echo   - 图标.ico              (程序图标)

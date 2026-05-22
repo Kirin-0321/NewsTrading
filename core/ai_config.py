@@ -67,7 +67,7 @@ class AIConfig:
                 "deepseek": {
                     "api_key": "",
                     "base_url": "https://api.deepseek.com/v1",
-                    "model": "deepseek-chat",
+                    "model": "deepseek-v4-pro",
                     "max_tokens": 4000,
                     "temperature": 0.7
                 },
@@ -176,6 +176,23 @@ class AIConfig:
         """获取分析参数"""
         return self.config.get('analysis_params', {})
 
+    def get_theme_extraction_config(self) -> Dict:
+        """获取题材抽取配置。
+
+        默认值与 ai_config.example.json 保持一致，避免老配置文件缺失字段时崩溃。
+        """
+        defaults = {
+            "enabled": True,
+            "auto_run": True,
+            "provider": "deepseek",
+            "model": "deepseek-v4-flash",
+            "temperature": 0.2,
+            "max_tokens": 32768,
+        }
+        cfg = dict(defaults)
+        cfg.update(self.config.get("theme_extraction", {}) or {})
+        return cfg
+
     def set_analysis_param(self, key: str, value):
         """设置分析参数"""
         if 'analysis_params' not in self.config:
@@ -197,9 +214,12 @@ class AIConfig:
         models = {
             'openai': ['gpt-4', 'gpt-4-turbo', 'gpt-3.5-turbo'],
             'deepseek': [
-                'deepseek-chat',           # V3.2正式版 (推荐，长文本+Agent优化)
-                'deepseek-reasoner',       # R1推理模型 (深度思考)
-                'deepseek-coder'           # 代码专用
+                # DeepSeek V4（2026-04-24 发布，1M 上下文，支持思考模式）
+                'deepseek-v4-pro',         # 旗舰版，1.6T 参数，前沿推理/编码/长 Agent
+                'deepseek-v4-flash',       # 经济版，284B 参数，高吞吐场景
+                # 旧别名（将于 2026-07-24 停用，仅做兼容保留）
+                'deepseek-chat',           # → 实际指向 v4-flash 非思考模式
+                'deepseek-reasoner',       # → 实际指向 v4-flash 思考模式
             ],
             'zhipu': ['glm-4', 'glm-3-turbo'],
             'qwen': ['qwen-max', 'qwen-plus', 'qwen-turbo'],

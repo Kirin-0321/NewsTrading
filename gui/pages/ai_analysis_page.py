@@ -5,7 +5,7 @@ AI分析页面
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                              QPushButton, QGroupBox, QComboBox, QLineEdit,
                              QTextBrowser, QMessageBox,
-                             QDateTimeEdit)
+                             QDateTimeEdit, QCheckBox)
 from PyQt5.QtCore import QDateTime
 from PyQt5.QtGui import QTextCursor
 from datetime import datetime, timedelta
@@ -323,9 +323,16 @@ class AIAnalysisPage(QWidget):
         row2 = QHBoxLayout()
         row2.addWidget(QLabel("快捷范围:"))
         self.range_preset_combo = QComboBox()
-        self.range_preset_combo.addItems([
-            "最近 24 小时", "最近 48 小时", "最近 7 天", "全部数据", "自定义",
-        ])
+        # (显示文本, key) —— 用 key 判断分支，避免新增项时 index 错位
+        for label, key in [
+            ("最近 24 小时", "24h"),
+            ("最近 48 小时", "48h"),
+            ("最近 7 天", "7d"),
+            ("上一收盘日 14:00 至今", "last_close_14"),
+            ("全部数据", "all"),
+            ("自定义", "custom"),
+        ]:
+            self.range_preset_combo.addItem(label, key)
         self.range_preset_combo.setStyleSheet(COMBOBOX_STYLE)
         self.range_preset_combo.currentIndexChanged.connect(self._on_range_preset_changed)
         row2.addWidget(self.range_preset_combo, 1)
@@ -363,23 +370,55 @@ class AIAnalysisPage(QWidget):
     def _on_db_source_changed(self, _index=None):
         self._refresh_db_stats()
 
-    def _on_range_preset_changed(self, index):
-        if index == 3:
+    def _on_range_preset_changed(self, _index=None):
+        key = self.range_preset_combo.currentData()
+        if key == "all":
             start, end = self._get_source_time_bounds()
             if start and end:
                 self.start_datetime.setDateTime(QDateTime(start))
                 self.end_datetime.setDateTime(QDateTime(end))
             return
-        if index == 4:
+        if key == "custom":
             return
+
         now = QDateTime.currentDateTime()
         self.end_datetime.setDateTime(now)
-        if index == 0:
+
+        if key == "24h":
             self.start_datetime.setDateTime(now.addSecs(-86400))
-        elif index == 1:
+        elif key == "48h":
             self.start_datetime.setDateTime(now.addSecs(-86400 * 2))
-        elif index == 2:
+        elif key == "7d":
             self.start_datetime.setDateTime(now.addDays(-7))
+        elif key == "last_close_14":
+            self.start_datetime.setDateTime(QDateTime(self._last_trading_close_14()))
+
+    @staticmethod
+    def _last_trading_close_14() -> datetime:
+        """
+        返回"上一次收盘日下午 14:00"的时间。
+
+        规则：
+            - A 股交易日为周一(0) ~ 周五(4)
+            - 若今天是交易日且当前时间已过 14:00，则起点为今天 14:00
+            - 否则回溯到最近一个早于今天的交易日 14:00（自动跳过周末）
+
+        示例（now → 起点）：
+            周四 09:00 → 周三 14:00
+            周一 09:00 → 上周五 14:00
+            周四 16:00 → 周四 14:00
+            周六 任意 → 周五 14:00
+        """
+        now = datetime.now()
+        today_14 = now.replace(hour=14, minute=0, second=0, microsecond=0)
+
+        if now.weekday() < 5 and now >= today_14:
+            return today_14
+
+        d = (now - timedelta(days=1)).date()
+        while d.weekday() >= 5:  # 跳过周六(5)、周日(6)
+            d = d - timedelta(days=1)
+        return datetime(d.year, d.month, d.day, 14, 0, 0)
 
     def _refresh_db_stats(self):
         try:
@@ -450,8 +489,25 @@ class AIAnalysisPage(QWidget):
         self.summary_input.setMaximumHeight(120)
         layout.addWidget(self.summary_input)
 
+        # 题材抽取开关
+        theme_row = QHBoxLayout()
+        self.extract_theme_check = QCheckBox(
+            "📌 分析完成后自动抽取题材并入库（题材预测库）"
+        )
+        self.extract_theme_check.setChecked(True)
+        self.extract_theme_check.setStyleSheet(
+            "QCheckBox { font-size: 13px; color: #262626; padding-top: 4px; }"
+        )
+        self.extract_theme_check.setToolTip(
+            "勾选后分析报告生成完会调用另一个 AI（默认 deepseek-v4-flash）"
+            "抽取结构化题材入 SQLite，可在【题材预测】页面查看。"
+        )
+        theme_row.addWidget(self.extract_theme_check)
+        theme_row.addStretch()
+        layout.addLayout(theme_row)
+
         group.setLayout(layout)
-        
+
         return group
 
     def create_progress_group(self):
@@ -719,6 +775,7 @@ class AIAnalysisPage(QWidget):
             sqlite_source=sqlite_source,
             sqlite_start=sqlite_start,
             sqlite_end=sqlite_end,
+            extract_themes=self.extract_theme_check.isChecked(),
         )
 
         self.worker.finished.connect(self.on_analysis_finished)
@@ -737,12 +794,22 @@ class AIAnalysisPage(QWidget):
         time_range = result.get('time_range', {})
         start_time = time_range.get('start', '未知')
         end_time = time_range.get('end', '未知')
+        theme_count = result.get('theme_count', 0)
+        theme_error = result.get('theme_error')
+        theme_line = ""
+        if theme_count:
+            theme_line = f"\n题材入库: {theme_count} 条 ✅"
+        elif theme_error:
+            theme_line = f"\n题材抽取: ⚠️ {theme_error}"
+        elif self.extract_theme_check.isChecked():
+            theme_line = "\n题材抽取: 已开启但未入库（可能未识别到题材）"
+
         summary = f"""
 分析完成！
 
 新闻数量: {result.get('news_count', 0)} 条
 时间范围: {start_time} 至 {end_time}
-报告文件: {result.get('report_file', '未知')}
+报告文件: {result.get('report_file', '未知')}{theme_line}
         """.strip()
 
         self.add_progress(summary)

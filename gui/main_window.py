@@ -16,6 +16,7 @@ from gui.pages.crawler_page import CrawlerPage
 from gui.pages.data_page import DataPage
 from gui.pages.export_page import ExportPage
 from gui.pages.ai_analysis_page import AIAnalysisPage
+from gui.pages.theme_prediction_page import ThemePredictionPage
 from gui.pages.schedule_page import SchedulePage
 from gui.pages.news_cleaning_page import NewsCleaningPage
 from core.scheduler_service import SchedulerService
@@ -81,6 +82,7 @@ class MainWindow(QMainWindow):
             'data': DataPage(),
             'export': ExportPage(),
             'ai_analysis': AIAnalysisPage(),
+            'theme_prediction': ThemePredictionPage(),
             'cleaning': NewsCleaningPage(),
             'schedule': SchedulePage(scheduler_service=self.scheduler_service)
         }
@@ -117,6 +119,7 @@ class MainWindow(QMainWindow):
 #            ('analysis', '📊 新闻分析（弃用）'),
             ('export', '📤 数据导出'),
             ('ai_analysis', '🤖 AI分析'),
+            ('theme_prediction', '🎯 预测题材'),
             ('schedule', '⏰ 定时任务'),
         ]
 

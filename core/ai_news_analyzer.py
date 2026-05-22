@@ -4,6 +4,7 @@ AI新闻分析器核心
 """
 
 import os
+import re
 import json
 from datetime import datetime
 from typing import Dict, List, Optional, Callable
@@ -32,64 +33,75 @@ class AINewsAnalyzer:
     def build_user_prompt(
         self,
         news_data: str,
-        max_sectors = 6,  # 可以是int或'auto'
-        stocks_per_sector = 5,  # 可以是int或'auto'
+        max_sectors=6,  # int 或 'auto'
+        stocks_per_sector=5,  # int 或 'auto'
         template_name: Optional[str] = None,
-        market_summary: Optional[str] = None
+        market_summary: Optional[str] = None,
     ) -> str:
-        """构建用户提示词（支持自动模式）"""
+        """
+        构建 user prompt。
+
+        Prompt cache 友好策略（关键）:
+            DeepSeek / Qwen / OpenAI 等 LLM 服务商按 prompt **前缀** 自动命中缓存，
+            命中部分计费降至 1/10。本方法将 prompt 拆为两段：
+
+                [前段 - 静态]   模板正文 + max_sectors/stocks_per_sector 渲染结果
+                [后段 - 动态]   market_summary（可选）+ news_data
+
+            模板里若内嵌 ``{news_data}`` / ``{market_summary}`` 占位符，
+            一律置空丢弃，统一追加到末尾。这样无需用户改模板即可获得 cache 收益。
+
+        占位符渲染规则:
+            ``{max_sectors}`` / ``{stocks_per_sector}`` -> 按值替换（数值或 'auto' 描述）
+            ``{news_data}``                            -> 置空，数据追加到末尾
+            ``{market_summary}``                       -> 置空，数据追加到末尾
+
+        Args:
+            news_data: 已格式化的新闻文本（带 1-based 编号）
+            max_sectors: 板块数，int 或 'auto'
+            stocks_per_sector: 每板块股票数，int 或 'auto'
+            template_name: 模板 ID，默认取 AIConfig.current_prompt_template
+            market_summary: 盘后总结文本（可选，会拼接到末尾）
+
+        Returns:
+            完整 user prompt 字符串，前段静态可缓存、后段为本次变化数据
+        """
         if template_name:
             template = self.config.get_prompt_template(template_name)
         else:
-            current_template = self.config.get_current_prompt_template()
-            template = self.config.get_prompt_template(current_template)
-        
+            template = self.config.get_prompt_template(
+                self.config.get_current_prompt_template()
+            )
+
         user_prompt_template = template.get('user_prompt_template', '')
-        
-        # 处理自动模式：将'auto'替换为自然语言描述
-        if max_sectors == 'auto':
-            max_sectors_text = "根据新闻数据的实际情况自动确定（建议3-10个）"
-        else:
-            max_sectors_text = str(max_sectors)
-        
-        if stocks_per_sector == 'auto':
-            stocks_per_sector_text = "根据每个板块的实际情况自动确定（建议3-10只）"
-        else:
-            stocks_per_sector_text = str(stocks_per_sector)
-        
-        # 处理盘后总结
-        market_summary_text = ""
-        if market_summary:
-            market_summary_text = f"【盘后总结】\n{market_summary}\n"
-        
-        # 检查模板是否包含 {market_summary} 占位符
-        has_placeholder = '{market_summary}' in user_prompt_template
-        
+
+        max_sectors_text = (
+            "根据新闻数据的实际情况自动确定（建议3-10个）"
+            if max_sectors == 'auto' else str(max_sectors)
+        )
+        stocks_per_sector_text = (
+            "根据每个板块的实际情况自动确定（建议3-10只）"
+            if stocks_per_sector == 'auto' else str(stocks_per_sector)
+        )
+
         try:
-            if has_placeholder:
-                # 模板中有占位符，正常替换
-                return user_prompt_template.format(
-                    news_data=news_data,
-                    max_sectors=max_sectors_text,
-                    stocks_per_sector=stocks_per_sector_text,
-                    market_summary=market_summary_text
-                )
-            else:
-                # 模板中没有占位符，先替换其他变量，再将盘后总结追加到开头
-                base_prompt = user_prompt_template.format(
-                    news_data=news_data,
-                    max_sectors=max_sectors_text,
-                    stocks_per_sector=stocks_per_sector_text
-                )
-                
-                # 如果有盘后总结，追加到提示词开头（在所有内容之前）
-                if market_summary:
-                    base_prompt = market_summary_text + "\n\n" + base_prompt
-                
-                return base_prompt
+            body = user_prompt_template.format(
+                news_data="",
+                market_summary="",
+                max_sectors=max_sectors_text,
+                stocks_per_sector=stocks_per_sector_text,
+            )
         except KeyError as e:
-            # 如果模板缺少必要的占位符，返回错误提示
             raise ValueError(f"提示词模板缺少占位符: {e}")
+
+        body = re.sub(r'\n{3,}', '\n\n', body).strip()
+
+        sections = [body]
+        if market_summary and market_summary.strip():
+            sections.append("---\n\n【盘后总结】\n" + market_summary.strip())
+        sections.append("---\n\n【新闻数据】\n" + news_data)
+
+        return "\n\n".join(sections)
 
     def _stream_chat(
         self,
@@ -136,25 +148,77 @@ class AINewsAnalyzer:
             client = OpenAI(api_key=api_key, base_url=base_url)
 
         model = provider_config.get("model", "gpt-4")
-        response = client.chat.completions.create(
-            model=model,
-            messages=[
+
+        # 场景分流（参见 .huiye/架构方案.md §13）:
+        # AI 分析任务（盘后总结）使用思考模式 + 最高推理强度，
+        # DeepSeek V4 / V4-Pro 均支持 thinking + reasoning_effort，
+        # 通过 extra_body 透传可避免 openai SDK 版本兼容问题。
+        create_kwargs = {
+            "model": model,
+            "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
-            max_tokens=provider_config.get("max_tokens", 4000),
-            temperature=provider_config.get("temperature", 0.7),
-            stream=True,
-        )
+            "max_tokens": provider_config.get("max_tokens", 4000),
+            "temperature": provider_config.get("temperature", 0.7),
+            "stream": True,
+        }
+        if provider == "deepseek" and model.startswith("deepseek-v4"):
+            create_kwargs["extra_body"] = {
+                "thinking": {"type": "enabled"},
+                "reasoning_effort": "max",
+            }
 
-        result = []
+        response = client.chat.completions.create(**create_kwargs)
+
+        # 思考模式下，DeepSeek V4 通过 chunk.delta.reasoning_content 推送
+        # 思考链；普通模式只会有 chunk.delta.content。两者先后到达，
+        # 直接拼接 -> 「思考过程」在前、「正式分析」在后，落到 md 报告。
+        reasoning_parts: List[str] = []
+        content_parts: List[str] = []
+        sent_reasoning_header = False
+        sent_content_header = False
+
         for chunk in response:
-            if chunk.choices[0].delta.content:
-                content = chunk.choices[0].delta.content
-                result.append(content)
+            if not chunk.choices:
+                continue
+            delta = chunk.choices[0].delta
+            reasoning = getattr(delta, "reasoning_content", None)
+            content = delta.content
+
+            if reasoning:
+                if not sent_reasoning_header:
+                    header = "## 🧠 模型思考过程\n\n"
+                    if progress_callback:
+                        progress_callback(header, is_streaming=True)
+                    sent_reasoning_header = True
+                reasoning_parts.append(reasoning)
+                if progress_callback:
+                    progress_callback(reasoning, is_streaming=True)
+
+            if content:
+                if not sent_content_header:
+                    if reasoning_parts:
+                        sep = "\n\n---\n\n## 📋 主要分析\n\n"
+                        if progress_callback:
+                            progress_callback(sep, is_streaming=True)
+                    sent_content_header = True
+                content_parts.append(content)
                 if progress_callback:
                     progress_callback(content, is_streaming=True)
-        return "".join(result)
+
+        reasoning_text = "".join(reasoning_parts).strip()
+        content_text = "".join(content_parts)
+
+        if reasoning_text:
+            return (
+                "## 🧠 模型思考过程\n\n"
+                f"{reasoning_text}\n\n"
+                "---\n\n"
+                "## 📋 主要分析\n\n"
+                f"{content_text}"
+            )
+        return content_text
 
     def analyze_with_openai(
         self,
@@ -424,6 +488,11 @@ class AINewsAnalyzer:
             lines.append("")
             lines.append(f"### 新闻{num}")
             lines.append("")
+
+            # 数据库 ID（题材抽取脚本反查 curated_news 用，永远放标题前）
+            news_db_id = news.get("id") or ""
+            if news_db_id:
+                lines.append(f"**数据库ID**: `{news_db_id}`")
 
             # 时间
             time_str = news.get('datetime') or news.get('time', '未知')

@@ -272,13 +272,18 @@ class NewsCleaner:
                 base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
             client = OpenAI(api_key=api_key, base_url=base_url)
 
-        model = provider_config.get("model") or {
-            "deepseek": "deepseek-chat",
-            "openai": "gpt-4",
-            "zhipu": "glm-4",
-            "qwen": "qwen-plus",
-            "volcengine": "doubao-seed-1-6-251015",
-        }.get(provider, "deepseek-chat")
+        # 场景分流（参见 .huiye/架构方案.md §13）:
+        # 清洗是分类任务，固定使用 deepseek-v4-flash 非思考模式
+        # —— 比 v4-pro 便宜 + 速度快；其他服务商沿用 config 中的 model。
+        if provider == "deepseek":
+            model = "deepseek-v4-flash"
+        else:
+            model = provider_config.get("model") or {
+                "openai": "gpt-4",
+                "zhipu": "glm-4",
+                "qwen": "qwen-plus",
+                "volcengine": "doubao-seed-1-6-251015",
+            }.get(provider, "gpt-4")
 
         response = client.chat.completions.create(
             model=model,

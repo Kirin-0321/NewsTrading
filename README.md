@@ -275,58 +275,6 @@ data/
 
 ---
 
-### 7️⃣ 工作流引擎
-
-<details>
-<summary><b>点击展开详情</b></summary>
-
-#### 内置工作流
-
-**每日新闻分析流程**（daily_news_flow）
-
-```
-Step 1: 爬取新闻
-  ↓ 启用增量爬取，只获取新增新闻
-  
-Step 2: 清洗数据
-  ↓ 使用AI过滤无价值新闻
-  
-Step 3: 导出数据
-  ↓ 导出为Markdown格式
-  
-Step 4: AI分析
-  ↓ 结合盘后总结，生成投资策略
-  
-📄 输出: 完整的分析报告
-```
-
-#### 工作流特性
-- 🔧 **配置化** - JSON配置文件定义流程
-- 📝 **日志记录** - 详细的执行日志
-- 🔄 **错误处理** - 失败重试、状态跟踪
-- ⏱️ **定时执行** - 支持定时自动运行
-- 📊 **执行统计** - 成功率、耗时统计
-
-#### 自定义工作流
-
-可在`workflows/`目录创建自定义工作流：
-
-```python
-from workflows.base import WorkflowBase
-
-class MyWorkflow(WorkflowBase):
-    workflow_id = "my_workflow"
-    name = "我的工作流"
-    
-    def execute(self, params):
-        # 实现你的逻辑
-        pass
-```
-
-</details>
-
----
-
 ## 📖 使用指南
 
 ### 典型工作流程
@@ -483,17 +431,27 @@ F:\爬虫/
 │   ├── ai_config.json        # AI模型配置
 │   └── cleaning_criteria.json # 清洗规则
 │
-├── core/                      # 核心功能模块
+├── core/                      # 核心功能模块（底层能力）
 │   ├── config.py             # 基础配置
 │   ├── news_crawler_scroll.py # 爬虫核心
-│   ├── news_cleaner.py       # 清洗核心
-│   ├── ai_news_analyzer.py   # AI分析核心
+│   ├── news_cleaner.py       # 清洗核心（AI 判别）
+│   ├── ai_news_analyzer.py   # AI 分析核心
 │   ├── news_exporter.py      # 导出功能
-│   ├── data_merger.py        # 数据合并
 │   ├── semantic_dedup.py     # 语义去重
-│   ├── db_helper.py          # 数据库操作
-│   ├── workflow_engine.py    # 工作流引擎
-│   └── scheduler_service.py  # 定时任务服务
+│   ├── scheduler_service.py  # 定时任务服务
+│   ├── ai_config.py          # AI 服务商与模板配置
+│   └── env_loader.py         # .env 加载
+│
+├── services/                  # 业务服务层
+│   ├── crawl_sync_service.py # ① 爬取 → 去重 → 原始库
+│   ├── clean_sync_service.py # ② 清洗 → 精选库 / 剔除库
+│   ├── analysis_service.py   # ③ 分析（GUI + Agent 共用）
+│   ├── scheduled_runner.py   # 定时任务分发
+│   └── storage/              # SQLite 存储层
+│       ├── database.py       # 连接 / 表结构
+│       ├── raw_store.py      # 原始库
+│       ├── curated_store.py  # 精选库 + 剔除库
+│       └── news_utils.py     # 字段归一化
 │
 ├── gui/                       # 界面模块
 │   ├── main_window.py        # 主窗口
@@ -501,32 +459,18 @@ F:\爬虫/
 │   │   ├── crawler_page.py
 │   │   ├── data_page.py
 │   │   ├── news_cleaning_page.py
-│   │   ├── analysis_page.py
 │   │   ├── export_page.py
 │   │   ├── ai_analysis_page.py
 │   │   └── schedule_page.py
 │   ├── workers/              # 后台线程
-│   │   ├── crawler_worker.py
-│   │   └── analysis_worker.py
 │   └── utils/                # 工具函数
-│       └── styles.py
-│
-├── workflows/                 # 工作流模块
-│   ├── base.py               # 工作流基类
-│   ├── daily_news_flow.py    # 每日新闻流程
-│   └── configs/              # 工作流配置
 │
 ├── data/                      # 数据目录
-│   ├── raw/                  # 原始数据
-│   ├── cleaned/              # 清洗后数据
+│   ├── news.db               # SQLite 主库（原始/精选/剔除）
 │   ├── exports/              # 导出数据
-│   ├── AI_analysis/          # AI分析报告
-│   └── crawler.db            # SQLite数据库
+│   └── AI_analysis/          # AI 分析报告
 │
 ├── logs/                      # 日志目录
-│   ├── crawler.log
-│   ├── analysis.log
-│   └── workflows/            # 工作流日志
 │
 ├── chrome-win64/              # Chrome浏览器
 │   ├── chrome.exe
