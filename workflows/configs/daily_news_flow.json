@@ -1,0 +1,68 @@
+{
+  "workflow_id": "daily_news_flow",
+  "name": "每日新闻分析流程",
+  "description": "自动执行爬取、清洗、导出、AI分析的完整流程",
+  "enabled": true,
+  "steps": [
+    {
+      "step": 1,
+      "name": "爬取新闻",
+      "description": "使用爬虫获取最新新闻，支持自动停止"
+    },
+    {
+      "step": 2,
+      "name": "清洗数据",
+      "description": "使用AI过滤无关新闻，保留重要信息"
+    },
+    {
+      "step": 3,
+      "name": "导出数据",
+      "description": "将清洗后的数据导出为Markdown格式"
+    },
+    {
+      "step": 4,
+      "name": "AI分析",
+      "description": "使用短线模板分析新闻，结合盘后总结"
+    }
+  ],
+  "schedule": {
+    "enabled": true,
+    "time": "09:00",
+    "description": "每天早上9点自动执行"
+  },
+  "params": {
+    "crawler": {
+      "scroll_times": 36,
+      "wait_seconds": 6,
+      "auto_stop": true
+    },
+    "cleaner": {
+      "ai_provider": "deepseek",
+      "batch_size": 100
+    },
+    "export": {
+      "source": "cleaned",
+      "format": "markdown",
+      "time_range_hours": 24
+    },
+    "analyzer": {
+      "template": "short_term",
+      "summary_mode": "auto",
+      "summary_file": ""
+    }
+  },
+  "error_handling": {
+    "on_step_error": "abort",
+    "retry_times": 0,
+    "retry_interval": 60
+  },
+  "history": {
+    "last_run": "2026-01-08 11:23:43",
+    "last_status": "success",
+    "last_error": null,
+    "last_duration": 146.122382,
+    "total_runs": 5,
+    "success_count": 3,
+    "failure_count": 2
+  }
+}

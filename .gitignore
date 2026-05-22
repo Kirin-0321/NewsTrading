@@ -1,0 +1,63 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+.venv
+venv/
+ENV/
+env/
+
+# 数据文件
+Typora/
+chrome-win64/
+data/raw/*.json
+data/summaries/*.md
+data/summaries/*.txt
+data/analysis/*.md
+data/exports/*
+data/AI_analysis/
+data/raw/OLD/
+data/cleaned/*.json
+分析数据/盘后总结/
+!data/**/.gitkeep
+
+# 数据库
+*.db
+*.sqlite
+*.sqlite3
+
+# 日志
+logs/*.log
+logs/workflows/
+.mypy_cache/
+
+# 本地快捷方式与空占位
+*.lnk
+
+# 日志目录占位
+!logs/.gitkeep
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 环境变量与本地密钥（勿提交真实 API Key）
+.env
+config/ai_config.json
+
+# Node.js
+node_modules/
+.DS_Store
+
+# 系统文件
+Thumbs.db
+.DS_Store
+

@@ -1,0 +1,38 @@
+[
+  {
+    "name": "1",
+    "time": "09:00",
+    "scroll_times": 36,
+    "wait_seconds": 6,
+    "enabled": true,
+    "last_run": "2026-05-22 09:00:00",
+    "id": "fc1fcd1c-2adb-40b5-aebc-0e5cce19c421"
+  },
+  {
+    "name": "2",
+    "time": "12:00",
+    "scroll_times": 36,
+    "wait_seconds": 6,
+    "enabled": true,
+    "last_run": "2026-05-22 12:00:00",
+    "id": "9997c040-9701-49c0-b372-a2e539f8af4c"
+  },
+  {
+    "name": "3",
+    "time": "15:00",
+    "scroll_times": 36,
+    "wait_seconds": 6,
+    "enabled": true,
+    "last_run": "2026-05-21 15:00:00",
+    "id": "37d998f8-7a8f-45ac-987f-38394c57fb0e"
+  },
+  {
+    "name": "4",
+    "time": "18:00",
+    "scroll_times": 36,
+    "wait_seconds": 6,
+    "enabled": true,
+    "last_run": "2026-05-21 18:00:00",
+    "id": "5c763e5f-7629-4cb5-a189-c9d870a931df"
+  }
+]

@@ -1,0 +1,667 @@
+"""
+AI分析配置管理
+支持多种AI服务商的配置和管理
+"""
+
+import os
+import json
+from typing import Dict, Optional
+
+from core.env_loader import load_dotenv
+
+load_dotenv()
+
+# 环境变量优先于配置文件中的 api_key
+_PROVIDER_ENV_KEYS = {
+    "openai": "OPENAI_API_KEY",
+    "deepseek": "DEEPSEEK_API_KEY",
+    "zhipu": "ZHIPU_API_KEY",
+    "qwen": "QWEN_API_KEY",
+    "volcengine": "VOLCENGINE_API_KEY",
+}
+
+
+class AIConfig:
+    """AI配置管理类"""
+
+    def __init__(self):
+        self.config_file = 'config/ai_config.json'
+        self.config = self.load_config()
+
+    def load_config(self) -> Dict:
+        """加载配置文件；若不存在则从 example 复制或生成默认配置"""
+        example_file = "config/ai_config.example.json"
+        if not os.path.exists(self.config_file):
+            if os.path.exists(example_file):
+                os.makedirs(os.path.dirname(self.config_file), exist_ok=True)
+                with open(example_file, "r", encoding="utf-8") as src:
+                    with open(self.config_file, "w", encoding="utf-8") as dst:
+                        dst.write(src.read())
+            else:
+                config = self.get_default_config()
+                self.save_config(config)
+                return config
+
+        try:
+            with open(self.config_file, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"加载配置失败: {e}")
+            return self.get_default_config()
+
+    def get_default_config(self) -> Dict:
+        """获取默认配置"""
+        return {
+            "current_provider": "deepseek",
+            "current_prompt_template": "standard",
+            "current_template": "standard",
+            "prompt_templates": self.get_default_prompt_templates(),
+            "providers": {
+                "openai": {
+                    "api_key": "",
+                    "base_url": "https://api.openai.com/v1",
+                    "model": "gpt-4",
+                    "max_tokens": 4000,
+                    "temperature": 0.7
+                },
+                "deepseek": {
+                    "api_key": "",
+                    "base_url": "https://api.deepseek.com/v1",
+                    "model": "deepseek-chat",
+                    "max_tokens": 4000,
+                    "temperature": 0.7
+                },
+                "zhipu": {
+                    "api_key": "",
+                    "base_url": "https://open.bigmodel.cn/api/paas/v4",
+                    "model": "glm-4",
+                    "max_tokens": 4000,
+                    "temperature": 0.7
+                },
+                "qwen": {
+                    "api_key": "",
+                    "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                    "model": "qwen-max",
+                    "max_tokens": 4000,
+                    "temperature": 0.7
+                },
+                "volcengine": {
+                    "api_key": "",
+                    "base_url": "https://ark.cn-beijing.volces.com/api/v3",
+                    "model": "doubao-seed-1-6-251015",
+                    "max_tokens": 4000,
+                    "temperature": 0.7
+                }
+            },
+            "analysis_params": {
+                "max_sectors": 6,
+                "stocks_per_sector": 5,
+                "detail_level": "standard",
+                "max_input_tokens": 15000
+            },
+        }
+
+    def save_config(self, config: Optional[Dict] = None):
+        """保存配置到文件"""
+        if config is None:
+            config = self.config
+
+        # 确保目录存在
+        os.makedirs(os.path.dirname(self.config_file), exist_ok=True)
+
+        try:
+            with open(self.config_file, 'w', encoding='utf-8') as f:
+                json.dump(config, f, ensure_ascii=False, indent=2)
+            return True
+        except Exception as e:
+            print(f"保存配置失败: {e}")
+            return False
+
+    def get_current_provider(self) -> str:
+        """获取当前使用的AI服务商"""
+        return self.config.get('current_provider', 'openai')
+
+    def set_current_provider(self, provider: str):
+        """设置当前使用的AI服务商"""
+        if provider in self.config['providers']:
+            self.config['current_provider'] = provider
+            self.save_config()
+            return True
+        return False
+
+    def get_provider_config(self, provider: Optional[str] = None) -> Dict:
+        """获取指定服务商的配置（api_key 已合并环境变量）"""
+        if provider is None:
+            provider = self.get_current_provider()
+        cfg = dict(self.config.get("providers", {}).get(provider, {}))
+        api_key = self.get_api_key(provider)
+        if api_key:
+            cfg["api_key"] = api_key
+        return cfg
+
+    def set_api_key(self, provider: str, api_key: str):
+        """设置API Key"""
+        if provider in self.config['providers']:
+            self.config['providers'][provider]['api_key'] = api_key
+            self.save_config()
+            return True
+        return False
+
+    def get_api_key(self, provider: Optional[str] = None) -> str:
+        """获取 API Key：优先环境变量，其次配置文件"""
+        if provider is None:
+            provider = self.get_current_provider()
+        env_name = _PROVIDER_ENV_KEYS.get(provider or "")
+        if env_name:
+            env_key = os.environ.get(env_name, "").strip()
+            if env_key:
+                return env_key
+        cfg = self.config.get("providers", {}).get(provider, {})
+        return (cfg.get("api_key") or "").strip()
+
+    def get_model(self, provider: Optional[str] = None) -> str:
+        """获取模型名称"""
+        config = self.get_provider_config(provider)
+        return config.get('model', 'gpt-4')
+
+    def set_model(self, provider: str, model: str):
+        """设置模型名称"""
+        if provider in self.config['providers']:
+            self.config['providers'][provider]['model'] = model
+            self.save_config()
+            return True
+        return False
+
+    def get_analysis_params(self) -> Dict:
+        """获取分析参数"""
+        return self.config.get('analysis_params', {})
+
+    def set_analysis_param(self, key: str, value):
+        """设置分析参数"""
+        if 'analysis_params' not in self.config:
+            self.config['analysis_params'] = {}
+        self.config['analysis_params'][key] = value
+        self.save_config()
+
+    def is_configured(self, provider: Optional[str] = None) -> bool:
+        """检查是否已配置（有API Key）"""
+        api_key = self.get_api_key(provider)
+        return bool(api_key and api_key.strip())
+
+    def get_available_providers(self) -> list:
+        """获取所有可用的服务商列表"""
+        return list(self.config['providers'].keys())
+
+    def get_available_models(self, provider: str) -> list:
+        """获取指定服务商支持的模型列表"""
+        models = {
+            'openai': ['gpt-4', 'gpt-4-turbo', 'gpt-3.5-turbo'],
+            'deepseek': [
+                'deepseek-chat',           # V3.2正式版 (推荐，长文本+Agent优化)
+                'deepseek-reasoner',       # R1推理模型 (深度思考)
+                'deepseek-coder'           # 代码专用
+            ],
+            'zhipu': ['glm-4', 'glm-3-turbo'],
+            'qwen': ['qwen-max', 'qwen-plus', 'qwen-turbo'],
+            'volcengine': [
+                'doubao-seed-1-6-251015',  # 豆包1.6 (推荐，长上下文)
+                'doubao-pro-32k',          # 豆包Pro 32K
+                'doubao-pro-128k',         # 豆包Pro 128K
+                'doubao-lite-32k',         # 豆包Lite 32K
+                'doubao-lite-128k'         # 豆包Lite 128K
+            ]
+        }
+        return models.get(provider, [])
+
+    # 提示词模板管理
+    def get_prompt_templates(self) -> Dict:
+        """获取所有提示词模板"""
+        return self.config.get('prompt_templates', {})
+
+    def get_template_names(self) -> list:
+        """获取模板名称列表"""
+        templates = self.get_prompt_templates()
+        return [(key, template.get('name', key)) 
+                for key, template in templates.items()]
+
+    def get_template(self, template_id: str) -> Optional[Dict]:
+        """获取指定模板"""
+        templates = self.get_prompt_templates()
+        return templates.get(template_id)
+
+    def save_template(self, template_id: str, name: str, 
+                     system_prompt: str, user_prompt_template: str):
+        """保存模板"""
+        if 'prompt_templates' not in self.config:
+            self.config['prompt_templates'] = {}
+        
+        self.config['prompt_templates'][template_id] = {
+            'name': name,
+            'system_prompt': system_prompt,
+            'user_prompt_template': user_prompt_template
+        }
+        self.save_config()
+
+    def delete_template(self, template_id: str) -> bool:
+        """删除模板"""
+        if template_id in ['default', 'conservative', 'aggressive']:
+            return False  # 不允许删除内置模板
+        
+        if 'prompt_templates' in self.config:
+            if template_id in self.config['prompt_templates']:
+                del self.config['prompt_templates'][template_id]
+                self.save_config()
+                return True
+        return False
+
+    def get_current_template(self) -> str:
+        """获取当前使用的模板"""
+        return self.config.get('current_template', 'default')
+
+    def set_current_template(self, template_id: str):
+        """设置当前使用的模板"""
+        self.config['current_template'] = template_id
+        self.save_config()
+
+    def get_default_prompt_templates(self) -> Dict:
+        """获取默认提示词模板"""
+        return {
+            "standard": {
+                "name": "标准分析",
+                "system_prompt": """你是一位资深的A股投资分析师，擅长基于新闻事件进行投资机会挖掘。
+
+【新闻重要性分级标准】：
+🔴 **重点新闻**（优先关注，作为主要投资依据）：
+1. 国家级政策：中央、国务院、部委发布的重大政策文件
+2. 行业突破性技术：颠覆性技术创新、填补国内空白、打破国外垄断
+3. 重大产业政策：产业规划、扶持政策、准入门槛变化
+4. 关键数据发布：GDP、CPI、PMI等宏观经济数据
+5. 重大事件：国际局势重大变化、行业格局重塑事件
+
+🟡 **一般行业新闻**（辅助参考）：
+- 企业常规经营动态
+- 一般性产品发布
+- 行业会议活动
+- 市场数据更新
+
+你的任务:
+1. **先对新闻进行重要性分级**（重点/一般）
+2. **优先基于重点新闻**识别投资机会
+3. 为每个板块推荐龙头股票
+4. 给出介入时机和目标涨幅
+5. 提示相关风险
+
+【智能数量决策】（当用户选择"自动"模式时）：
+- 根据重点新闻的数量和质量，灵活确定板块数量（建议3-10个）
+- 根据每个板块的标的质量和分散度，灵活确定推荐股票数量（建议3-10只）
+- 宁缺毋滥：只推荐有充分依据的板块和股票
+- 在分析报告中说明为何选择了这个数量
+
+输出要求:
+- 使用Markdown格式
+- 结构清晰、逻辑严密
+- 明确标注重点新闻与一般新闻
+- 数据支撑、可操作性强
+- 风险提示明确""",
+                "user_prompt_template": """请基于以下新闻数据，分析A股投资机会：
+
+【新闻数据】
+{news_data}
+
+【分析流程】
+
+**第一步：新闻分级**（在分析报告开头单独列出）
+请先识别出：
+- 🔴 **重点新闻**：政策类、突破性技术类、重大事件类（标注新闻序号）
+- 🟡 **一般新闻**：常规动态类（可简要说明）
+
+**第二步：板块机会分析**
+基于**重点新闻**，识别{max_sectors}个最有潜力的投资板块：
+
+每个板块需包含：
+1. **核心催化剂**（来自重点新闻，使用"[新闻X](#新闻X)"格式标注）
+2. **投资逻辑链条**（说明为何重点新闻带来投资机会）
+3. **{stocks_per_sector}只龙头股票推荐**
+4. **介入时机建议**
+5. **目标涨幅预期**（百分比）
+6. **新闻重要性说明**（为何这些新闻是重点）
+
+**第三步：投资策略**
+1. 板块优先级排序（按重点新闻催化强度排序）
+2. 最佳介入时机窗口
+3. 风险提示
+
+【重要格式要求】：
+- 引用新闻时必须使用Markdown锚点链接格式：[新闻X](#新闻X)
+- 示例：全国住房城乡建设工作会议密集发布多项重磅政策（[新闻9](#新闻9), [新闻45](#新闻45), [新闻46](#新闻46)）
+- 优先引用重点新闻，一般新闻作为辅助"""
+            },
+            "aggressive": {
+                "name": "激进策略",
+                "system_prompt": """你是一位激进型投资分析师，专注于捕捉高成长、高回报的投资机会。
+
+【新闻重要性分级】：
+🔴 **重点新闻**（主要关注）：
+1. **政策催化**：国家级产业政策、扶持计划、准入放开
+2. **技术突破**：颠覆性创新、国产替代突破、行业首创
+3. **重大事件**：国际局势变化、行业格局重塑、市场爆发信号
+4. **资金动向**：大额投资、并购重组、IPO/融资动态
+
+🟡 **一般新闻**：常规经营动态、行业会议、市场数据
+
+你的特点:
+- **优先挖掘重点新闻中的爆发性机会**
+- 更关注新兴产业和热点题材
+- 重视短期爆发力和市场情绪
+- 敢于推荐高风险高收益标的
+- 注重技术突破和政策催化
+
+输出风格:
+- 突出重点新闻驱动的爆发板块
+- 推荐弹性大的标的
+- 给出更激进的涨幅预期
+- 强调短期交易机会""",
+                "user_prompt_template": """请基于以下新闻数据，分析高潜力投资机会：
+
+【新闻数据】
+{news_data}
+
+【分析流程】
+
+**第一步：识别重点爆发性新闻**
+筛选出最具爆发潜力的重点新闻（政策催化、技术突破、重大事件）
+
+**第二步：板块机会分析**
+基于重点新闻，识别{max_sectors}个爆发力最强的板块：
+
+每个板块需包含：
+1. **核心催化剂**（来自重点新闻，使用"[新闻X](#新闻X)"格式）
+2. **短期爆发逻辑**（为何这是重点机会）
+3. **{stocks_per_sector}只高弹性标的**
+4. **最佳进场时机**
+5. **激进涨幅目标**（更高预期）
+6. **重点新闻权重说明**
+
+**第三步：交易策略**
+- 优先级排序（按重点新闻催化强度）
+- 短期操作窗口
+- 止盈止损建议
+
+【重要格式要求】：引用新闻时必须使用Markdown锚点链接格式：[新闻X](#新闻X)"""
+            },
+            "conservative": {
+                "name": "稳健策略",
+                "system_prompt": """你是一位稳健型投资分析师，注重风险控制和长期价值投资。
+
+【新闻确定性分级】：
+🔵 **高确定性新闻**（优先关注）：
+1. **国家战略政策**：长期产业规划、国家战略方向
+2. **稳定性技术突破**：成熟技术升级、产能扩张、质量提升
+3. **基本面改善**：业绩超预期、行业景气度提升、市场份额扩大
+4. **长期趋势**：人口结构变化、消费升级、产业升级
+
+⚪ **不确定性新闻**：短期题材炒作、未经验证的技术、预期不明的政策
+
+你的特点:
+- **优先基于高确定性新闻进行投资决策**
+- 更关注基本面扎实的板块
+- 重视企业质量和估值安全边际
+- 偏好确定性高的投资机会
+- 强调风险管理和长期持有
+
+输出风格:
+- 突出确定性强的板块
+- 推荐基本面优秀的龙头
+- 给出合理的涨幅预期
+- 详细的风险提示""",
+                "user_prompt_template": """请基于以下新闻数据，分析稳健投资机会：
+
+【新闻数据】
+{news_data}
+
+【分析流程】
+
+**第一步：筛选高确定性新闻**
+识别确定性最高的新闻（国家战略、稳定性技术、基本面改善）
+
+**第二步：板块机会分析**
+基于高确定性新闻，识别{max_sectors}个最稳健的板块：
+
+每个板块需包含：
+1. **长期催化剂**（来自高确定性新闻，使用"[新闻X](#新闻X)"格式）
+2. **基本面支撑逻辑**（为何确定性高）
+3. **{stocks_per_sector}只质地优秀的龙头**
+4. **合理买入区间**
+5. **稳健涨幅目标**
+6. **新闻确定性评估**
+
+**第三步：投资策略**
+- 优先级排序（按确定性和安全边际）
+- 分批建仓建议
+- 详细风险评估
+
+【重要格式要求】：引用新闻时必须使用Markdown锚点链接格式：[新闻X](#新闻X)"""
+            },
+            "value": {
+                "name": "价值投资",
+                "system_prompt": """你是一位价值投资分析师，专注于发现被低估的优质资产。
+
+【新闻价值分级】：
+💎 **高价值新闻**（优先关注）：
+1. **基本面改善**：业绩拐点、盈利能力提升、成本下降
+2. **政策支持**：行业扶持、税收优惠、补贴政策
+3. **资产重估**：并购重组、资产注入、分拆上市
+4. **行业复苏**：景气度回升、需求恢复、产能利用率提升
+5. **估值修复**：市场认知改善、机构增持、估值体系变化
+
+💤 **一般新闻**：短期炒作、题材概念、未验证消息
+
+你的特点:
+- **优先挖掘高价值新闻中的重估机会**
+- 关注估值和安全边际
+- 重视企业内在价值
+- 寻找市场错误定价
+- 强调长期投资回报
+
+输出风格:
+- 强调基于高价值新闻的估值优势
+- 分析价值重估逻辑
+- 推荐低估值优质股
+- 长期持有建议""",
+                "user_prompt_template": """请基于以下新闻数据，分析价值投资机会：
+
+【新闻数据】
+{news_data}
+
+【分析流程】
+
+**第一步：筛选高价值新闻**
+识别能够触发价值重估的高价值新闻（基本面改善、政策支持、资产重估）
+
+**第二步：板块机会分析**
+基于高价值新闻，识别{max_sectors}个估值低估的板块：
+
+每个板块需包含：
+1. **价值重估催化剂**（来自高价值新闻，使用"[新闻X](#新闻X)"格式）
+2. **内在价值分析**（为何被低估）
+3. **{stocks_per_sector}只低估值优质股**
+4. **合理估值区间**
+5. **价值回归预期**
+6. **新闻价值权重说明**
+
+**第三步：投资策略**
+- 优先级排序（按价值重估潜力）
+- 长期持有建议
+- 估值修复路径
+
+【重要格式要求】：引用新闻时必须使用Markdown锚点链接格式：[新闻X](#新闻X)"""
+            },
+            "short_term": {
+                "name": "短线交易",
+                "system_prompt": """你是一名资深的A股短线策略分析师，你的核心任务是基于提供的纯文本盘后总结与新闻，进行深度解读、逻辑串联与次日策略推演。
+
+【核心能力要求】：
+- 深度信息提炼与结构化能力
+- 市场情绪与资金流向判断
+- 主线持续性与轮动逻辑推演
+- 基于逻辑推理的次日策略制定
+
+【分析原则】：
+- 所有结论必须严格源于提供的文本信息与逻辑推导
+- 避免主观臆测，信息不足时明确标注"依据不足，需观察确认"
+- 输出风格冷静、理性、可执行
+
+【新闻重要性分级】：
+🔥 **高影响新闻**（市场主线驱动）：
+1. **政策突发**：突然出台的重磅政策、政策转向信号
+2. **技术爆点**：重大技术突破、首创性产品发布
+3. **事件驱动**：国际局势突变、行业重大事件、突发利好
+4. **资金异动**：大额资金流入、北向资金大幅净买入
+5. **市场情绪**：涨停潮、连板梯队形成、龙头晋级
+
+🌡️ **一般新闻**：常规动态、预期内消息
+❄️ **低价值新闻**：重复信息、无实质影响
+
+【智能数量决策】：
+当板块数或推荐股数设为"自动"时，你需要根据市场分化程度灵活决定：
+- 主线明确：集中3-4个核心板块，每个板块3-5只龙头
+- 分化明显：扩展到5-6个板块，每个板块2-3只
+- 普涨行情：精选最强2-3个板块，每个板块5-8只""",
+                "user_prompt_template": """请基于以下新闻数据，进行短线策略分析与次日推演：
+
+【新闻数据】
+{news_data}
+
+{market_summary}
+
+【分析框架】
+
+## 一、信息提炼与结构化
+
+首先，从提供的文本中提取并确认以下核心信息：
+
+### 1. 量能与情绪指标
+- 今日成交额（绝对值及与前日对比）
+- 上涨/下跌家数比、涨跌停数据
+- 主力资金流向（如提及）
+- 用一句话概括整体市场环境
+
+### 2. 最强与最弱方向
+- **领涨板块**：找出涨停家数最多的板块及其核心驱动逻辑（引用具体新闻：[新闻X](#新闻X)）
+- **领跌/风险板块**：找出出现亏钱效应或明显回调的板块
+
+### 3. 市场结构与主线线索
+从连板梯队中梳理：
+- 市场最高标（几板？属于什么题材？）
+- 梯队最完整的题材（各板高度是否有标的晋级）
+- 新出现的强势板块（首板涨停数量、资金承接力度）
+
+---
+
+## 二、综合分析与次日推演
+
+基于第一步提炼的信息，进行连贯的逻辑分析：
+
+### 1. 市场生态诊断
+- 判断市场整体是"指数与个股同步"还是"分化"状态
+- 结合情绪指标，判断短线情绪是：亢奋期、谨慎期还是退潮期
+- 分析原因（赚钱效应、资金态度、外部环境）
+
+### 2. 主线持续性推演
+针对识别出的{max_sectors}个核心板块/题材：
+
+**对于领涨板块**：
+- 驱动逻辑的可持续性分析（政策延续性、事件发酵空间、资金持续性）
+- 判断次日走势：继续走强 / 高位分歧 / 资金撤离
+- 重点标的表现（龙头能否晋级、跟风是否活跃）
+
+**对于梯队完整的板块**：
+- 评估成为新主线的潜力（逻辑强度、资金认可度、板块容量）
+- 推荐{stocks_per_sector}只核心标的及晋级路径
+
+**对于高位风险板块**：
+- 判断其对整体市场情绪的潜在影响
+- 是否会引发连锁反应
+
+### 3. 资金流向与潜在机会挖掘
+- 根据市场分化特征，推断资金可能的流向
+- 识别同时具备"逻辑驱动"和"资金痕迹"的低位或新启动板块
+- 列为潜在轮动方向（引用支撑新闻：[新闻X](#新闻X)）
+
+---
+
+## 三、次日策略与观察清单
+
+### 1. 总体策略定调
+用一句话明确次日操作基调（激进参与 / 谨慎观望 / 防守为主）
+
+### 2. 核心观察锚点
+- **情绪锚点**：市场最高标的表现（是否能继续晋级、带动跟风）
+- **板块锚点**：
+  - 新强板块前排龙头的晋级情况
+  - 风险板块高标的走势（是否止跌企稳）
+- **资金锚点**：北向资金、主力资金的流向变化
+
+### 3. 具体操作预案
+针对市场可能出现的不同情况，给出相应策略：
+
+**情景A：情绪修复**
+- 参与方向：XXX板块龙头
+- 进场时机：XXX
+- 止损位：XXX
+
+**情景B：分歧加剧**
+- 防守策略：XXX
+- 观望标的：XXX
+- 避开方向：XXX
+
+**情景C：新主线启动**
+- 低吸方向：XXX
+- 关注信号：XXX
+
+### 4. 风险提示
+- 明确当前市场最大风险点
+- 需要警惕的信号
+
+---
+
+【重要格式要求】：
+1. 引用新闻时必须使用Markdown锚点链接格式：[新闻X](#新闻X)
+2. 所有标的推荐必须有明确的逻辑支撑和新闻依据
+3. 结论必须可执行、可验证"""
+            }
+        }
+
+    def get_prompt_template(self, template_name: str) -> Dict:
+        """获取指定的提示词模板"""
+        templates = self.get_prompt_templates()
+        return templates.get(template_name, templates.get('standard'))
+
+    def save_prompt_template(self, template_name: str, template_data: Dict):
+        """保存提示词模板"""
+        if 'prompt_templates' not in self.config:
+            self.config['prompt_templates'] = {}
+        self.config['prompt_templates'][template_name] = template_data
+        self.save_config()
+
+    def get_current_prompt_template(self) -> str:
+        """获取当前使用的提示词模板"""
+        return self.config.get('current_prompt_template', 'standard')
+
+    def set_current_prompt_template(self, template_name: str):
+        """设置当前使用的提示词模板"""
+        self.config['current_prompt_template'] = template_name
+        self.save_config()
+
+
+# 全局配置实例
+ai_config = AIConfig()
+
+
+if __name__ == '__main__':
+    # 测试配置管理
+    config = AIConfig()
+    print("当前服务商:", config.get_current_provider())
+    print("OpenAI配置:", config.get_provider_config('openai'))
+    print("是否已配置:", config.is_configured())
+

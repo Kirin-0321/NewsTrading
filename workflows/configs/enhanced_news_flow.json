@@ -1,0 +1,80 @@
+{
+  "workflow_id": "enhanced_news_flow",
+  "name": "增强版新闻分析流程",
+  "description": "自动执行爬取、清洗、合并去重、导出、AI分析的完整流程",
+  "enabled": true,
+  "steps": [
+    {
+      "step": 1,
+      "name": "爬取新闻",
+      "description": "使用爬虫获取最新新闻，支持自动停止"
+    },
+    {
+      "step": 2,
+      "name": "清洗数据",
+      "description": "使用AI过滤无关新闻，保留重要信息"
+    },
+    {
+      "step": 3,
+      "name": "合并去重",
+      "description": "合并清洗后的数据，使用语义去重（10分钟窗口+60%相似度）"
+    },
+    {
+      "step": 4,
+      "name": "导出数据",
+      "description": "将合并去重后的数据导出为Markdown格式"
+    },
+    {
+      "step": 5,
+      "name": "AI分析",
+      "description": "使用指定模板分析新闻，结合盘后总结"
+    }
+  ],
+  "schedule": {
+    "enabled": false,
+    "mode": "daily",
+    "time": "09:30",
+    "interval_hours": 1,
+    "description": "定时执行模式：daily=每天固定时间, interval=每隔N小时"
+  },
+  "params": {
+    "crawler": {
+      "scroll_times": 36,
+      "wait_seconds": 6,
+      "auto_stop": true
+    },
+    "cleaner": {
+      "ai_provider": "deepseek",
+      "batch_size": 100
+    },
+    "merger": {
+      "mode": "recent",
+      "recent_count": 5,
+      "time_range_hours": null
+    },
+    "export": {
+      "source": "cleaned",
+      "format": "markdown",
+      "time_range_hours": 4
+    },
+    "analyzer": {
+      "template": "custom_6",
+      "summary_mode": "none",
+      "summary_file": ""
+    }
+  },
+  "error_handling": {
+    "on_step_error": "abort",
+    "retry_times": 0,
+    "retry_interval": 60
+  },
+  "history": {
+    "last_run": "2026-01-08 13:53:48",
+    "last_status": "success",
+    "last_error": null,
+    "last_duration": 467.089942,
+    "total_runs": 6,
+    "success_count": 5,
+    "failure_count": 1
+  }
+}
