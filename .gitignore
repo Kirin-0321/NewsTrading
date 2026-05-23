@@ -46,6 +46,11 @@ logs/*.log
 .env
 config/ai_config.json
 
+# .huiye 调试产物（可由 tools/_debug_theme_extract.py、show_ai_input.py 再生成）
+.huiye/_debug_io/
+.huiye/_debug_*.py
+.huiye/ai_input_sample.md
+
 # Node.js
 node_modules/
 .DS_Store

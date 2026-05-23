@@ -122,7 +122,7 @@ doc/文档分类规范.md  → 已修改（MM-DD-HHmm 新命名规范等）
 | L2 | 打包路径逻辑分散（`main.py` / `main_window.py` / crawler） |
 | L3 | `chrome-win64/` 体积大，README 已提，分发策略可再写 guides |
 | L4 | `tools/` 为手工脚本，非 pytest |
-| L5 | `.huiye/_debug_*` 调试产物可考虑 gitignore |
+| L5 | ~~`.huiye/_debug_*` 调试产物~~ 已清理并加入 `.gitignore` |
 | L6 | Windows 控制台 emoji 可能 `UnicodeEncodeError` |
 | L7 | `news_exporter.py` 与 ExportPage 功能重叠 |
 | L8 | 无 `pyproject.toml` / ruff / mypy |
