@@ -360,12 +360,15 @@ class AIAnalysisPage(QWidget):
         return group
 
     def _get_source_store(self, source=None):
-        from services.storage import get_raw_store, get_curated_store
+        """统一返回 (RawStore, status)；status=None 表示不过滤。"""
+        from services.storage import CLEAN_CURATED, get_raw_store
         source = source or self.db_source_combo.currentData()
-        return get_curated_store() if source == "curated" else get_raw_store()
+        status = CLEAN_CURATED if source == "curated" else None
+        return get_raw_store(), status
 
     def _get_source_time_bounds(self, source=None):
-        return self._get_source_store(source).get_time_bounds()
+        store, status = self._get_source_store(source)
+        return store.get_time_bounds(status=status)
 
     def _on_db_source_changed(self, _index=None):
         self._refresh_db_stats()
@@ -422,23 +425,22 @@ class AIAnalysisPage(QWidget):
 
     def _refresh_db_stats(self):
         try:
-            from services.storage import get_raw_store, get_curated_store
-            raw = get_raw_store()
-            curated = get_curated_store()
-            source = self.db_source_combo.currentData()
-            store = curated if source == "curated" else raw
-            label = "精选库" if source == "curated" else "原始库"
-            start, end = store.get_time_bounds()
+            store, status = self._get_source_store()
+            label = "精选库" if status else "原始库"
+            start, end = store.get_time_bounds(status=status)
+            count = store.count(status=status)
             if start and end:
                 span = (
-                    f"{label} {store.count()} 条 | "
+                    f"{label} {count} 条 | "
                     f"数据时间 {start.strftime('%m-%d %H:%M')} ~ "
                     f"{end.strftime('%m-%d %H:%M')}"
                 )
             else:
                 span = f"{label} 暂无数据"
+            from services.storage import get_raw_store
+            raw = get_raw_store()
             self.db_stats_label.setText(
-                f"原始库 {raw.count()} 条 | 精选库 {curated.count()} 条 | "
+                f"原始库 {raw.count()} 条 | 精选库 {raw.count_curated()} 条 | "
                 f"待清洗 {raw.count_uncleaned()} 条 | {span}"
             )
         except Exception as e:

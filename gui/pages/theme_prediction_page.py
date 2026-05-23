@@ -46,6 +46,19 @@ _THEME_TABLE_COLS = [
     ("核心逻辑（含催化）", 280),
 ]
 
+# 可点击排序的列索引 -> 数据字段
+_SORTABLE_COLS = {
+    2: "strength_level",
+    3: "strength_score",
+    7: "expectation_gap",
+    8: "priority_rank",
+}
+
+# 等级序（高 → 低）；未知等级排最后
+_LEVEL_ORDER = {"极强": 4, "强": 3, "中": 2, "弱": 1, "利空": 0}
+# 预期差序（高 → 低）
+_GAP_ORDER = {"高": 5, "中高": 4, "中": 3, "中低": 2, "低": 1}
+
 _STOCK_TABLE_COLS = [
     ("标的", 140),
     ("代码", 110),
@@ -58,7 +71,7 @@ _NEWS_TABLE_COLS = [
     ("关联类型", 70),
     ("时间", 130),
     ("来源", 90),
-    ("标题（反查 curated_news）", 360),
+    ("标题（反查 raw_news）", 360),
 ]
 
 
@@ -69,6 +82,8 @@ class ThemePredictionPage(QWidget):
         super().__init__()
         self.worker: Optional[ThemeExtractWorker] = None
         self._current_themes: list = []
+        self._sort_col: Optional[int] = None
+        self._sort_asc: bool = True
         self.init_ui()
         self.refresh()
 
@@ -250,6 +265,10 @@ class ThemePredictionPage(QWidget):
         self.theme_table.horizontalHeader().setStretchLastSection(True)
         for i, (_, w) in enumerate(_THEME_TABLE_COLS):
             self.theme_table.setColumnWidth(i, w)
+        header = self.theme_table.horizontalHeader()
+        header.setSectionsClickable(True)
+        header.setSortIndicatorShown(True)
+        header.sectionClicked.connect(self._on_theme_header_clicked)
         self.theme_table.itemSelectionChanged.connect(self._on_theme_selected)
         layout.addWidget(self.theme_table, 2)
 
@@ -350,9 +369,56 @@ class ThemePredictionPage(QWidget):
     def _reload_themes_for_date(self, report_date: str):
         from services.storage import get_theme_store
         themes = get_theme_store().get_by_date(report_date)
+        self._reset_theme_sort()
         self._current_themes = themes
         self._render_theme_table(themes)
         self._clear_detail()
+
+    def _reset_theme_sort(self):
+        """切换日期或刷新时恢复数据库默认顺序。"""
+        self._sort_col = None
+        self._sort_asc = True
+        header = self.theme_table.horizontalHeader()
+        header.setSortIndicator(-1, Qt.AscendingOrder)
+
+    def _on_theme_header_clicked(self, col: int):
+        """点击可排序列：同列切换升降序，新列按业务默认方向。"""
+        if col not in _SORTABLE_COLS:
+            return
+        if self._sort_col == col:
+            self._sort_asc = not self._sort_asc
+        else:
+            self._sort_col = col
+            # 排名默认升序（1 在前）；等级/分数/预期差默认降序（高在前）
+            self._sort_asc = col == 8
+        self._apply_theme_sort()
+        order = Qt.AscendingOrder if self._sort_asc else Qt.DescendingOrder
+        self.theme_table.horizontalHeader().setSortIndicator(col, order)
+
+    def _apply_theme_sort(self):
+        if self._sort_col is None or not self._current_themes:
+            return
+        field = _SORTABLE_COLS[self._sort_col]
+        asc = self._sort_asc
+
+        def sort_key(theme: dict):
+            if field == "strength_level":
+                val = _LEVEL_ORDER.get(theme.get("strength_level") or "", -1)
+                return val if asc else -val
+            if field == "strength_score":
+                score = theme.get("strength_score")
+                val = score if score is not None else -1
+                return val if asc else -val
+            if field == "expectation_gap":
+                val = _GAP_ORDER.get(theme.get("expectation_gap") or "", -1)
+                return val if asc else -val
+            rank = theme.get("priority_rank")
+            if rank is None:
+                return (1, 0)
+            return (0, rank if asc else -rank)
+
+        self._current_themes = sorted(self._current_themes, key=sort_key)
+        self._render_theme_table(self._current_themes)
 
     def _render_theme_table(self, themes: list):
         self.theme_table.setRowCount(len(themes))
@@ -423,7 +489,7 @@ class ThemePredictionPage(QWidget):
                 self.stock_table.setItem(r, c, item)
 
         news = theme.get("news") or []
-        # 反查 curated_news 拿 title / source / published_at
+        # 反查 raw_news 拿 title / source / published_at
         news_meta = self._fetch_news_meta(
             [n.get("news_id") for n in news if n.get("news_id")]
         )
@@ -444,7 +510,7 @@ class ThemePredictionPage(QWidget):
 
     @staticmethod
     def _fetch_news_meta(news_ids: list) -> dict:
-        """LEFT JOIN curated_news：通过 news_id 拿 title/source/published_at。"""
+        """通过 news_id 从 raw_news 反查 title/source/published_at。"""
         ids = [i for i in news_ids if i]
         if not ids:
             return {}
@@ -455,7 +521,7 @@ class ThemePredictionPage(QWidget):
                 rows = conn.execute(
                     f"""
                     SELECT id, title, source, published_at
-                    FROM curated_news
+                    FROM raw_news
                     WHERE id IN ({placeholders})
                     """,
                     ids,

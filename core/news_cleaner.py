@@ -5,9 +5,13 @@
 
 import json
 import os
+import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import List, Dict, Callable, Optional
 from openai import OpenAI
+
+from core.ai_config import DEFAULT_MAX_OUTPUT_TOKENS
 
 
 class NewsCleaner:
@@ -34,6 +38,7 @@ class NewsCleaner:
         batch_size: int = 100,
         auto_merge: bool = True,
         progress_callback: Optional[Callable] = None,
+        max_workers: int = 1,
     ) -> Dict:
         """
         清洗内存中的新闻列表（供 SQLite 同步服务使用）。
@@ -63,7 +68,7 @@ class NewsCleaner:
             progress_callback("开始AI清洗...")
 
         kept, removed, error_skipped = self._ai_clean_batches(
-            all_news, batch_size, progress_callback
+            all_news, batch_size, progress_callback, max_workers=max_workers
         )
         kept.sort(key=lambda x: x.get("datetime") or x.get("time", ""))
         removed.sort(key=lambda x: x.get("datetime") or x.get("time", ""))
@@ -83,36 +88,84 @@ class NewsCleaner:
         self,
         news_list: List[Dict],
         batch_size: int,
-        progress_callback: Optional[Callable]
+        progress_callback: Optional[Callable],
+        max_workers: int = 1,
     ) -> tuple:
-        """AI 分批清洗；单批失败时拆半重试，仍失败则跳过问题条目。"""
-        kept = []
-        removed = []
+        """AI 分批清洗；支持有限并行；单批失败时拆半重试。"""
+        kept: List[Dict] = []
+        removed: List[Dict] = []
         error_skipped = 0
 
         total = len(news_list)
-        total_batches = (total + batch_size - 1) // batch_size
+        if total == 0:
+            return kept, removed, error_skipped
 
+        total_batches = (total + batch_size - 1) // batch_size
+        batches = []
         for batch_idx in range(total_batches):
             start_idx = batch_idx * batch_size
             end_idx = min(start_idx + batch_size, total)
-            batch = news_list[start_idx:end_idx]
+            batches.append((batch_idx, news_list[start_idx:end_idx], end_idx))
 
-            batch_kept, batch_removed, batch_skipped = self._process_batch_resilient(
-                batch, progress_callback
-            )
-            kept.extend(batch_kept)
-            removed.extend(batch_removed)
-            error_skipped += batch_skipped
+        workers = max(1, min(int(max_workers or 1), 4, total_batches))
 
-            if progress_callback:
-                progress_callback(
-                    f"批次 {batch_idx + 1}/{total_batches}",
-                    end_idx,
-                    total,
-                    len(batch_kept),
-                    len(batch_removed),
+        def _run_one(item, cb: Optional[Callable] = None):
+            batch_idx, batch, end_idx = item
+            if cb:
+                cb(
+                    f"批次 {batch_idx + 1}/{total_batches} "
+                    f"请求 AI 中（{len(batch)} 条）..."
                 )
+            bk, br, bs = self._process_batch_resilient(
+                batch, cb, batch_idx + 1, total_batches
+            )
+            return batch_idx, end_idx, bk, br, bs
+
+        cum_kept = 0
+        cum_removed = 0
+        processed = 0
+
+        def _emit_done(batch_idx, end_idx, batch_kept, batch_removed):
+            """单批返回后立刻向 UI 推进度（保留/剔除条数 + 累计保留率）。"""
+            nonlocal cum_kept, cum_removed
+            cum_kept += len(batch_kept)
+            cum_removed += len(batch_removed)
+            if not progress_callback:
+                return
+            progress_callback(
+                f"批次 {batch_idx + 1}/{total_batches}",
+                end_idx,
+                total,
+                len(batch_kept),
+                len(batch_removed),
+            )
+            denom = max(end_idx, cum_kept + cum_removed)
+            rate = round(cum_kept / denom * 100, 1) if denom else 0
+            progress_callback(
+                f"累计保留 {cum_kept}/{denom}（{rate}%）"
+            )
+
+        if workers == 1:
+            for item in batches:
+                batch_idx, end_idx, bk, br, bs = _run_one(item, progress_callback)
+                kept.extend(bk)
+                removed.extend(br)
+                error_skipped += bs
+                processed += 1
+                _emit_done(batch_idx, end_idx, bk, br)
+        else:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = {
+                    pool.submit(_run_one, item, progress_callback): item[0]
+                    for item in batches
+                }
+                for fut in as_completed(futures):
+                    batch_idx, end_idx, bk, br, bs = fut.result()
+                    kept.extend(bk)
+                    removed.extend(br)
+                    error_skipped += bs
+                    processed += 1
+                    _emit_done(batch_idx, end_idx, bk, br)
 
         return kept, removed, error_skipped
 
@@ -120,6 +173,8 @@ class NewsCleaner:
         self,
         batch: List[Dict],
         progress_callback: Optional[Callable],
+        batch_no: Optional[int] = None,
+        total_batches: Optional[int] = None,
     ) -> tuple:
         """
         处理单批新闻；API 拒绝（如敏感词）时二分拆批，隔离问题条目。
@@ -133,6 +188,32 @@ class NewsCleaner:
         user_prompt = self._build_batch_prompt(batch)
         try:
             decisions = self._call_ai_judge(user_prompt, len(batch))
+            padded = sum(
+                1 for _, reason in decisions if reason == "AI解析丢失-保守剔除"
+            )
+            if padded > 0:
+                if progress_callback:
+                    label = (
+                        f"批次 {batch_no}/{total_batches} "
+                        if batch_no and total_batches else ""
+                    )
+                    progress_callback(
+                        f"{label}解析不完整（{len(batch) - padded}/{len(batch)}），重试..."
+                    )
+                retry_prompt = (
+                    user_prompt
+                    + f"\n\n【重要】上次只解析到 {len(decisions) - padded}/{len(batch)} 条，"
+                    f"请严格输出 {len(batch)} 行，每行格式：序号. keep|理由 或 序号. remove|理由，"
+                    "不要其他文字。"
+                )
+                retry_decisions = self._call_ai_judge(retry_prompt, len(batch))
+                retry_padded = sum(
+                    1 for _, reason in retry_decisions
+                    if reason == "AI解析丢失-保守剔除"
+                )
+                if retry_padded < padded:
+                    decisions = retry_decisions
+
             kept, removed = [], []
             for news, (decision, reason) in zip(batch, decisions):
                 if decision == "keep":
@@ -193,13 +274,14 @@ class NewsCleaner:
 
         说明:
         - content 不再截断（库内 p99=493 字，最长 1705 字，远低于 context 上限）
-        - 强制要求输出剔除/保留理由，便于事后追溯（落到 rejected_news.reason）
+        - 强制要求输出剔除/保留理由，便于事后追溯（落到 raw_news.clean_reason）
         """
         prompt = "请判断以下新闻是否应该保留：\n\n"
 
         for idx, news in enumerate(batch, 1):
             prompt += f"{idx}. 【标题】{news.get('title', '无标题')}\n"
-            prompt += f"   【时间】{news.get('time', '未知')}\n"
+            time_str = news.get('time') or news.get('datetime') or '未知'
+            prompt += f"   【时间】{time_str}\n"
             if news.get('source'):
                 prompt += f"   【来源】{news['source']}\n"
             if news.get('content'):
@@ -285,6 +367,8 @@ class NewsCleaner:
                 "volcengine": "doubao-seed-1-6-251015",
             }.get(provider, "gpt-4")
 
+        max_tokens = self.config.get_cleaning_max_tokens(expected_count, provider)
+
         response = client.chat.completions.create(
             model=model,
             messages=[
@@ -292,9 +376,27 @@ class NewsCleaner:
                 {"role": "user", "content": user_prompt},
             ],
             temperature=0.1,
-            max_tokens=2000,
+            max_tokens=max_tokens,
         )
-        result_text = response.choices[0].message.content
+        choice = response.choices[0]
+        finish_reason = getattr(choice, "finish_reason", None)
+        if finish_reason == "length":
+            retry_tokens = min(max_tokens * 2, DEFAULT_MAX_OUTPUT_TOKENS)
+            print(
+                f"⚠️ 清洗 AI 输出被截断（max_tokens={max_tokens}, "
+                f"batch={expected_count}），以 {retry_tokens} 重试..."
+            )
+            response = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=0.1,
+                max_tokens=retry_tokens,
+            )
+            choice = response.choices[0]
+        result_text = choice.message.content
         return self._parse_decisions(result_text, expected_count)
     
     def _parse_decisions(
@@ -318,14 +420,26 @@ class NewsCleaner:
             - 解析数量过多：截断到 expected_count
         """
         decisions: List[tuple] = []
-        for raw_line in result_text.strip().split('\n'):
+        text = result_text.strip()
+        if text.startswith("```"):
+            text = re.sub(r"^```[\w]*\n?", "", text)
+            text = re.sub(r"\n?```$", "", text)
+
+        for raw_line in text.split('\n'):
             line = raw_line.strip()
             if not line:
                 continue
-            low = line.lower()
-            if 'keep' in low:
+
+            head = line.split('|', 1)[0]
+            low_head = head.lower()
+            decision = None
+            if re.search(r'\bkeep\b', low_head) or re.search(r'保留', head):
                 decision = 'keep'
-            elif 'remove' in low:
+            elif (
+                re.search(r'\bremove\b', low_head)
+                or re.search(r'剔除', head)
+                or re.search(r'去除', head)
+            ):
                 decision = 'remove'
             else:
                 continue
@@ -333,6 +447,10 @@ class NewsCleaner:
             reason = ''
             if '|' in line:
                 reason = line.split('|', 1)[1].strip()[:40]
+            elif '：' in line:
+                parts = line.split('：', 1)
+                if len(parts) == 2:
+                    reason = parts[1].strip()[:40]
             decisions.append((decision, reason))
 
         while len(decisions) < expected_count:

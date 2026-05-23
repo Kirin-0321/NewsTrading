@@ -17,34 +17,12 @@ CREATE TABLE IF NOT EXISTS raw_news (
     published_at    TEXT NOT NULL,
     published_ts    INTEGER NOT NULL,
     crawled_at      TEXT NOT NULL,
+    clean_status    TEXT NOT NULL DEFAULT 'pending',
+    clean_reason    TEXT,
     extra_json      TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_raw_published ON raw_news(published_ts DESC);
-
-CREATE TABLE IF NOT EXISTS curated_news (
-    id              TEXT PRIMARY KEY,
-    raw_id          TEXT NOT NULL,
-    title           TEXT NOT NULL,
-    content         TEXT,
-    source          TEXT,
-    published_at    TEXT NOT NULL,
-    published_ts    INTEGER NOT NULL,
-    cleaned_at      TEXT NOT NULL,
-    clean_provider  TEXT,
-    extra_json      TEXT,
-    FOREIGN KEY (raw_id) REFERENCES raw_news(id)
-);
-CREATE INDEX IF NOT EXISTS idx_curated_published ON curated_news(published_ts DESC);
-CREATE INDEX IF NOT EXISTS idx_curated_raw_id ON curated_news(raw_id);
-
-CREATE TABLE IF NOT EXISTS rejected_news (
-    id              TEXT PRIMARY KEY,
-    raw_id          TEXT,
-    title           TEXT,
-    rejected_at     TEXT NOT NULL,
-    reason          TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_rejected_raw_id ON rejected_news(raw_id);
+CREATE INDEX IF NOT EXISTS idx_raw_clean_status ON raw_news(clean_status);
 
 CREATE TABLE IF NOT EXISTS sync_meta (
     key             TEXT PRIMARY KEY,
@@ -63,7 +41,7 @@ CREATE TABLE IF NOT EXISTS theme_predictions (
     theme_category      TEXT,
     strength_score      INTEGER NOT NULL,
     strength_level      TEXT NOT NULL,
-    priority_rank       INTEGER,
+    priority_rank       INTEGER,  -- 单份报告内排序序号；非全局唯一，跨 report_id 可重复
     duration            TEXT,
     expectation_gap     TEXT,
     sentiment           TEXT NOT NULL DEFAULT '利好',
@@ -122,6 +100,30 @@ _THEME_V2_COLUMNS = {
 }
 
 
+def _ensure_clean_status_columns(conn: sqlite3.Connection) -> None:
+    """老库补 clean_status / clean_reason 字段，并直接抛弃旧的 curated/rejected 表。
+
+    旧分类不做迁移：原始新闻全部回到 pending，需要重新跑清洗。
+    """
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(raw_news)").fetchall()}
+    changed = False
+    if "clean_status" not in cols:
+        conn.execute(
+            "ALTER TABLE raw_news ADD COLUMN clean_status TEXT NOT NULL DEFAULT 'pending'"
+        )
+        changed = True
+    if "clean_reason" not in cols:
+        conn.execute("ALTER TABLE raw_news ADD COLUMN clean_reason TEXT")
+        changed = True
+
+    for legacy in ("curated_news", "rejected_news"):
+        conn.execute(f"DROP TABLE IF EXISTS {legacy}")
+
+    if changed:
+        _log.info("raw_news 已添加 clean_status / clean_reason，旧分类表已删除")
+    conn.commit()
+
+
 def _migrate_theme_tables_v2(conn: sqlite3.Connection) -> None:
     """检测题材三张表的 schema，若与 v2 不一致则 DROP 重建。
 
@@ -170,6 +172,7 @@ def init_database(db_path=None) -> str:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with sqlite3.connect(path) as conn:
         _migrate_theme_tables_v2(conn)
+        _ensure_clean_status_columns(conn)  # 旧库补列 + DROP 旧 curated/rejected 表
         conn.executescript(_SCHEMA)
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA foreign_keys=ON")

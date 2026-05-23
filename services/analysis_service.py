@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Callable, Dict, List, Literal, Optional
 
-from services.storage import get_raw_store, get_curated_store
+from services.storage import CLEAN_CURATED, get_raw_store
 
 
 @dataclass
@@ -30,7 +30,6 @@ class AnalysisService:
 
     def __init__(self):
         self.raw_store = get_raw_store()
-        self.curated_store = get_curated_store()
 
     def load_news(
         self,
@@ -43,7 +42,7 @@ class AnalysisService:
         按数据源与时间范围加载新闻。
 
         Args:
-            source: curated 精选库 / raw 原始库
+            source: curated 仅取 clean_status='curated' / raw 取全部
             start: 起始时间
             end: 结束时间
             hours: 若未指定 start/end，则取最近 N 小时
@@ -56,8 +55,8 @@ class AnalysisService:
             else:
                 start = end - timedelta(hours=24)
 
-        store = self.curated_store if source == "curated" else self.raw_store
-        return store.get_news_in_range(start, end)
+        status = CLEAN_CURATED if source == "curated" else None
+        return self.raw_store.get_news_in_range(start, end, status=status)
 
     def analyze(
         self,

@@ -6,7 +6,8 @@
                 ├→ _read_report()           # 读 md，去掉末尾引用区
                 ├→ parse_news_id_map()      # 解析底部'**数据库ID**:'映射
                 ├→ _call_llm(stream=True)   # 流式 + JSON mode + chunk 回调
-                └→ _parse_response()        # 容错解析（4 级兜底）
+                ├→ _parse_response()        # 容错解析（4 级兜底）
+                └→ apply_priority_ranks_from_report()  # 从正文 7.2 表补全排序
         └→ ThemeStore.save_themes(meta, themes, news_id_map=...)
 
 设计要点:
@@ -22,7 +23,7 @@ import re
 from datetime import datetime
 from typing import Callable, Dict, List, Optional, Tuple
 
-from core.ai_config import AIConfig
+from core.ai_config import AIConfig, DEFAULT_MAX_OUTPUT_TOKENS
 
 
 _REPORT_REF_HEADER = "## 📰 引用新闻详情"
@@ -102,14 +103,14 @@ class ThemeExtractor:
         provider: Optional[str] = None,
         model: Optional[str] = None,
         temperature: float = 0.2,
-        max_tokens: int = 32768,
+        max_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
     ):
         self.config = config or AIConfig()
         ext_cfg = self.config.get_theme_extraction_config()
         self.provider = provider or ext_cfg.get("provider") or "deepseek"
         self.model = model or ext_cfg.get("model") or "deepseek-v4-flash"
         self.temperature = ext_cfg.get("temperature", temperature)
-        self.max_tokens = ext_cfg.get("max_tokens", max_tokens)
+        self.max_tokens = int(ext_cfg.get("max_tokens", max_tokens))
         self._last_finish_reason: Optional[str] = None
         self._last_raw_response: Optional[str] = None
 
@@ -118,7 +119,7 @@ class ThemeExtractor:
         report_path: str,
         progress_callback: Optional[Callable] = None,
     ) -> Tuple[List[Dict], Dict[str, str], Optional[str]]:
-        """读 .md → 抽题材，同时建立"新闻N → curated_news.id"映射。
+        """读 .md → 抽题材，同时建立"新闻N → raw_news.id"映射。
 
         Args:
             progress_callback: 形如 ``cb(msg, is_streaming=False)``，
@@ -142,6 +143,7 @@ class ThemeExtractor:
 
         news_id_map = parse_news_id_map(report_path)
         themes, err = self.extract_from_text(report_text, progress_callback)
+        themes = apply_priority_ranks_from_report(themes, report_text)
         return themes, news_id_map, err
 
     def extract_from_text(
@@ -517,7 +519,7 @@ class ThemeExtractor:
         - 老版对象（含 title/relation_type） [{"ref": ..., "title": ..., "relation_type": ...}]
 
         统一返回 [{"ref": str, "relation_type": Optional[str]}]，
-        title 不再保留——下游通过 news_id 反查 curated_news 拿。
+        title 不再保留——下游通过 news_id 反查 raw_news 拿。
         """
         if not isinstance(raw, list):
             return []
@@ -538,8 +540,104 @@ class ThemeExtractor:
         return out
 
 
+_PRIORITY_SECTION_PAT = re.compile(
+    r"(?:#{2,4}\s*)?7\.2\s*板块优先级排序|板块优先级排序",
+)
+_PRIORITY_TABLE_ROW = re.compile(
+    r"^\|\s*(\d+)\s*\|\s*(?:\*\*)?([^|*]+?)(?:\*\*)?\s*\|",
+    re.MULTILINE,
+)
+_PRIORITY_SECTION_END = re.compile(
+    r"\n#{2,4}\s*(?:7\.3|八、|📰)",
+)
+
+
+def _norm_theme_key(name: str) -> str:
+    """题材名规范化，用于与报告表格做模糊匹配。"""
+    s = (name or "").strip()
+    s = re.sub(r"[\s/*\-、，。·•()（）\[\]【】]", "", s)
+    return s.lower()
+
+
+def parse_priority_rank_table(report_text: str) -> List[Tuple[int, str]]:
+    """从报告正文解析「7.2 板块优先级排序」表。
+
+    Returns:
+        [(rank, 板块名), ...]，按 rank 升序；无该章节则 []。
+    """
+    m = _PRIORITY_SECTION_PAT.search(report_text)
+    if not m:
+        return []
+
+    section = report_text[m.start() : m.start() + 6000]
+    end_m = _PRIORITY_SECTION_END.search(section[30:])
+    if end_m:
+        section = section[: 30 + end_m.start()]
+
+    ranks: List[Tuple[int, str]] = []
+    seen: set = set()
+    for row in _PRIORITY_TABLE_ROW.finditer(section):
+        rank = int(row.group(1))
+        name = row.group(2).strip()
+        if not name or name in ("板块", "#", "---") or rank in seen:
+            continue
+        ranks.append((rank, name))
+        seen.add(rank)
+    ranks.sort(key=lambda x: x[0])
+    return ranks
+
+
+def _match_priority_rank(
+    theme_name: str, rank_table: List[Tuple[int, str]]
+) -> Optional[int]:
+    """将 AI 题材名与表格板块名匹配，返回 priority_rank。"""
+    tn = _norm_theme_key(theme_name)
+    if not tn:
+        return None
+
+    for rank, sector in rank_table:
+        if tn == _norm_theme_key(sector):
+            return rank
+
+    best_rank: Optional[int] = None
+    best_overlap = 0
+    for rank, sector in rank_table:
+        sn = _norm_theme_key(sector)
+        if not sn:
+            continue
+        if tn in sn or sn in tn:
+            overlap = min(len(tn), len(sn))
+            if overlap > best_overlap:
+                best_overlap = overlap
+                best_rank = rank
+    return best_rank
+
+
+def apply_priority_ranks_from_report(
+    themes: List[Dict], report_text: str
+) -> List[Dict]:
+    """用报告正文优先级表补全 priority_rank（仅当前报告批次）。
+
+    priority_rank 按 report_id 快照入库，全库允许重复（各报告各有 1、2、3…）。
+    以正文表格为准，覆盖 AI 漏填或填错的序号。
+    """
+    rank_table = parse_priority_rank_table(report_text)
+    if not rank_table:
+        return themes
+
+    out: List[Dict] = []
+    for theme in themes:
+        t = dict(theme)
+        name = (t.get("theme_name") or "").strip()
+        matched = _match_priority_rank(name, rank_table)
+        if matched is not None:
+            t["priority_rank"] = matched
+        out.append(t)
+    return out
+
+
 def parse_news_id_map(report_path: str) -> Dict[str, str]:
-    """解析报告底部"📰 引用新闻详情"段，建立"新闻N → curated_news.id"映射。
+    """解析报告底部"📰 引用新闻详情"段，建立"新闻N → raw_news.id"映射。
 
     报告底部每条新闻形如:
         <a id="新闻107"></a>

@@ -159,7 +159,7 @@ class AINewsAnalyzer:
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
-            "max_tokens": provider_config.get("max_tokens", 4000),
+            "max_tokens": self.config.get_max_output_tokens(provider),
             "temperature": provider_config.get("temperature", 0.7),
             "stream": True,
         }
@@ -489,7 +489,7 @@ class AINewsAnalyzer:
             lines.append(f"### 新闻{num}")
             lines.append("")
 
-            # 数据库 ID（题材抽取脚本反查 curated_news 用，永远放标题前）
+            # 数据库 ID（题材抽取脚本反查 raw_news 用，永远放标题前）
             news_db_id = news.get("id") or ""
             if news_db_id:
                 lines.append(f"**数据库ID**: `{news_db_id}`")

@@ -110,10 +110,10 @@ python main.py
 
 ```
 定时 crawl_sync（可串联 auto_clean）
-    → raw_news
+    → raw_news (clean_status='pending')
 定时或手动 clean_sync（通常爬取任务已串联清洗）
-    → curated_news / rejected_news
-手动或定时 analyze（默认读精选库）
+    → UPDATE raw_news SET clean_status IN ('curated','rejected'), clean_reason=...
+手动或定时 analyze（默认读 clean_status='curated'）
     → data/AI_analysis/…/*.md
     → theme_predictions（若开启自动抽取）
 ```
@@ -209,7 +209,7 @@ NewsTrading/
 │   ├── clean_sync_service.py
 │   ├── analysis_service.py
 │   ├── scheduled_runner.py
-│   └── storage/            # SQLite：raw / curated / theme
+│   └── storage/            # SQLite：raw_news (含 clean_status) / theme_*
 │
 ├── gui/
 │   ├── main_window.py
@@ -233,11 +233,12 @@ NewsTrading/
 ### 数据流
 
 ```
-[源站] → crawl_sync → raw_news
+[源站] → crawl_sync → raw_news.clean_status = pending
               ↓
-         clean_sync → curated_news (+ rejected_news)
+         clean_sync → raw_news.clean_status ∈ {curated, rejected}, clean_reason 填实
               ↓
-         analyze → Markdown 报告 + theme_predictions / theme_stocks / theme_news
+         analyze（默认筛 clean_status=curated）
+              → Markdown 报告 + theme_predictions / theme_stocks / theme_news
 ```
 
 ### 技术栈

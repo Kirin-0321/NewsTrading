@@ -1,8 +1,7 @@
 """
-② 数据清理服务：从未清洗原始数据 → AI 清洗 → 精选库 / 剔除库
+② 数据清理服务：从未清洗原始数据 → AI 清洗 → 更新 raw_news.clean_status
 
-未清洗判定基于 raw LEFT JOIN curated/rejected（见 RawStore.get_uncleaned_news），
-无需额外维护时间水位线。
+未清洗：`clean_status='pending'`（见 RawStore.get_uncleaned_news）。
 """
 
 import json
@@ -10,7 +9,7 @@ import os
 from dataclasses import dataclass, field
 from typing import Callable, Dict, Optional
 
-from services.storage import get_raw_store, get_curated_store
+from services.storage import get_raw_store
 
 
 @dataclass
@@ -35,13 +34,13 @@ class CleanSyncService:
 
     def __init__(self):
         self.raw_store = get_raw_store()
-        self.curated_store = get_curated_store()
 
     def run(
         self,
         batch_size: int = 100,
         provider: str = "deepseek",
         limit: int = 500,
+        max_workers: int = 2,
         progress_callback: Optional[Callable[[str], None]] = None,
     ) -> CleanSyncResult:
         """
@@ -51,6 +50,7 @@ class CleanSyncService:
             batch_size: AI 批大小
             provider: AI 服务商
             limit: 单次最多处理条数
+            max_workers: 并行批次数（1–4，默认 2）
             progress_callback: 文本进度回调，签名 ``Callable[[str], None]``。
                 NewsCleaner 内部既会 1 参（普通日志）也会 5 参（批次进度）地调
                 progress_callback，本方法会将 5 参合并为单字符串再上抛，
@@ -100,13 +100,15 @@ class CleanSyncService:
                 batch_size=batch_size,
                 auto_merge=False,
                 progress_callback=_adapter,
+                max_workers=max_workers,
             )
 
             kept = clean_result.get("kept", [])
             removed = clean_result.get("removed", [])
 
-            kept_count = self.curated_store.upsert_cleaned(kept, provider=provider)
-            removed_count = self.curated_store.save_rejected(removed)
+            kept_count, removed_count = self.raw_store.apply_clean_results(
+                kept, removed, provider=provider
+            )
 
             result.processed = len(uncleaned)
             result.kept = kept_count
@@ -116,8 +118,8 @@ class CleanSyncService:
                 "processed": result.processed,
                 "kept": len(kept),
                 "removed": len(removed),
-                "inserted_curated": kept_count,
-                "inserted_rejected": removed_count,
+                "updated_curated": kept_count,
+                "updated_rejected": removed_count,
                 "error_skipped": clean_result.get("metadata", {}).get("error_skipped", 0),
             }
             skipped = result.stats["error_skipped"]

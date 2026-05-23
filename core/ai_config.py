@@ -11,6 +11,11 @@ from core.env_loader import load_dotenv
 
 load_dotenv()
 
+# DeepSeek V4 等大上下文模型：各阶段输出 token 下限（可通过 providers.*.max_tokens 上调）
+DEFAULT_MAX_OUTPUT_TOKENS = 65536
+# 清洗每条约 keep|理由 行估算 token（含序号/标点），用于 batch 动态下限
+CLEANING_TOKENS_PER_ITEM = 80
+
 # 环境变量优先于配置文件中的 api_key
 _PROVIDER_ENV_KEYS = {
     "openai": "OPENAI_API_KEY",
@@ -61,35 +66,35 @@ class AIConfig:
                     "api_key": "",
                     "base_url": "https://api.openai.com/v1",
                     "model": "gpt-4",
-                    "max_tokens": 4000,
+                    "max_tokens": 16384,
                     "temperature": 0.7
                 },
                 "deepseek": {
                     "api_key": "",
                     "base_url": "https://api.deepseek.com/v1",
                     "model": "deepseek-v4-pro",
-                    "max_tokens": 4000,
+                    "max_tokens": 65536,
                     "temperature": 0.7
                 },
                 "zhipu": {
                     "api_key": "",
                     "base_url": "https://open.bigmodel.cn/api/paas/v4",
                     "model": "glm-4",
-                    "max_tokens": 4000,
+                    "max_tokens": 16384,
                     "temperature": 0.7
                 },
                 "qwen": {
                     "api_key": "",
                     "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
                     "model": "qwen-max",
-                    "max_tokens": 4000,
+                    "max_tokens": 16384,
                     "temperature": 0.7
                 },
                 "volcengine": {
                     "api_key": "",
                     "base_url": "https://ark.cn-beijing.volces.com/api/v3",
                     "model": "doubao-seed-1-6-251015",
-                    "max_tokens": 4000,
+                    "max_tokens": 32768,
                     "temperature": 0.7
                 }
             },
@@ -97,7 +102,7 @@ class AIConfig:
                 "max_sectors": 6,
                 "stocks_per_sector": 5,
                 "detail_level": "standard",
-                "max_input_tokens": 15000
+                "max_input_tokens": 900000
             },
         }
 
@@ -176,6 +181,26 @@ class AIConfig:
         """获取分析参数"""
         return self.config.get('analysis_params', {})
 
+    def get_max_output_tokens(self, provider: Optional[str] = None) -> int:
+        """读取 AI 输出 max_tokens；未配置或非法时用 DEFAULT_MAX_OUTPUT_TOKENS。"""
+        cfg = self.get_provider_config(provider)
+        raw = cfg.get("max_tokens")
+        if raw is None:
+            return DEFAULT_MAX_OUTPUT_TOKENS
+        try:
+            return max(int(raw), 1)
+        except (TypeError, ValueError):
+            return DEFAULT_MAX_OUTPUT_TOKENS
+
+    def get_cleaning_max_tokens(
+        self, expected_count: int, provider: Optional[str] = None
+    ) -> int:
+        """清洗批次输出上限：配置值与「条数 × CLEANING_TOKENS_PER_ITEM」取较大值。"""
+        base = self.get_max_output_tokens(provider)
+        dynamic = max(int(expected_count) * CLEANING_TOKENS_PER_ITEM, 4096)
+        # 清洗输出必须按批大小动态上浮，避免 providers.max_tokens 过低导致截断
+        return min(max(base, dynamic), DEFAULT_MAX_OUTPUT_TOKENS)
+
     def get_theme_extraction_config(self) -> Dict:
         """获取题材抽取配置。
 
@@ -187,10 +212,17 @@ class AIConfig:
             "provider": "deepseek",
             "model": "deepseek-v4-flash",
             "temperature": 0.2,
-            "max_tokens": 32768,
+            "max_tokens": DEFAULT_MAX_OUTPUT_TOKENS,
         }
         cfg = dict(defaults)
         cfg.update(self.config.get("theme_extraction", {}) or {})
+        provider = cfg.get("provider") or "deepseek"
+        configured = cfg.get("max_tokens")
+        try:
+            configured_int = int(configured) if configured is not None else DEFAULT_MAX_OUTPUT_TOKENS
+        except (TypeError, ValueError):
+            configured_int = DEFAULT_MAX_OUTPUT_TOKENS
+        cfg["max_tokens"] = max(configured_int, self.get_max_output_tokens(provider))
         return cfg
 
     def set_analysis_param(self, key: str, value):

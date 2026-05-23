@@ -99,14 +99,13 @@ class NewsExporter:
     ) -> List[Dict]:
         """从 SQLite 读取时间范围内的新闻并语义去重。"""
         from core.semantic_dedup import semantic_deduplicate
-        from services.storage import get_raw_store, get_curated_store
+        from services.storage import CLEAN_CURATED, get_raw_store
 
-        if source == "cleaned":
-            store = get_curated_store()
-        else:
-            store = get_raw_store()
-
-        news_list = store.get_news_in_range(start_datetime, end_datetime)
+        store = get_raw_store()
+        status = CLEAN_CURATED if source == "cleaned" else None
+        news_list = store.get_news_in_range(
+            start_datetime, end_datetime, status=status
+        )
         if not news_list:
             return []
 

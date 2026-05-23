@@ -5,6 +5,11 @@ import json
 from datetime import datetime
 from typing import Any, Dict, Optional, Tuple
 
+# raw_news.clean_status：未清洗 / 精选 / 剔除
+CLEAN_PENDING = "pending"
+CLEAN_CURATED = "curated"
+CLEAN_REJECTED = "rejected"
+
 
 def news_item_id(news: Dict[str, Any]) -> str:
     """生成稳定新闻 ID；优先使用源站 id。"""
@@ -77,7 +82,10 @@ def news_to_row(news: Dict[str, Any], crawled_at: Optional[str] = None) -> Dict[
     pub_at, pub_ts = published_fields(item)
     crawled = crawled_at or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    known = {"id", "title", "content", "source", "datetime", "time", "timestamp"}
+    known = {
+        "id", "title", "content", "source", "datetime", "time", "timestamp",
+        "clean_status", "clean_reason",
+    }
     extra = {k: v for k, v in item.items() if k not in known}
 
     return {
@@ -88,6 +96,8 @@ def news_to_row(news: Dict[str, Any], crawled_at: Optional[str] = None) -> Dict[
         "published_at": pub_at,
         "published_ts": pub_ts,
         "crawled_at": crawled,
+        "clean_status": item.get("clean_status") or CLEAN_PENDING,
+        "clean_reason": item.get("clean_reason"),
         "extra_json": json.dumps(extra, ensure_ascii=False) if extra else None,
     }
 
@@ -102,6 +112,11 @@ def row_to_news(row) -> Dict[str, Any]:
         "datetime": row["published_at"],
         "timestamp": row["published_ts"],
     }
+    if "clean_status" in row.keys():
+        news["clean_status"] = row["clean_status"] or CLEAN_PENDING
+        news["clean_reason"] = row["clean_reason"] or ""
+        if news["clean_status"] == CLEAN_REJECTED:
+            news["reason"] = news["clean_reason"]
     if row["extra_json"]:
         try:
             news.update(json.loads(row["extra_json"]))

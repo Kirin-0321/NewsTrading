@@ -7,6 +7,7 @@
 
 设计要点:
     - 同一份报告(report_id)允许重复插入相同题材，按 report_date 做时序快照
+    - priority_rank 仅表示该 report_id 内板块优先级，全库可重复（1/2/3 各报告各有一份）
     - save_themes() 是事务性的：主表 + 标的 + 新闻 三表一起入库失败回滚
     - 强度 score / level 在 _normalize_theme() 自动互相校正
 """

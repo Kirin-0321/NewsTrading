@@ -281,29 +281,16 @@ def export_txt(output_path: str, labeled_groups: List[Dict]) -> None:
 
 
 def apply_deletions(removed_ids: List[str]) -> Dict[str, int]:
-    """从 raw / curated / rejected 中删除重复 raw_id。"""
+    """从 raw_news 删除重复 id（清洗状态随记录一并删除）。"""
     if not removed_ids:
-        return {"raw": 0, "curated": 0, "rejected": 0}
+        return {"raw": 0}
 
-    stats = {"raw": 0, "curated": 0, "rejected": 0}
+    stats = {"raw": 0}
     chunk_size = 500
     with get_connection() as conn:
         for i in range(0, len(removed_ids), chunk_size):
             chunk = removed_ids[i:i + chunk_size]
             placeholders = ",".join("?" * len(chunk))
-
-            cur = conn.execute(
-                f"DELETE FROM curated_news WHERE raw_id IN ({placeholders})",
-                chunk,
-            )
-            stats["curated"] += cur.rowcount
-
-            cur = conn.execute(
-                f"DELETE FROM rejected_news WHERE raw_id IN ({placeholders})",
-                chunk,
-            )
-            stats["rejected"] += cur.rowcount
-
             cur = conn.execute(
                 f"DELETE FROM raw_news WHERE id IN ({placeholders})",
                 chunk,
@@ -398,10 +385,7 @@ def main():
 
     print(f"\n即将删除 {len(removed_ids)} 条重复 raw 记录...")
     stats = apply_deletions(removed_ids)
-    print(
-        f"已删除 raw={stats['raw']} | "
-        f"关联 curated={stats['curated']} | rejected={stats['rejected']}"
-    )
+    print(f"已删除 raw={stats['raw']}")
 
 
 if __name__ == "__main__":

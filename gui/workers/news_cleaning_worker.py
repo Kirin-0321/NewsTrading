@@ -21,6 +21,7 @@ class NewsCleaningWorker(QThread):
         batch_size=100,
         auto_merge=True,
         sqlite_limit=500,
+        max_workers=1,
     ):
         super().__init__()
         self.criteria = criteria
@@ -28,11 +29,12 @@ class NewsCleaningWorker(QThread):
         self.batch_size = batch_size
         self.auto_merge = auto_merge
         self.sqlite_limit = sqlite_limit
+        self.max_workers = max_workers
 
     def run(self):
         try:
             from core.news_cleaner import NewsCleaner
-            from services.storage import get_raw_store, get_curated_store
+            from services.storage import get_raw_store
 
             cleaner = NewsCleaner(
                 criteria=self.criteria,
@@ -46,7 +48,6 @@ class NewsCleaningWorker(QThread):
                     self.batch_progress.emit(*args)
 
             raw_store = get_raw_store()
-            curated_store = get_curated_store()
             uncleaned = raw_store.get_uncleaned_news(limit=self.sqlite_limit)
             if not uncleaned:
                 self.error.emit("没有待清洗的原始新闻")
@@ -61,13 +62,15 @@ class NewsCleaningWorker(QThread):
                 batch_size=self.batch_size,
                 auto_merge=self.auto_merge,
                 progress_callback=progress_callback,
+                max_workers=self.max_workers,
             )
             kept = results.get("kept", [])
             removed = results.get("removed", [])
 
-            self.progress.emit("正在写入 SQLite 精选库...")
-            inserted = curated_store.upsert_cleaned(kept, provider=self.ai_provider)
-            rejected = curated_store.save_rejected(removed)
+            self.progress.emit("正在更新 raw_news.clean_status ...")
+            updated_kept, updated_rejected = raw_store.apply_clean_results(
+                kept, removed, provider=self.ai_provider
+            )
 
             source_count = len(uncleaned)
             kept_count = len(kept)
@@ -76,8 +79,8 @@ class NewsCleaningWorker(QThread):
                 "source_count": source_count,
                 "kept_count": kept_count,
                 "removed_count": removed_count,
-                "inserted_curated": inserted,
-                "inserted_rejected": rejected,
+                "updated_curated": updated_kept,
+                "updated_rejected": updated_rejected,
                 "kept_percent": round(
                     kept_count / source_count * 100, 1
                 ) if source_count else 0,

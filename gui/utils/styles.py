@@ -136,10 +136,16 @@ QTableWidget {
     border: 1px solid #f0f0f0;
     gridline-color: #f0f0f0;
     selection-background-color: #e6f7ff;
+    selection-color: #262626;
 }
 
 QTableWidget::item {
     padding: 5px;
+}
+
+QTableWidget::item:selected {
+    background-color: #e6f7ff;
+    color: #262626;
 }
 
 QHeaderView::section {

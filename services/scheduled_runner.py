@@ -63,6 +63,7 @@ def run_task_sync(task: Dict) -> Dict:
                     batch_size=params.get("batch_size", 100),
                     provider=params.get("provider", "deepseek"),
                     limit=params.get("limit", 500),
+                    max_workers=params.get("max_workers", 2),
                 )
                 outcome["clean_result"] = clean_result.stats
                 outcome["ok"] = result.ok and clean_result.ok
@@ -77,6 +78,7 @@ def run_task_sync(task: Dict) -> Dict:
                 batch_size=params.get("batch_size", 100),
                 provider=params.get("provider", "deepseek"),
                 limit=params.get("limit", 500),
+                max_workers=params.get("max_workers", 2),
             )
             return {
                 "ok": result.ok,

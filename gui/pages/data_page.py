@@ -1,5 +1,5 @@
 """
-数据管理页面 — SQLite 原始库 / 精选库 / 剔除记录 + 报告文件
+数据管理页面 — SQLite 原始库（按 clean_status 分视图: 全部/精选/剔除）+ 报告文件
 """
 
 from PyQt5.QtWidgets import (
@@ -81,28 +81,45 @@ class NewsDayViewDialog(QDialog):
             self.tree.addTopLevelItem(top)
 
     def _summary_text(self, news):
-        if self._kind == "rejected":
-            ts = news.get("rejected_at", "")
-            title = news.get("title", "") or "（无标题）"
-            return f"[{ts}] {title}"
-        ts = news.get("datetime") or news.get("time", "")
+        ts = (
+            news.get("datetime")
+            or news.get("time")
+            or news.get("published_at")
+            or ""
+        )
         title = news.get("title", "") or "（无标题）"
         return f"[{ts}] {title}"
 
     def _detail_html(self, news):
         if self._kind == "rejected":
+            news_time = (
+                news.get("datetime")
+                or news.get("time")
+                or news.get("published_at")
+                or ""
+            )
             rows = [
-                ("剔除时间", news.get("rejected_at", "")),
+                ("新闻时间", news_time),
                 ("标题", news.get("title", "")),
-                ("原因", news.get("reason", "")),
-                ("原始 ID", news.get("raw_id", "")),
+                ("原因", news.get("reason") or news.get("clean_reason", "")),
+                ("ID", news.get("id", "")),
             ]
+            content = (news.get("content") or "").strip()
+            if content:
+                rows.insert(3, ("正文", content))
+            if news.get("source"):
+                rows.insert(3, ("来源", news.get("source")))
         else:
             rows = [
                 ("时间", news.get("datetime") or news.get("time", "")),
                 ("来源", news.get("source", "")),
                 ("标题", news.get("title", "")),
             ]
+            if self._kind == "curated":
+                rows.append((
+                    "保留原因",
+                    news.get("keep_reason") or news.get("clean_reason") or "",
+                ))
             content = (news.get("content") or "").strip()
             if content:
                 rows.append(("正文", content))
@@ -172,9 +189,9 @@ class DataPage(QWidget):
         header.addWidget(QLabel("视图:"))
         self.type_combo = QComboBox()
         self.type_combo.addItems([
-            "原始库 (SQLite)",
-            "精选库 (SQLite)",
-            "剔除记录 (SQLite)",
+            "原始库 (全部 raw_news)",
+            "精选 (clean_status=curated)",
+            "剔除 (clean_status=rejected)",
             "摘要 (Markdown)",
             "分析报告",
         ])
@@ -252,36 +269,38 @@ class DataPage(QWidget):
         )
 
     def _refresh_curated_db(self):
-        from services.storage import get_curated_store
+        from services.storage import CLEAN_CURATED, get_raw_store
 
-        store = get_curated_store()
-        stats = store.get_daily_stats()
+        store = get_raw_store()
+        stats = store.get_daily_stats(status=CLEAN_CURATED)
         for item in stats:
             self._add_db_row(
                 item["date"],
                 item["count"],
                 f"{item.get('time_start', '')} ~ {item.get('time_end', '')}",
-                "精选库",
+                "精选（clean_status=curated）",
                 "curated",
             )
         self.stats_label.setText(
-            f"SQLite 精选库共 {store.count()} 条 | 按 {len(stats)} 天分布"
+            f"精选共 {store.count_curated()} 条 | 按 {len(stats)} 天分布"
         )
 
     def _refresh_rejected_db(self):
-        from services.storage import get_curated_store
+        from services.storage import CLEAN_REJECTED, get_raw_store
 
-        store = get_curated_store()
-        stats = store.get_rejected_daily_stats()
+        store = get_raw_store()
+        stats = store.get_daily_stats(status=CLEAN_REJECTED)
         for item in stats:
             self._add_db_row(
                 item["date"],
                 item["count"],
-                "-",
-                "AI 剔除",
+                f"{item.get('time_start', '')} ~ {item.get('time_end', '')}",
+                "剔除（clean_status=rejected）",
                 "rejected",
             )
-        self.stats_label.setText(f"SQLite 剔除记录共 {store.count_rejected()} 条")
+        self.stats_label.setText(
+            f"剔除共 {store.count_rejected()} 条 | 按 {len(stats)} 天分布"
+        )
 
     def _add_db_row(self, label, count, time_range, note, db_kind):
         row = self.file_table.rowCount()
@@ -369,17 +388,22 @@ class DataPage(QWidget):
 
     def _view_db_day(self, kind, date_str):
         try:
-            from services.storage import get_raw_store, get_curated_store
+            from services.storage import (
+                CLEAN_CURATED,
+                CLEAN_REJECTED,
+                get_raw_store,
+            )
 
-            if kind == "raw":
-                news = get_raw_store().get_news_for_date(date_str)
-                title = f"原始库 {date_str} ({len(news)} 条)"
-            elif kind == "curated":
-                news = get_curated_store().get_news_for_date(date_str)
-                title = f"精选库 {date_str} ({len(news)} 条)"
-            else:
-                news = get_curated_store().get_rejected_for_date(date_str)
-                title = f"剔除记录 {date_str} ({len(news)} 条)"
+            store = get_raw_store()
+            status_map = {"curated": CLEAN_CURATED, "rejected": CLEAN_REJECTED}
+            title_map = {
+                "raw": "原始库",
+                "curated": "精选",
+                "rejected": "剔除",
+            }
+            status = status_map.get(kind)
+            news = store.get_news_for_date(date_str, status=status)
+            title = f"{title_map.get(kind, kind)} {date_str} ({len(news)} 条)"
 
             dialog = NewsDayViewDialog(self, title, news, kind=kind)
             dialog.exec_()
@@ -387,23 +411,34 @@ class DataPage(QWidget):
             QMessageBox.critical(self, "错误", str(e))
 
     def _delete_db_day(self, kind, date_str):
+        action_text = {
+            "raw": "原始（物理删除当天全部新闻）",
+            "curated": "精选标记（重置为未清洗，原文保留）",
+            "rejected": "剔除标记（重置为未清洗，原文保留）",
+        }.get(kind, "")
         reply = QMessageBox.question(
-            self, "确认删除",
-            f"确定删除 {date_str} 的{'原始' if kind == 'raw' else '精选' if kind == 'curated' else '剔除'}数据吗？",
+            self,
+            "确认删除",
+            f"确定对 {date_str} 执行「{action_text}」吗？",
             QMessageBox.Yes | QMessageBox.No,
         )
         if reply != QMessageBox.Yes:
             return
         try:
-            from services.storage import get_raw_store, get_curated_store
+            from services.storage import (
+                CLEAN_CURATED,
+                CLEAN_REJECTED,
+                get_raw_store,
+            )
 
+            store = get_raw_store()
             if kind == "raw":
-                n = get_raw_store().delete_by_date(date_str)
+                n = store.delete_by_date(date_str)
             elif kind == "curated":
-                n = get_curated_store().delete_by_date(date_str)
+                n = store.reset_clean_status_by_date(date_str, CLEAN_CURATED)
             else:
-                n = get_curated_store().delete_rejected_by_date(date_str)
-            QMessageBox.information(self, "成功", f"已删除 {n} 条")
+                n = store.reset_clean_status_by_date(date_str, CLEAN_REJECTED)
+            QMessageBox.information(self, "成功", f"已处理 {n} 条")
             self.refresh()
         except Exception as e:
             QMessageBox.critical(self, "错误", str(e))
