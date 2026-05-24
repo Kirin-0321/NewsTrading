@@ -20,10 +20,11 @@ data/AI_analysis/
 分析数据/盘后总结/
 !data/**/.gitkeep
 
-# 数据库
+# 数据库（主库 news.db 纳入版本管理，其余仍忽略）
 *.db
 *.sqlite
 *.sqlite3
+!data/news.db
 
 # 日志
 logs/*.log
