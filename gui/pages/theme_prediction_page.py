@@ -19,7 +19,7 @@ import os
 from typing import Optional
 
 from PyQt5.QtCore import Qt
-from PyQt5.QtGui import QTextCursor
+from PyQt5.QtGui import QColor, QTextCursor
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QGroupBox,
     QComboBox, QLineEdit, QFileDialog, QMessageBox, QTextBrowser,
@@ -73,6 +73,8 @@ _NEWS_TABLE_COLS = [
     ("来源", 90),
     ("标题（反查 raw_news）", 360),
 ]
+
+_NEWS_TITLE_COL = 4
 
 
 class ThemePredictionPage(QWidget):
@@ -295,10 +297,24 @@ class ThemePredictionPage(QWidget):
         self.news_table.horizontalHeader().setStretchLastSection(True)
         for i, (_, w) in enumerate(_NEWS_TABLE_COLS):
             self.news_table.setColumnWidth(i, w)
+        self.news_table.cellClicked.connect(self._on_news_cell_clicked)
+
+        self.news_content_browser = QTextBrowser()
+        self.news_content_browser.setStyleSheet(TEXTBROWSER_STYLE)
+        self.news_content_browser.setPlaceholderText("点击左侧标题查看时间与原文")
+
+        self.news_splitter = QSplitter(Qt.Horizontal)
+        self.news_splitter.addWidget(self.news_table)
+        self.news_splitter.addWidget(self.news_content_browser)
+        self.news_splitter.setStretchFactor(0, 1)
+        self.news_splitter.setStretchFactor(1, 1)
+        self.news_splitter.setChildrenCollapsible(False)
+        # 等大比例，布局完成后左右约各占一半
+        self.news_splitter.setSizes([10000, 10000])
 
         self.detail_tab.addTab(self.reason_browser, "📝 逻辑/原因")
         self.detail_tab.addTab(self.stock_table, "💼 关联标的")
-        self.detail_tab.addTab(self.news_table, "📰 关联新闻")
+        self.detail_tab.addTab(self.news_splitter, "📰 关联新闻")
         layout.addWidget(self.detail_tab, 2)
 
         group.setLayout(layout)
@@ -495,22 +511,77 @@ class ThemePredictionPage(QWidget):
         )
         self.news_table.setRowCount(len(news))
         for r, n in enumerate(news):
-            meta = news_meta.get(n.get("news_id") or "", {})
+            news_id = n.get("news_id") or ""
+            meta = news_meta.get(news_id, {})
+            title_text = meta.get("title") or "（未反查到，可能 news_id 缺失）"
             cells = [
                 n.get("news_ref") or "",
                 n.get("relation_type") or "",
                 meta.get("published_at") or "",
                 meta.get("source") or "",
-                meta.get("title") or "（未反查到，可能 news_id 缺失）",
+                title_text,
             ]
+            detail_payload = {
+                "news_id": news_id,
+                "published_at": meta.get("published_at") or "",
+                "content": meta.get("content") or "",
+            }
             for c, text in enumerate(cells):
                 item = QTableWidgetItem(text)
-                item.setToolTip(text)
+                item.setToolTip(
+                    "点击查看时间与原文" if c == _NEWS_TITLE_COL else text
+                )
+                if c == _NEWS_TITLE_COL:
+                    item.setForeground(QColor("#1890ff"))
+                    item.setData(Qt.UserRole, detail_payload)
                 self.news_table.setItem(r, c, item)
+
+    def _on_news_cell_clicked(self, row: int, col: int):
+        """点击标题列 → 右侧展示时间与原文。"""
+        if col != _NEWS_TITLE_COL:
+            return
+        item = self.news_table.item(row, col)
+        if not item:
+            return
+        payload = item.data(Qt.UserRole)
+        if not isinstance(payload, dict):
+            return
+        self.news_content_browser.setHtml(self._format_news_detail_html(payload))
+
+    @staticmethod
+    def _escape_html(text) -> str:
+        return (
+            str(text or "")
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+            .replace("\n", "<br>")
+        )
+
+    @classmethod
+    def _format_news_detail_html(cls, payload: dict) -> str:
+        time_text = (payload.get("published_at") or "").strip() or "（未知）"
+        content = (payload.get("content") or "").strip()
+        if content:
+            body_text = content
+        elif payload.get("news_id"):
+            body_text = "（数据库中暂无正文）"
+        else:
+            body_text = "（未关联 news_id，无法反查正文）"
+
+        rows = [("时间", time_text), ("原文", body_text)]
+        parts = ['<div style="font-family: sans-serif; line-height: 1.6;">']
+        for label, value in rows:
+            parts.append(
+                f'<p><b>{cls._escape_html(label)}</b><br>'
+                f'{cls._escape_html(value)}</p>'
+            )
+        parts.append("</div>")
+        return "".join(parts)
 
     @staticmethod
     def _fetch_news_meta(news_ids: list) -> dict:
-        """通过 news_id 从 raw_news 反查 title/source/published_at。"""
+        """通过 news_id 从 raw_news 反查 title/source/published_at/content。"""
         ids = [i for i in news_ids if i]
         if not ids:
             return {}
@@ -520,7 +591,7 @@ class ThemePredictionPage(QWidget):
             with get_connection() as conn:
                 rows = conn.execute(
                     f"""
-                    SELECT id, title, source, published_at
+                    SELECT id, title, content, source, published_at
                     FROM raw_news
                     WHERE id IN ({placeholders})
                     """,
@@ -531,6 +602,7 @@ class ThemePredictionPage(QWidget):
         return {
             r["id"]: {
                 "title": r["title"],
+                "content": r["content"],
                 "source": r["source"],
                 "published_at": r["published_at"],
             }
@@ -541,6 +613,7 @@ class ThemePredictionPage(QWidget):
         self.reason_browser.clear()
         self.stock_table.setRowCount(0)
         self.news_table.setRowCount(0)
+        self.news_content_browser.clear()
 
     # ---------- 删除 ----------
 
