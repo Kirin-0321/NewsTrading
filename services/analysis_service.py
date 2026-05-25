@@ -11,6 +11,7 @@ from datetime import datetime, timedelta
 from typing import Callable, Dict, List, Literal, Optional
 
 from services.storage import CLEAN_CURATED, get_raw_store
+from core.ai_news_analyzer import AnalysisCancelledError
 
 
 @dataclass
@@ -21,6 +22,7 @@ class AnalysisResult:
     time_range: Dict = field(default_factory=dict)
     result_text: Optional[str] = None
     error: Optional[str] = None
+    cancelled: bool = False
     theme_count: int = 0
     theme_error: Optional[str] = None
 
@@ -71,6 +73,8 @@ class AnalysisService:
         max_news: Optional[int] = None,
         market_summary: Optional[str] = None,
         extract_themes: Optional[bool] = None,
+        enable_deep_thinking: bool = True,
+        cancel_check: Optional[Callable[[], bool]] = None,
         progress_callback: Optional[Callable] = None,
     ) -> AnalysisResult:
         """
@@ -113,6 +117,8 @@ class AnalysisService:
                     template_id=template_id,
                     market_summary=market_summary,
                     progress_callback=progress_callback,
+                    enable_deep_thinking=enable_deep_thinking,
+                    cancel_check=cancel_check,
                 )
             finally:
                 try:
@@ -120,17 +126,28 @@ class AnalysisService:
                 except OSError:
                     pass
 
+            if result.get("cancelled"):
+                out.cancelled = True
+                out.error = result.get("error", "用户已终止分析")
+                return out
+
             if result.get("success"):
                 out.ok = True
                 out.report_path = result.get("report_file")
                 out.result_text = result.get("result")
                 out.time_range = result.get("time_range") or out.time_range
                 self._maybe_extract_themes(
-                    out, progress_callback, force=extract_themes
+                    out,
+                    progress_callback,
+                    force=extract_themes,
+                    cancel_check=cancel_check,
                 )
             else:
                 out.error = result.get("error", "分析失败")
 
+        except AnalysisCancelledError as e:
+            out.cancelled = True
+            out.error = str(e)
         except Exception as e:
             out.error = str(e)
 
@@ -141,6 +158,7 @@ class AnalysisService:
         result: AnalysisResult,
         progress_callback: Optional[Callable] = None,
         force: Optional[bool] = None,
+        cancel_check: Optional[Callable[[], bool]] = None,
     ) -> None:
         """分析完成后自动抽取题材入库。
 
@@ -175,6 +193,9 @@ class AnalysisService:
             return
         if force is None and not ext_cfg.get("auto_run"):
             return
+
+        from core.ai_news_analyzer import _raise_if_cancelled
+        _raise_if_cancelled(cancel_check)
 
         if progress_callback:
             progress_callback("正在抽取题材并入库...")

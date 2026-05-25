@@ -102,7 +102,8 @@ class AIConfig:
                 "max_sectors": 6,
                 "stocks_per_sector": 5,
                 "detail_level": "standard",
-                "max_input_tokens": 900000
+                "max_input_tokens": 900000,
+                "deep_thinking_enabled": True,
             },
         }
 

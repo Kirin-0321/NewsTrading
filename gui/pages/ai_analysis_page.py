@@ -14,7 +14,7 @@ import os
 from gui.utils.styles import (BUTTON_PRIMARY, BUTTON_SUCCESS, BUTTON_DANGER,
                               COMBOBOX_STYLE, INPUT_STYLE, TEXTBROWSER_STYLE)
 from gui.workers.ai_analysis_worker import AIAnalysisWorker
-from gui.pages.prompt_template_dialog import PromptTemplateDialog
+from gui.utils.paths import find_typora_executable, resolve_project_path
 
 
 class AIAnalysisPage(QWidget):
@@ -49,17 +49,29 @@ class AIAnalysisPage(QWidget):
         # 分析参数
         params_group = self.create_params_group()
         layout.addWidget(params_group)
+        self.model_combo.currentTextChanged.connect(
+            self._update_deep_thinking_availability
+        )
 
         # 提示词模板
         template_group = self.create_template_group()
         layout.addWidget(template_group)
 
-        # 分析按钮
+        # 分析 / 终止按钮
+        action_row = QHBoxLayout()
         self.analyze_btn = QPushButton("🚀 开始分析")
         self.analyze_btn.setStyleSheet(BUTTON_PRIMARY)
         self.analyze_btn.setMinimumHeight(45)
         self.analyze_btn.clicked.connect(self.start_analysis)
-        layout.addWidget(self.analyze_btn)
+        action_row.addWidget(self.analyze_btn, 1)
+
+        self.stop_btn = QPushButton("⏹ 终止分析")
+        self.stop_btn.setStyleSheet(BUTTON_DANGER)
+        self.stop_btn.setMinimumHeight(45)
+        self.stop_btn.setEnabled(False)
+        self.stop_btn.clicked.connect(self.stop_analysis)
+        action_row.addWidget(self.stop_btn)
+        layout.addLayout(action_row)
 
         # 进度显示
         progress_group = self.create_progress_group()
@@ -129,9 +141,6 @@ class AIAnalysisPage(QWidget):
         key_layout.addWidget(self.save_key_btn)
         key_layout.addWidget(self.test_btn)
         layout.addLayout(key_layout)
-
-        # 加载已保存的配置
-        self.load_config()
 
         group.setLayout(layout)
         return group
@@ -329,6 +338,7 @@ class AIAnalysisPage(QWidget):
             ("最近 48 小时", "48h"),
             ("最近 7 天", "7d"),
             ("上一收盘日 14:00 至今", "last_close_14"),
+            ("早上 7:00 至今", "since_7am"),
             ("全部数据", "all"),
             ("自定义", "custom"),
         ]:
@@ -395,6 +405,23 @@ class AIAnalysisPage(QWidget):
             self.start_datetime.setDateTime(now.addDays(-7))
         elif key == "last_close_14":
             self.start_datetime.setDateTime(QDateTime(self._last_trading_close_14()))
+        elif key == "since_7am":
+            self.start_datetime.setDateTime(QDateTime(self._since_morning_7()))
+
+    @staticmethod
+    def _since_morning_7() -> datetime:
+        """
+        返回「最近一次早上 7:00」的时间点。
+
+        规则：
+            - 若当前时间已过今日 7:00，起点为今天 7:00
+            - 否则起点为昨天 7:00（避免凌晨选此项时范围为负）
+        """
+        now = datetime.now()
+        today_7 = now.replace(hour=7, minute=0, second=0, microsecond=0)
+        if now < today_7:
+            today_7 = today_7 - timedelta(days=1)
+        return today_7
 
     @staticmethod
     def _last_trading_close_14() -> datetime:
@@ -491,6 +518,22 @@ class AIAnalysisPage(QWidget):
         self.summary_input.setMaximumHeight(120)
         layout.addWidget(self.summary_input)
 
+        # 深度思考开关
+        thinking_row = QHBoxLayout()
+        self.deep_thinking_check = QCheckBox("🧠 深度思考（DeepSeek V4 推理模式）")
+        self.deep_thinking_check.setChecked(True)
+        self.deep_thinking_check.setStyleSheet(
+            "QCheckBox { font-size: 13px; color: #262626; padding-top: 4px; }"
+        )
+        self.deep_thinking_check.setToolTip(
+            "开启后 DeepSeek V4 系列模型将启用 thinking + reasoning_effort=max，"
+            "分析质量更高但耗时更长、费用更高；其他服务商/模型忽略此选项。"
+        )
+        self.deep_thinking_check.toggled.connect(self._save_deep_thinking_pref)
+        thinking_row.addWidget(self.deep_thinking_check)
+        thinking_row.addStretch()
+        layout.addLayout(thinking_row)
+
         # 题材抽取开关
         theme_row = QHBoxLayout()
         self.extract_theme_check = QCheckBox(
@@ -570,8 +613,47 @@ class AIAnalysisPage(QWidget):
             # 加载对应服务商的配置
             self.load_provider_config()
 
+            params = config.get_analysis_params()
+            if hasattr(self, "deep_thinking_check"):
+                self.deep_thinking_check.setChecked(
+                    params.get("deep_thinking_enabled", True)
+                )
+                self._update_deep_thinking_availability()
+
         except Exception as e:
             print(f"加载配置失败: {e}")
+
+    def _supports_deep_thinking(self) -> bool:
+        """当前选中的 DeepSeek V4 模型是否支持深度思考。"""
+        if self.provider_combo.currentText() != "DeepSeek":
+            return False
+        model = self.model_combo.currentText().strip()
+        return model.startswith("deepseek-v4")
+
+    def _update_deep_thinking_availability(self, *_args):
+        """根据服务商/模型更新深度思考开关可用状态。"""
+        if not hasattr(self, "deep_thinking_check"):
+            return
+        supported = self._supports_deep_thinking()
+        self.deep_thinking_check.setEnabled(supported)
+        if supported:
+            self.deep_thinking_check.setToolTip(
+                "开启后 DeepSeek V4 系列模型将启用 thinking + reasoning_effort=max，"
+                "分析质量更高但耗时更长、费用更高。"
+            )
+        else:
+            self.deep_thinking_check.setToolTip(
+                "仅 DeepSeek V4 系列模型（deepseek-v4-pro / deepseek-v4-flash）"
+                "支持深度思考；当前选择不可用。"
+            )
+
+    def _save_deep_thinking_pref(self, checked: bool):
+        """持久化深度思考开关偏好。"""
+        try:
+            from core.ai_config import AIConfig
+            AIConfig().set_analysis_param("deep_thinking_enabled", checked)
+        except Exception as e:
+            print(f"保存深度思考配置失败: {e}")
 
     def load_provider_config(self):
         """加载当前选中服务商的配置"""
@@ -611,6 +693,7 @@ class AIAnalysisPage(QWidget):
         self.update_model_list()
         # 加载对应服务商的API Key和模型
         self.load_provider_config()
+        self._update_deep_thinking_availability()
 
     def update_model_list(self):
         """更新模型列表（从AIConfig动态获取）"""
@@ -741,6 +824,7 @@ class AIAnalysisPage(QWidget):
 
         self.analyze_btn.setEnabled(False)
         self.open_report_btn.setEnabled(False)
+        self.stop_btn.setEnabled(True)
         self.progress_browser.clear()
         self.result_browser.clear()
 
@@ -751,6 +835,14 @@ class AIAnalysisPage(QWidget):
             f"数据源: SQLite {self.db_source_combo.currentText()} | "
             f"{sqlite_start.strftime('%Y-%m-%d %H:%M')} ~ "
             f"{sqlite_end.strftime('%Y-%m-%d %H:%M')}"
+        )
+        thinking_on = (
+            self.deep_thinking_check.isChecked()
+            and self._supports_deep_thinking()
+        )
+        self.add_progress(
+            f"深度思考: {'开启' if thinking_on else '关闭'}"
+            + ("" if self._supports_deep_thinking() else "（当前模型不支持）")
         )
 
         provider_map = {
@@ -778,13 +870,28 @@ class AIAnalysisPage(QWidget):
             sqlite_start=sqlite_start,
             sqlite_end=sqlite_end,
             extract_themes=self.extract_theme_check.isChecked(),
+            enable_deep_thinking=thinking_on,
         )
 
         self.worker.finished.connect(self.on_analysis_finished)
         self.worker.error.connect(self.on_analysis_error)
+        self.worker.cancelled.connect(self.on_analysis_cancelled)
         self.worker.progress.connect(self.add_progress)
         self.worker.streaming.connect(self.add_streaming_content)
         self.worker.start()
+
+    def stop_analysis(self):
+        """终止正在进行的分析"""
+        if not self.worker or not self.worker.isRunning():
+            return
+        self.add_progress("正在终止分析，请稍候...")
+        self.stop_btn.setEnabled(False)
+        self.worker.request_cancel()
+
+    def _reset_analysis_buttons(self):
+        """恢复分析按钮状态"""
+        self.analyze_btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
 
     def on_analysis_finished(self, result):
         """分析完成"""
@@ -820,12 +927,19 @@ class AIAnalysisPage(QWidget):
         self.result_browser.setPlainText(result.get('result', ''))
 
         # 保存报告路径
-        self.last_report = result.get('report_file')
+        self.last_report = resolve_project_path(result.get('report_file', ''))
 
         # 启用按钮
-        self.analyze_btn.setEnabled(True)
+        self._reset_analysis_buttons()
         if self.last_report and os.path.exists(self.last_report):
             self.open_report_btn.setEnabled(True)
+
+    def on_analysis_cancelled(self):
+        """分析被用户终止"""
+        self.add_progress("=" * 60)
+        self.add_progress("⏹ 分析已终止")
+        self.add_progress("=" * 60)
+        self._reset_analysis_buttons()
 
     def on_analysis_error(self, error_msg):
         """分析失败"""
@@ -833,7 +947,7 @@ class AIAnalysisPage(QWidget):
         self.add_progress(f"❌ 分析失败: {error_msg}")
         self.add_progress("=" * 60)
 
-        self.analyze_btn.setEnabled(True)
+        self._reset_analysis_buttons()
         QMessageBox.critical(self, "错误", error_msg)
 
     def add_progress(self, message):
@@ -848,39 +962,30 @@ class AIAnalysisPage(QWidget):
         self.result_browser.moveCursor(QTextCursor.End)
 
     def open_report(self):
-        """打开报告（使用Typora）"""
-        if self.last_report and os.path.exists(self.last_report):
-            import subprocess
-            import sys
-
-            # 智能获取Typora路径（兼容打包后的exe）
-            if getattr(sys, 'frozen', False):
-                # 打包后的程序
-                exe_dir = os.path.dirname(sys.executable)
-                typora_path = os.path.join(exe_dir, 'Typora', 'Typora.exe')
-            else:
-                # 开发环境
-                typora_path = os.path.join(os.getcwd(), 'Typora', 'Typora.exe')
-
-            # 如果Typora存在，使用Typora打开
-            if os.path.exists(typora_path):
-                try:
-                    subprocess.Popen(
-                        [typora_path, os.path.abspath(self.last_report)])
-                    self.add_progress(
-                        f"已使用Typora打开报告: {os.path.basename(self.last_report)}")
-                except Exception as e:
-                    QMessageBox.warning(self, "警告", f"使用Typora打开失败: {str(e)}")
-            else:
-                # Typora不存在，使用系统默认程序
-                try:
-                    os.startfile(self.last_report)
-                    self.add_progress(
-                        f"已打开报告: {os.path.basename(self.last_report)}")
-                except Exception as e:
-                    QMessageBox.critical(self, "错误", f"打开报告失败: {str(e)}")
-        else:
+        """打开报告（优先使用 Typora）"""
+        report_path = resolve_project_path(self.last_report or "")
+        if not report_path or not os.path.exists(report_path):
             QMessageBox.warning(self, "警告", "报告文件不存在！")
+            return
+
+        import subprocess
+
+        typora_path = find_typora_executable()
+        if typora_path:
+            try:
+                subprocess.Popen([typora_path, report_path])
+                self.add_progress(
+                    f"已使用 Typora 打开报告: {os.path.basename(report_path)}"
+                )
+                return
+            except Exception as e:
+                QMessageBox.warning(self, "警告", f"使用 Typora 打开失败: {str(e)}")
+
+        try:
+            os.startfile(report_path)
+            self.add_progress(f"已打开报告: {os.path.basename(report_path)}")
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"打开报告失败: {str(e)}")
 
     def update_template_description(self):
         """更新模板说明"""

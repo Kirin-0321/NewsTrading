@@ -12,6 +12,15 @@ from core.ai_config import AIConfig
 from core.data_loader import DataLoader
 
 
+class AnalysisCancelledError(Exception):
+    """用户主动终止分析。"""
+
+
+def _raise_if_cancelled(cancel_check: Optional[Callable[[], bool]]) -> None:
+    if cancel_check and cancel_check():
+        raise AnalysisCancelledError("用户已终止分析")
+
+
 class AINewsAnalyzer:
     """AI新闻分析器"""
 
@@ -112,8 +121,11 @@ class AINewsAnalyzer:
         template_name: Optional[str] = None,
         progress_callback: Optional[Callable] = None,
         market_summary: Optional[str] = None,
+        enable_deep_thinking: bool = True,
+        cancel_check: Optional[Callable[[], bool]] = None,
     ) -> str:
         """统一流式调用（OpenAI 兼容接口或智谱）"""
+        _raise_if_cancelled(cancel_check)
         provider_config = self.config.get_provider_config(provider)
         api_key = provider_config.get("api_key")
         if not api_key:
@@ -150,9 +162,7 @@ class AINewsAnalyzer:
         model = provider_config.get("model", "gpt-4")
 
         # 场景分流（参见 .huiye/架构方案.md §13）:
-        # AI 分析任务（盘后总结）使用思考模式 + 最高推理强度，
-        # DeepSeek V4 / V4-Pro 均支持 thinking + reasoning_effort，
-        # 通过 extra_body 透传可避免 openai SDK 版本兼容问题。
+        # DeepSeek V4 默认 thinking=enabled，须显式 disabled 才能关闭。
         create_kwargs = {
             "model": model,
             "messages": [
@@ -163,11 +173,18 @@ class AINewsAnalyzer:
             "temperature": provider_config.get("temperature", 0.7),
             "stream": True,
         }
+        # DeepSeek V4 默认开启 thinking；必须显式 enabled/disabled，
+        # 否则仅不传 extra_body 时模型仍会返回 reasoning_content。
         if provider == "deepseek" and model.startswith("deepseek-v4"):
-            create_kwargs["extra_body"] = {
-                "thinking": {"type": "enabled"},
-                "reasoning_effort": "max",
-            }
+            if enable_deep_thinking:
+                create_kwargs["extra_body"] = {
+                    "thinking": {"type": "enabled"},
+                    "reasoning_effort": "max",
+                }
+            else:
+                create_kwargs["extra_body"] = {
+                    "thinking": {"type": "disabled"},
+                }
 
         response = client.chat.completions.create(**create_kwargs)
 
@@ -178,39 +195,49 @@ class AINewsAnalyzer:
         content_parts: List[str] = []
         sent_reasoning_header = False
         sent_content_header = False
+        collect_reasoning = enable_deep_thinking
 
-        for chunk in response:
-            if not chunk.choices:
-                continue
-            delta = chunk.choices[0].delta
-            reasoning = getattr(delta, "reasoning_content", None)
-            content = delta.content
+        try:
+            for chunk in response:
+                _raise_if_cancelled(cancel_check)
+                if not chunk.choices:
+                    continue
+                delta = chunk.choices[0].delta
+                reasoning = getattr(delta, "reasoning_content", None) if collect_reasoning else None
+                content = delta.content
 
-            if reasoning:
-                if not sent_reasoning_header:
-                    header = "## 🧠 模型思考过程\n\n"
-                    if progress_callback:
-                        progress_callback(header, is_streaming=True)
-                    sent_reasoning_header = True
-                reasoning_parts.append(reasoning)
-                if progress_callback:
-                    progress_callback(reasoning, is_streaming=True)
-
-            if content:
-                if not sent_content_header:
-                    if reasoning_parts:
-                        sep = "\n\n---\n\n## 📋 主要分析\n\n"
+                if reasoning:
+                    if not sent_reasoning_header:
+                        header = "## 🧠 模型思考过程\n\n"
                         if progress_callback:
-                            progress_callback(sep, is_streaming=True)
-                    sent_content_header = True
-                content_parts.append(content)
-                if progress_callback:
-                    progress_callback(content, is_streaming=True)
+                            progress_callback(header, is_streaming=True)
+                        sent_reasoning_header = True
+                    reasoning_parts.append(reasoning)
+                    if progress_callback:
+                        progress_callback(reasoning, is_streaming=True)
+
+                if content:
+                    if not sent_content_header:
+                        if reasoning_parts:
+                            sep = "\n\n---\n\n## 📋 主要分析\n\n"
+                            if progress_callback:
+                                progress_callback(sep, is_streaming=True)
+                        sent_content_header = True
+                    content_parts.append(content)
+                    if progress_callback:
+                        progress_callback(content, is_streaming=True)
+        except AnalysisCancelledError:
+            if hasattr(response, "close"):
+                try:
+                    response.close()
+                except Exception:
+                    pass
+            raise
 
         reasoning_text = "".join(reasoning_parts).strip()
         content_text = "".join(content_parts)
 
-        if reasoning_text:
+        if reasoning_text and collect_reasoning:
             return (
                 "## 🧠 模型思考过程\n\n"
                 f"{reasoning_text}\n\n"
@@ -299,7 +326,9 @@ class AINewsAnalyzer:
         max_news: Optional[int] = None,
         template_id: Optional[str] = None,
         market_summary: Optional[str] = None,
-        progress_callback: Optional[Callable] = None
+        progress_callback: Optional[Callable] = None,
+        enable_deep_thinking: bool = True,
+        cancel_check: Optional[Callable[[], bool]] = None,
     ) -> Dict:
         """
         分析新闻文件
@@ -311,6 +340,7 @@ class AINewsAnalyzer:
         }
         """
         try:
+            _raise_if_cancelled(cancel_check)
             # 加载数据
             if progress_callback:
                 progress_callback("正在加载数据...")
@@ -319,6 +349,7 @@ class AINewsAnalyzer:
             news_list = data['news_list']
             format_type = data['format']
 
+            _raise_if_cancelled(cancel_check)
             if progress_callback:
                 progress_callback(
                     f"已加载 {data['count']} 条新闻 ({format_type}格式)")
@@ -329,6 +360,7 @@ class AINewsAnalyzer:
                 if progress_callback:
                     progress_callback(f"已限制为前 {max_news} 条新闻")
 
+            _raise_if_cancelled(cancel_check)
             # 格式化数据
             if progress_callback:
                 progress_callback("正在格式化数据...")
@@ -341,6 +373,7 @@ class AINewsAnalyzer:
             if progress_callback:
                 progress_callback(f"预估输入tokens: {estimated_tokens}")
 
+            _raise_if_cancelled(cancel_check)
             # 选择服务商
             if provider is None:
                 provider = self.config.get_current_provider()
@@ -356,8 +389,11 @@ class AINewsAnalyzer:
                 template_id,
                 progress_callback,
                 market_summary,
+                enable_deep_thinking=enable_deep_thinking,
+                cancel_check=cancel_check,
             )
 
+            _raise_if_cancelled(cancel_check)
             # 保存报告
             if progress_callback:
                 progress_callback("正在保存报告...")
@@ -380,6 +416,15 @@ class AINewsAnalyzer:
                 'time_range': data['time_range']
             }
 
+        except AnalysisCancelledError as e:
+            error_msg = str(e)
+            if progress_callback:
+                progress_callback(error_msg)
+            return {
+                'success': False,
+                'cancelled': True,
+                'error': error_msg,
+            }
         except Exception as e:
             error_msg = f"分析失败: {str(e)}"
             if progress_callback:
@@ -416,7 +461,9 @@ class AINewsAnalyzer:
         report_filename = f"{month_day}_{time_str}_盘后总结分析报告.md"
 
         # 生成保存路径: data/AI_analysis/月日/
-        report_dir = os.path.join('data', 'AI_analysis', month_day)
+        from services.storage.database import get_project_root
+        project_root = get_project_root()
+        report_dir = os.path.join(project_root, 'data', 'AI_analysis', month_day)
         report_path = os.path.join(report_dir, report_filename)
 
         # 确保目录存在
@@ -584,6 +631,7 @@ class AINewsAnalyzer:
                 template_name="standard",
                 progress_callback=None,
                 market_summary=None,
+                enable_deep_thinking=False,
             )
             return {"success": True, "message": f"{provider} 连接成功"}
         except Exception as e:

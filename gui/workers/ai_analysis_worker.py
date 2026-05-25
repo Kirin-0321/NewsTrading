@@ -5,12 +5,15 @@ AI 分析后台工作线程（SQLite）
 from PyQt5.QtCore import QThread, pyqtSignal
 import traceback
 
+from core.ai_news_analyzer import AnalysisCancelledError
+
 
 class AIAnalysisWorker(QThread):
     """AI 分析工作线程"""
 
     finished = pyqtSignal(dict)
     error = pyqtSignal(str)
+    cancelled = pyqtSignal()
     progress = pyqtSignal(str)
     streaming = pyqtSignal(str)
 
@@ -26,6 +29,7 @@ class AIAnalysisWorker(QThread):
         sqlite_start=None,
         sqlite_end=None,
         extract_themes=None,
+        enable_deep_thinking=True,
     ):
         super().__init__()
         self.provider = provider
@@ -38,10 +42,21 @@ class AIAnalysisWorker(QThread):
         self.sqlite_start = sqlite_start
         self.sqlite_end = sqlite_end
         self.extract_themes = extract_themes
+        self.enable_deep_thinking = enable_deep_thinking
+        self._cancel_requested = False
+
+    def request_cancel(self):
+        """请求终止当前分析任务。"""
+        self._cancel_requested = True
+
+    def is_cancel_requested(self) -> bool:
+        return self._cancel_requested
 
     def run(self):
         try:
             def progress_callback(message, is_streaming=False):
+                if self._cancel_requested:
+                    raise AnalysisCancelledError("用户已终止分析")
                 if is_streaming:
                     self.streaming.emit(message)
                 else:
@@ -65,9 +80,13 @@ class AIAnalysisWorker(QThread):
                 max_news=self.max_news,
                 market_summary=self.market_summary,
                 extract_themes=self.extract_themes,
+                enable_deep_thinking=self.enable_deep_thinking,
+                cancel_check=self.is_cancel_requested,
                 progress_callback=progress_callback,
             )
-            if result.ok:
+            if result.cancelled:
+                self.cancelled.emit()
+            elif result.ok:
                 self.finished.emit({
                     "success": True,
                     "result": result.result_text,
@@ -80,6 +99,8 @@ class AIAnalysisWorker(QThread):
             else:
                 self.error.emit(result.error or "分析失败")
 
+        except AnalysisCancelledError:
+            self.cancelled.emit()
         except Exception as e:
             error_msg = f"分析失败: {str(e)}"
             self.progress.emit(error_msg)
