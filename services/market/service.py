@@ -315,7 +315,13 @@ class MarketSummaryService:
                 summary, gaps, fetch_result, mode=mode
             )
             summary["quality"] = quality
-            summary["gaps"] = quality.get("gaps") or gaps
+            # validator gaps 与手收集 gaps 合并（按 field 去重，validator 优先）
+            v_gaps = list(quality.get("gaps") or [])
+            v_fields = {(g.get("field") or "") for g in v_gaps if isinstance(g, dict)}
+            for g in gaps:
+                if isinstance(g, dict) and (g.get("field") or "") not in v_fields:
+                    v_gaps.append(g)
+            summary["gaps"] = v_gaps
             summary["meta"]["api_call_count"] = result.api_call_count
 
             # ---- 7) 渲染 compact MD ----
@@ -546,16 +552,53 @@ class MarketSummaryService:
             z_cnt = int(row["z_cnt"] or 0)
             d_cnt = int(row["d_cnt"] or 0)
 
+            # 取所有 U 股；不再用 cons_nums IS NOT NULL 过滤
+            # SQL alias limit_up_time AS lu_time —— 对齐 build_limit_ladder 字段名
             kpl_rows = conn.execute(
                 "SELECT ts_code, "
                 "       json_extract(raw_json, '$.name') AS name, "
-                "       theme, status, cons_nums, limit_up_time, open_times "
+                "       theme, status, cons_nums, "
+                "       limit_up_time AS lu_time, open_times "
                 "FROM fact_limit_stock "
-                "WHERE trade_date = ? AND limit_type = 'U' "
-                "  AND cons_nums IS NOT NULL",
+                "WHERE trade_date = ? AND limit_type = 'U'",
                 (td,),
             ).fetchall()
-        kpl_dicts = [dict(r) for r in kpl_rows]
+            kpl_dicts = [dict(r) for r in kpl_rows]
+            null_cons_codes = [
+                r["ts_code"] for r in kpl_rows if r["cons_nums"] is None
+            ]
+            null_theme_codes = [
+                r["ts_code"] for r in kpl_rows
+                if not r["theme"]
+            ]
+            cons_nums_filled = u_cnt - len(null_cons_codes)
+
+            # —— Fallback：当 cons_nums NULL 时，用历史涨停递归推算
+            # （T-1 仍涨停 → 2 板，T-2 仍涨停 → 3 板……上限 7 板）
+            derived_cons: Dict[str, int] = {}
+            if null_cons_codes:
+                derived_cons = self._derive_cons_nums_from_history(
+                    conn, td, null_cons_codes, max_n=7
+                )
+            # —— Fallback：当 theme 为空时，用 T-1..T-5 日的 theme 兜底
+            derived_themes: Dict[str, str] = {}
+            if null_theme_codes:
+                derived_themes = self._derive_themes_from_history(
+                    conn, td, null_theme_codes, lookback_days=5
+                )
+
+        # 把派生结果写回 kpl_dicts（in-place）
+        for d in kpl_dicts:
+            code = d["ts_code"]
+            if d.get("cons_nums") is None and code in derived_cons:
+                d["cons_nums"] = derived_cons[code]
+                d["cons_nums_source"] = (
+                    "derived_from_history"
+                    if derived_cons[code] > 1 else "fallback_first"
+                )
+            if not d.get("theme") and code in derived_themes:
+                d["theme"] = derived_themes[code]
+                d["theme_source"] = "derived_from_history"
 
         breadth = {
             "limit_up": u_cnt or None,
@@ -568,6 +611,21 @@ class MarketSummaryService:
             gaps.append({
                 "field": "breadth.limit_up",
                 "reason": "fact_limit_stock 无 U 数据",
+            })
+        elif u_cnt > 0 and cons_nums_filled == 0:
+            # kpl_list 接口当日延迟 → 用历史递归推算 cons_nums
+            from collections import Counter
+            dist = Counter(d.get("cons_nums") or 1 for d in kpl_dicts)
+            dist_str = "/".join(
+                f"{k}板:{dist[k]}" for k in sorted(dist.keys())
+            )
+            gaps.append({
+                "field": "limit_ladder.tiers",
+                "reason": (
+                    f"kpl_list({td}) 无数据，{u_cnt} 只涨停股的连板数 / 题材"
+                    f"已基于历史 fact_limit_stock 递归推算；分布: {dist_str}；"
+                    "T+1 Tushare 出数据后会自动 force-refresh 覆盖"
+                ),
             })
 
         # 情绪指标
@@ -751,6 +809,115 @@ class MarketSummaryService:
             return (limit_up_count, leaders)
         except Exception:  # noqa: BLE001
             return (None, [])
+
+    @staticmethod
+    def _derive_cons_nums_from_history(
+        conn: Any,
+        trade_date: str,
+        ts_codes: List[str],
+        *,
+        max_n: int = 7,
+    ) -> Dict[str, int]:
+        """递归推算每只股的连板数。
+
+        当 kpl_list 接口延迟（``cons_nums`` 全 NULL）时，用 fact_limit_stock
+        的历史涨停记录推算：T 日涨停 + T-1 日仍涨停 → 2 连板，T-2 日仍涨停
+        → 3 连板……上限 ``max_n`` 板（防止历史长链拖累性能）。
+
+        Args:
+            conn: 已 open 的 sqlite3 connection（readonly OK）
+            trade_date: T 日 YYYYMMDD
+            ts_codes: T 日涨停股 ts_code 列表
+            max_n: 最多推算到 N 板（默认 7）
+        Returns:
+            ``{ts_code: cons_n}`` —— 未推出额外连板的默认 1（首板）。
+            空输入返回 ``{}``。
+        """
+        if not ts_codes:
+            return {}
+        result: Dict[str, int] = {c: 1 for c in ts_codes}
+        current: set = set(ts_codes)
+        curr_date = trade_date
+        for step in range(2, max_n + 1):
+            if not current:
+                break
+            try:
+                prev_row = conn.execute(
+                    "SELECT pretrade_date FROM dim_trade_calendar "
+                    "WHERE trade_date = ? AND is_open = 1",
+                    (curr_date,),
+                ).fetchone()
+            except Exception:  # noqa: BLE001
+                break
+            if not prev_row or not prev_row["pretrade_date"]:
+                break
+            prev_date = str(prev_row["pretrade_date"])
+
+            qmarks = ",".join("?" * len(current))
+            try:
+                rs = conn.execute(
+                    f"SELECT ts_code FROM fact_limit_stock "
+                    f"WHERE trade_date = ? AND limit_type = 'U' "
+                    f"  AND ts_code IN ({qmarks})",
+                    (prev_date, *current),
+                ).fetchall()
+            except Exception:  # noqa: BLE001
+                break
+            still_u = {r["ts_code"] for r in rs}
+            for c in still_u:
+                result[c] = step
+            current = still_u
+            curr_date = prev_date
+        return result
+
+    @staticmethod
+    def _derive_themes_from_history(
+        conn: Any,
+        trade_date: str,
+        ts_codes: List[str],
+        *,
+        lookback_days: int = 5,
+    ) -> Dict[str, str]:
+        """对每只股，回溯最近 ``lookback_days`` 个交易日找最新的 theme。
+
+        当 kpl_list 当日延迟时 theme 全空，但同一只股在 T-1 / T-2 日的
+        fact_limit_stock 通常有 theme（资金主线短期内稳定，可作近似兜底）。
+
+        Args:
+            conn: sqlite3 connection
+            trade_date: T 日（不含），从 T-1 起回溯
+            ts_codes: 要查 theme 的股代码
+            lookback_days: 回溯天数（默认 5 个自然日，含周末按 SQL 过滤）
+        Returns:
+            ``{ts_code: theme}``。未找到 theme 的股不在返回 dict 里。
+        """
+        if not ts_codes:
+            return {}
+        out: Dict[str, str] = {}
+        from datetime import datetime, timedelta
+        try:
+            d_end = datetime.strptime(trade_date, "%Y%m%d")
+        except Exception:  # noqa: BLE001
+            return {}
+        start_str = (d_end - timedelta(days=lookback_days * 2 + 3)).strftime("%Y%m%d")
+        qmarks = ",".join("?" * len(ts_codes))
+        try:
+            rs = conn.execute(
+                f"SELECT ts_code, theme, trade_date "
+                f"FROM fact_limit_stock "
+                f"WHERE trade_date >= ? AND trade_date < ? "
+                f"  AND limit_type = 'U' AND theme IS NOT NULL "
+                f"  AND ts_code IN ({qmarks}) "
+                f"ORDER BY ts_code, trade_date DESC",
+                (start_str, trade_date, *ts_codes),
+            ).fetchall()
+        except Exception:  # noqa: BLE001
+            return {}
+        for r in rs:
+            code = r["ts_code"]
+            if code not in out:
+                out[code] = str(r["theme"] or "")
+        return out
 
     # --- dragon tiger ---
 
