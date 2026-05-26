@@ -34,7 +34,7 @@ def _section(title: str) -> None:
     print("=" * 72)
 
 
-def _run_script(name: str, args: list = None) -> int:
+def _run_script(name: str, args: list | None = None) -> int:
     args = args or []
     env = os.environ.copy()
     env["PYTHONIOENCODING"] = "utf-8"
@@ -163,7 +163,7 @@ def step_5_show_ai_input() -> bool:
     try:
         rc = _run_script(
             "show_ai_input.py",
-            ["--template", "standard", "--hours", "1", "--limit", "1",
+            ["--template", "standard", "--hours", "720", "--limit", "1",
              "--output", out_path],
         )
         if rc != 0:

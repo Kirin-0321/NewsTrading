@@ -100,11 +100,15 @@ def test_market_db_in_tmp(tmp_dir: Path) -> None:
     backup_dir = tmp_dir / "backups"
     db = MarketDB(db_path=db_path, backup_dir=backup_dir)
 
-    # 1) 首次 ensure_schema：应应用 2 个迁移
+    # 1) 首次 ensure_schema：应应用 migrations/ 下所有迁移
+    expected_versions = sorted(
+        int(p.name.split("_", 1)[0])
+        for p in (_ROOT / "services" / "market" / "migrations").glob("*.sql")
+    )
     applied = db.ensure_schema(do_backup=False)
     _check(
-        applied == [1, 2],
-        f"首次 ensure_schema 应用 2 个迁移，实际: {applied}",
+        applied == expected_versions,
+        f"首次 ensure_schema 应用 {len(expected_versions)} 个迁移，实际: {applied}",
     )
 
     # 2) 14 张表全部存在
@@ -156,7 +160,7 @@ def test_market_db_in_tmp(tmp_dir: Path) -> None:
     if sample_ok == len(KNOWN_ALIAS_SAMPLES):
         _ok(f"种子样本全部命中（{sample_ok}/{len(KNOWN_ALIAS_SAMPLES)}）")
 
-    # 4) schema_migrations 有 2 条
+    # 4) schema_migrations 与 migrations/*.sql 数量一致
     with db.connect(readonly=True) as conn:
         versions = [
             r[0]
@@ -165,8 +169,8 @@ def test_market_db_in_tmp(tmp_dir: Path) -> None:
             ).fetchall()
         ]
     _check(
-        versions == [1, 2],
-        f"schema_migrations 应为 [1, 2]，实际 {versions}",
+        versions == expected_versions,
+        f"schema_migrations 应为 {expected_versions}，实际 {versions}",
     )
 
     # 5) 幂等：再跑一次 ensure_schema 应返回空列表

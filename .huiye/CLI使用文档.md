@@ -1,0 +1,386 @@
+# CLI 使用文档
+
+> 把项目所有命令行入口（`tools/*.py`）按"日常会用 / 偶尔用 / 一次性 / 验收"四档整理出来，给主人速查。
+> 最后更新：2026-05-26 20:45（M0~M5 全部交付后整理 + 全量 smoke 通过）
+
+---
+
+## 0. TL;DR
+
+```
+日常会用 4 个 ─┬─ python tools/market_fetch.py              # 生成今天盘后总结
+              ├─ python tools/market_fetch_backfill.py     # 历史交易日批量回填
+              ├─ python tools/show_ai_input.py             # 看 AI 真实输入了什么
+              └─ python tools/dedupe_sqlite_raw.py         # 看 / 删 news 库重复
+
+偶尔会用 1 个 ─── python tools/export_tushare_theme_daily.py # 导出 Tushare 题材原始数据
+
+一次性 2 个 ─┬─ python tools/migrate_prompts_to_files.py    # M0 已跑过，无需再跑
+            └─ python tools/verify_migration_equivalence.py # M0 验收，可重复跑作回归
+
+验收脚本 3 个 ─┬─ python tools/test_phase_m0_acceptance.py  # M0 综合验收（5/5 PASS）
+              ├─ python tools/test_market_db.py            # market.db 与 ai_reports 验收
+              └─ python tools/test_prompt_loader.py        # PromptLoader 自检（20/20 PASS）
+
+调试 / 诊断 ─┬─ python tools/_debug_theme_extract.py       # 题材抽取一次完整 IO dump
+            └─ python tools/test_source_field.py          # 抓 source 字段排查
+```
+
+主入口 `python main.py` 是 **GUI**（PyQt5），没有命令行参数；GUI 内的"📊 盘后数据 / ⏰ 定时任务"页可以触达上述 CLI 的全部能力。
+
+---
+
+## 一、核心 CLI（日常会用）
+
+### 1. `tools/market_fetch.py` — 盘后数据：单日抓取/渲染
+
+**做什么**：给一个交易日，跑完 `MarketSummaryService.build()`，把 `summary_json / summary_md / completeness` 写进 `data/market.db.market_summaries`，并打印 KPI 速览 + 可选 Markdown。
+
+**调用链**：`TushareClient → Tushare 拉数 → fact_* → MarketSummaryService.build → (CLSEnricher → AIEnricher → Merger → Validator) → market_summaries`。
+
+**参数**：
+
+| 参数 | 默认 | 说明 |
+|------|------|------|
+| `trade_date` | 最近开市日 | 位置参数，`YYYYMMDD` |
+| `--mode` | `hybrid` | `tushare-only` / `hybrid` / `ai-full`（详见 [§4 模式说明](#四三种数据处理模式)） |
+| `--top-n` | `10` | 板块榜单 Top N |
+| `--force-refresh` | 关 | 忽略缓存，先清当日 `fact_*` 再重拉 |
+| `--print-md` | 关 | 把 compact Markdown 打到 stdout |
+| `--print-json` | 关 | 把 canonical summary JSON 打到 stdout |
+| `--save-md PATH` | — | 把 Markdown 同时另存 |
+| `-v / --verbose` | 关 | DEBUG 级日志 |
+
+**示例**：
+
+```powershell
+python tools/market_fetch.py                              # 最近开市日 hybrid
+python tools/market_fetch.py 20260526 --print-md          # 指定日 + 打印 MD
+python tools/market_fetch.py 20260526 --mode tushare-only # 不走 AI（最快，约 4~6s）
+python tools/market_fetch.py 20260526 --force-refresh     # 失效缓存重拉
+python tools/market_fetch.py 20260526 --save-md data/exports/20260526.md
+```
+
+**输出**：
+- KPI 速览（指数 / 涨跌停 / 北向 / 板块 Top5）
+- `--print-md` 时附 Markdown
+- 落库：`data/market.db.market_summaries`（同日 ON CONFLICT 覆盖）
+
+**退出码**：`0` 成功；`1` 异常；`2` 取消。
+
+**注意**：
+- 北向资金 T+1 才补齐，当日跑会有 `gaps: northbound_capital_pending` 警告，属正常。
+- `--mode ai-full` 会触发 AI 兜底（DeepSeek V4 Pro），单日约 30~60s、几分钱成本。
+- 首次跑某天数据时 Tushare 调用约 20 次（高频接口），后续会全部命中 `fact_*` 缓存。
+
+---
+
+### 2. `tools/market_fetch_backfill.py` — 盘后数据：历史多日回填
+
+**做什么**：批量调 `market_fetch` 的核心服务，把过去 N 个交易日或某区间一次性灌进 `market.db`，给 CLI 评估回测 / Agent 优化打底。
+
+**参数**：
+
+| 参数 | 默认 | 说明 |
+|------|------|------|
+| `--days N` | `30` | 最近 N 个交易日（与 `--start/--end` 互斥） |
+| `--start YYYYMMDD` | — | 区间起，需配 `--end` |
+| `--end YYYYMMDD` | — | 区间止 |
+| `--mode` | `hybrid` | 同上 |
+| `--top-n` | `10` | 同上 |
+| `--force-refresh` | 关 | 所有日都重拉 |
+| `--continue-on-error` | **开**（默认） | 单日失败不中断 |
+| `--no-continue` | — | 单日失败立即终止 |
+| `--dry-run` | 关 | 只打印目标日历，不实际跑 |
+| `--report PATH` | — | 写 CSV 汇总报告 |
+| `-v / --verbose` | 关 | DEBUG 级日志（含 service 进度） |
+
+**示例**：
+
+```powershell
+python tools/market_fetch_backfill.py --days 5                                # 先小试 5 天
+python tools/market_fetch_backfill.py --days 30                               # 30 天 hybrid（约 20~25 分钟）
+python tools/market_fetch_backfill.py --start 20260401 --end 20260525         # 指定区间
+python tools/market_fetch_backfill.py --days 30 --dry-run                     # 看会跑哪几天，不真跑
+python tools/market_fetch_backfill.py --days 30 --report data/backups/bf.csv  # 写报告
+```
+
+**输出**：
+- 进度条 + 每天的 completeness / 耗时 / api_call_count / from_cache
+- `--report` 时写 CSV：`trade_date, ok, completeness, api_calls, elapsed_ms, cache_hit, error`
+
+**退出码**：`0` 全部成功或 `--continue-on-error` 部分成功；`1` `--no-continue` 时首次失败；`2` 参数错误。
+
+**注意**：
+- 已优化：使用 `_ensure_calendar_window` 一次性灌满日期范围的 `dim_trade_calendar`，避免对 `trade_cal` 反复调用。
+- 命中缓存的日子（`market_summaries` 已存在）会跳过，秒级返回；要重跑请加 `--force-refresh`。
+
+---
+
+### 3. `tools/show_ai_input.py` — 看 AI 真实输入
+
+**做什么**：把 `AnalysisService` 真正发给 AI 的 system + user prompt 全部 dump 到 Markdown 文件。用来：
+- 调试 prompt 模板内容是否对齐
+- 检查盘后总结 / `--market-summary` 注入位置
+- 估算 token 用量
+
+**参数**：
+
+| 参数 | 默认 | 说明 |
+|------|------|------|
+| `--source` | `curated` | 数据源：`curated`（精选）/ `raw`（原始） |
+| `--hours N` | `24` | 最近 N 小时（与 `--start/--end` 互斥） |
+| `--start "YYYY-MM-DD HH:MM:SS"` | — | 起始时间 |
+| `--end "YYYY-MM-DD HH:MM:SS"` | now | 结束时间 |
+| `--limit N` | 不截断 | 最多取 N 条新闻 |
+| `--template ID` | 当前 | 模板 ID（`standard` / `short_term` / 等） |
+| `--max-sectors` | `auto` | 板块数 |
+| `--stocks-per-sector` | `auto` | 每板块股票数 |
+| `--market-summary TEXT` | — | 盘后总结文本（`short_term` 模板会嵌入） |
+| `--output PATH` | `.huiye/ai_input_sample.md` | 输出 MD 路径 |
+
+**示例**：
+
+```powershell
+python tools/show_ai_input.py
+python tools/show_ai_input.py --source raw --hours 6
+python tools/show_ai_input.py --template short_term --market-summary "今日大盘 -1.5%"
+python tools/show_ai_input.py --start "2026-05-22 09:00:00" --end "2026-05-22 15:00:00"
+python tools/show_ai_input.py --limit 20 --output ./debug_prompt.md
+```
+
+**输出文件结构**：
+```
+## 1. System Prompt
+...
+## 2. User Prompt
+...
+## 3. 统计
+- 新闻条数 / 字符数 / 估算 token
+```
+
+**注意**：
+- 不会真的调 AI；只在本地构造 prompt。
+- 若时间窗内无新闻会打 `[WARN]` 并退出码 1，把 `--hours` 调大即可。
+
+---
+
+### 4. `tools/dedupe_sqlite_raw.py` — news 库重复检测/清理
+
+**做什么**：扫 `data/news.db` 的 `raw` 表，按 30 分钟窗口 + 标题/标题正文相似度做语义去重；默认只导报告，`--apply` 才真删。
+
+**参数**：
+
+| 参数 | 默认 | 说明 |
+|------|------|------|
+| `--apply` | 关 | 物理删除重复项（默认只生成报告） |
+| `--window MIN` | `30` | 时间窗口（分钟） |
+| `--title-threshold` | `0.60` | 标题相似度阈值 0~1 |
+| `--merged-threshold` | `0.55` | 标题+正文合并相似度阈值 |
+| `--threshold` | — | 兼容旧参数：两路共用阈值 |
+| `--output-dir` | `data/exports` | 报告输出目录 |
+
+**示例**：
+
+```powershell
+python tools/dedupe_sqlite_raw.py                          # 只分析
+python tools/dedupe_sqlite_raw.py --apply                  # 真删（删前会有 JSON/CSV/TXT 三份核验文件）
+python tools/dedupe_sqlite_raw.py --title-threshold 0.7    # 收紧阈值
+```
+
+**输出**：
+- `data/exports/dedup_raw_review_<时间戳>.json|csv|txt` 三份核验文件
+- stdout 打印总数 / 保留 / 剔除统计
+
+**注意**：与 `crawler/crawl_sync.py` 在线去重的规则一致；批量删之前一定先看 CSV。
+
+---
+
+## 二、偶尔会用
+
+### 5. `tools/export_tushare_theme_daily.py` — Tushare 题材源原始数据导出
+
+**做什么**：把 Tushare 题材相关接口（`kpl_concept`, `kpl_concept_cons`, `cls_stock_shock` 等）在某交易日的完整原始返回 dump 到 `data/tushare_theme_compare/`，用来对比选型 / 离线回测。
+
+**用法**：
+
+```powershell
+python tools/export_tushare_theme_daily.py            # 默认最近一个交易日
+python tools/export_tushare_theme_daily.py 20260522   # 指定日
+```
+
+**注意**：每次会消耗 Tushare 积分（含高积分接口），不要随便跑。
+
+---
+
+## 三、一次性脚本（已经跑过，不需要再跑）
+
+### 6. `tools/migrate_prompts_to_files.py` — M0 把 prompt_templates 迁到 `prompts/*.md`
+
+```powershell
+python tools/migrate_prompts_to_files.py              # dry-run 看清单
+python tools/migrate_prompts_to_files.py --apply      # 真迁
+python tools/migrate_prompts_to_files.py --apply --force  # 覆盖已存在的目标文件
+```
+
+**当前状态**：已跑完，`config/ai_config.json` 不再含 `prompt_templates`，原文件备份在 `config/ai_config.legacy.json`。再跑会提示「没有可迁移的模板」并退出 0。
+
+### 7. `tools/verify_migration_equivalence.py` — M0 迁移等价性验证
+
+```powershell
+python tools/verify_migration_equivalence.py
+```
+
+**用途**：验证 `PromptLoader` 读到的内容与 `ai_config.legacy.json` 原文逐字符一致。可作为回归脚本，每次大改 PromptLoader 后跑一遍。当前 10/10 PASS。
+
+---
+
+## 四、三种数据处理模式
+
+| 模式 | 数据来源 | 完整度 | 单日耗时 | 单日成本 | 适用场景 |
+|------|---------|-------|---------|---------|----------|
+| `tushare-only` | 只用 Tushare | ~85% | 4~6s | 0 元 | 快速看 KPI / 已经手工补过别名 |
+| `hybrid`（默认） | Tushare + CLS（同源） | ~95% | 6~12s | 0 元 | **日常推荐**，免费但更完整 |
+| `ai-full` | Tushare + CLS + AI 兜底 | ~98% | 30~60s | ~0.05 元 | 重要交易日 / 别名缺得多的早期 |
+
+> AI 兜底由 `core/ai_config.py:get_market_fetch_config()` 控制，可分别关 `enable_sectors` / `enable_traders`。
+
+---
+
+## 五、验收脚本（CI / 回归用）
+
+| 脚本 | 验收范围 | 当前状态 |
+|------|---------|----------|
+| `tools/test_phase_m0_acceptance.py` | M0 综合：PromptLoader 单测 + 迁移等价 + theme_extractor + AIConfig 端到端 + show_ai_input 链路 | 5/5 PASS |
+| `tools/test_market_db.py` | market.db 建库 / 迁移 / 种子 / 备份 / ATTACH + `ai_reports` CRUD | 全 PASS |
+| `tools/test_prompt_loader.py` | YAML / frontmatter / include / 循环 / validate_all | 20/20 PASS |
+
+跑法：
+
+```powershell
+python tools/test_phase_m0_acceptance.py
+python tools/test_market_db.py
+python tools/test_prompt_loader.py
+```
+
+> 三个脚本退出码 0 = 全过，1 = 有失败项；输出尾部都有 `通过 X/Y` 汇总行。
+
+---
+
+## 六、调试 / 诊断脚本
+
+### 8. `tools/_debug_theme_extract.py` — 题材抽取完整 IO dump
+
+```powershell
+python tools/_debug_theme_extract.py
+```
+
+跑一次真实题材抽取，把 system prompt / user prompt / AI 原始返回 / 解析结果 / token 统计写到 `.huiye/_debug_io/` 五个文件。**会消耗 AI 配额**，且不入库。
+
+### 9. `tools/test_source_field.py` — 新闻 source 字段抓取诊断
+
+```powershell
+python tools/test_source_field.py            # 跑全套诊断
+python tools/test_source_field.py --verify   # 只跑验证模式
+```
+
+老脚本，当 source 字段抓不到时用来定位是 HTML 结构变了还是 parser 出错。
+
+---
+
+## 七、通用约定
+
+### 路径与编码
+
+- 全部脚本都假设以**仓库根目录**为 cwd（`d:\爬虫`）。在子目录跑会因 `data/`、`config/`、`prompts/` 相对路径而出错。
+- Windows PowerShell 控制台默认 GBK 编码，stdout 中文可能显示成乱码（如 `板块` → `板��`），**不影响**落盘文件和落库内容。要让控制台正常显示，可临时设：
+
+  ```powershell
+  chcp 65001
+  $env:PYTHONIOENCODING = "utf-8"
+  ```
+
+### 退出码
+
+| 码 | 含义 |
+|----|------|
+| `0` | 成功 / 部分成功（`--continue-on-error`） |
+| `1` | 业务失败（含 `--no-continue` 首个失败） |
+| `2` | 参数错误（仅 backfill） |
+
+### 日志
+
+- 所有 CLI 默认使用 `logging` 输出到 stderr，INFO 级别。
+- 加 `-v / --verbose` 切到 DEBUG，会打印 Tushare 请求详情、service 进度回调。
+
+### Tushare Token
+
+- 全部 Tushare 调用走 `.env` 的 `tushare=...` 字段，**不要**改用 MCP（项目内已统一为 token 直连，详见 `services/market/tushare_client.py`）。
+
+---
+
+## 八、典型工作流
+
+### A. 每天盘后跑当天数据
+
+```powershell
+python tools/market_fetch.py                # 默认 hybrid，~10s
+# 或在 GUI 「📊 盘后数据」页一键拉取
+# 或交给 GUI 「⏰ 定时任务」每天 16:00 自动跑
+```
+
+### B. 新装机 / 换台机器后补齐历史
+
+```powershell
+python tools/market_fetch_backfill.py --days 30 --report data/backups/init.csv
+```
+
+### C. 排查"为什么 AI 没看到 XXX 新闻"
+
+```powershell
+python tools/show_ai_input.py --hours 24 --output .huiye/_check.md
+# 然后看 .huiye/_check.md 的 User Prompt 段
+```
+
+### D. 排查"为什么 raw 库这么大"
+
+```powershell
+python tools/dedupe_sqlite_raw.py                 # 先看报告
+# 看完 data/exports/dedup_raw_review_*.csv 确认无误后
+python tools/dedupe_sqlite_raw.py --apply         # 真删
+```
+
+### E. 改完 PromptLoader 后回归
+
+```powershell
+python tools/test_prompt_loader.py                # 20 项基础自检
+python tools/verify_migration_equivalence.py      # 10 项迁移等价
+python tools/test_phase_m0_acceptance.py          # 5 步端到端
+```
+
+---
+
+## 九、故障排查
+
+| 现象 | 原因 | 处理 |
+|------|------|------|
+| `ModuleNotFoundError: No module named 'gui'` 等 | 不在仓库根目录跑 | `cd d:\爬虫` 再跑 |
+| 控制台中文乱码 | PowerShell GBK | 看落盘文件即可；或 `chcp 65001` |
+| `market_fetch` 报 `gaps: northbound_capital_pending` | 北向资金 T+1 | 正常，第二天再跑一次会补齐 |
+| `show_ai_input` 报 `选定范围内无新闻` | 时间窗内 news.db 没数据 | 把 `--hours` 调大，或换 `--source raw` |
+| `market_fetch_backfill` 卡在「解析交易日」 | Tushare 限速或网络问题 | 加 `-v` 看具体哪步；通常 30s 内会重试 |
+| `test_market_db` 报 `schema_migrations 应为 [1,2]` | 测试脚本旧版本，硬编码了迁移数 | 已修，拉一下当前 `tools/test_market_db.py` |
+
+---
+
+## 十、main.py（GUI 入口）
+
+`python main.py` 启动 PyQt5 GUI，没有命令行参数。GUI 内可触达：
+
+- 📰 新闻爬取 / 清洗
+- 📊 盘后数据（≈ `market_fetch.py` 的 GUI 形态，加 7 个 Tab 可视化）
+- 🤖 AI 分析（≈ `show_ai_input.py` 的反向：选好新闻范围真调 AI）
+- ⏰ 定时任务（含 `market_fetch` 任务类型，等价于把上述 CLI 挂 cron）
+- ⚙️ Prompt 管理（≈ `migrate_prompts_to_files.py` 之后的所有日常增删改）
+
+GUI 是"对外推荐入口"；CLI 主要给批量回填 / 自动化脚本 / 调试用。
