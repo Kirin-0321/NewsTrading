@@ -57,6 +57,7 @@ class MainWindow(QMainWindow):
         """初始化界面"""
         self.setWindowTitle("新闻爬虫管理系统")
         self.setMinimumSize(1200, 800)
+        self.resize(1280, 900)
 
         # 创建中心部件
         central_widget = QWidget()

@@ -5,8 +5,9 @@ AI分析页面
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                              QPushButton, QGroupBox, QComboBox, QLineEdit,
                              QTextBrowser, QMessageBox,
-                             QDateTimeEdit, QCheckBox)
-from PyQt5.QtCore import QDateTime
+                             QDateTimeEdit, QCheckBox, QScrollArea, QFrame,
+                             QSizePolicy)
+from PyQt5.QtCore import QDateTime, Qt
 from PyQt5.QtGui import QTextCursor
 from datetime import datetime, timedelta
 import os
@@ -29,35 +30,36 @@ class AIAnalysisPage(QWidget):
     def init_ui(self):
         """初始化界面"""
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(20, 20, 20, 20)
-        layout.setSpacing(15)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
 
-        # 标题
+        # 上部配置区：可滚动，避免默认窗口高度下控件互相挤压
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+
+        scroll_content = QWidget()
+        form_layout = QVBoxLayout(scroll_content)
+        form_layout.setContentsMargins(20, 20, 20, 10)
+        form_layout.setSpacing(15)
+
         title = QLabel("🤖 AI分析")
         title.setStyleSheet(
             "font-size: 24px; font-weight: bold; color: #262626;")
-        layout.addWidget(title)
+        form_layout.addWidget(title)
 
-        # AI配置
-        config_group = self.create_config_group()
-        layout.addWidget(config_group)
+        form_layout.addWidget(self.create_config_group())
+        form_layout.addWidget(self.create_source_group())
 
-        # 数据源选择
-        source_group = self.create_source_group()
-        layout.addWidget(source_group)
-
-        # 分析参数
         params_group = self.create_params_group()
-        layout.addWidget(params_group)
+        form_layout.addWidget(params_group)
         self.model_combo.currentTextChanged.connect(
             self._update_deep_thinking_availability
         )
 
-        # 提示词模板
-        template_group = self.create_template_group()
-        layout.addWidget(template_group)
+        form_layout.addWidget(self.create_template_group())
 
-        # 分析 / 终止按钮
         action_row = QHBoxLayout()
         self.analyze_btn = QPushButton("🚀 开始分析")
         self.analyze_btn.setStyleSheet(BUTTON_PRIMARY)
@@ -71,18 +73,25 @@ class AIAnalysisPage(QWidget):
         self.stop_btn.setEnabled(False)
         self.stop_btn.clicked.connect(self.stop_analysis)
         action_row.addWidget(self.stop_btn)
-        layout.addLayout(action_row)
+        form_layout.addLayout(action_row)
 
-        # 进度显示
+        scroll.setWidget(scroll_content)
+        layout.addWidget(scroll, 3)
+
+        # 下部日志/结果：占据剩余空间，随窗口伸缩
+        bottom_wrap = QWidget()
+        bottom_layout = QVBoxLayout(bottom_wrap)
+        bottom_layout.setContentsMargins(20, 0, 20, 20)
+        bottom_layout.setSpacing(10)
+
         progress_group = self.create_progress_group()
-        layout.addWidget(progress_group)
+        bottom_layout.addWidget(progress_group, 1)
 
-        # 结果显示
         result_group = self.create_result_group()
-        layout.addWidget(result_group)
+        bottom_layout.addWidget(result_group, 2)
 
-        layout.addStretch()
-        
+        layout.addWidget(bottom_wrap, 2)
+
         # 加载配置和模板数据（必须在所有 UI 组件创建完成后）
         self.load_config()
         self.load_template_list()
@@ -348,20 +357,29 @@ class AIAnalysisPage(QWidget):
         row2.addWidget(self.range_preset_combo, 1)
         sqlite_layout.addLayout(row2)
 
-        row3 = QHBoxLayout()
-        row3.addWidget(QLabel("起始:"))
-        self.start_datetime = QDateTimeEdit(QDateTime.currentDateTime().addSecs(-86400))
+        start_row = QHBoxLayout()
+        start_label = QLabel("起始:")
+        start_label.setMinimumWidth(56)
+        start_row.addWidget(start_label)
+        self.start_datetime = QDateTimeEdit(
+            QDateTime.currentDateTime().addSecs(-86400))
         self.start_datetime.setCalendarPopup(True)
         self.start_datetime.setDisplayFormat("yyyy-MM-dd HH:mm")
-        row3.addWidget(self.start_datetime, 1)
-        row3.addWidget(QLabel("结束:"))
+        start_row.addWidget(self.start_datetime, 1)
+        sqlite_layout.addLayout(start_row)
+
+        end_row = QHBoxLayout()
+        end_label = QLabel("结束:")
+        end_label.setMinimumWidth(56)
+        end_row.addWidget(end_label)
         self.end_datetime = QDateTimeEdit(QDateTime.currentDateTime())
         self.end_datetime.setCalendarPopup(True)
         self.end_datetime.setDisplayFormat("yyyy-MM-dd HH:mm")
-        row3.addWidget(self.end_datetime, 1)
-        sqlite_layout.addLayout(row3)
+        end_row.addWidget(self.end_datetime, 1)
+        sqlite_layout.addLayout(end_row)
 
         self.db_stats_label = QLabel("")
+        self.db_stats_label.setWordWrap(True)
         self.db_stats_label.setStyleSheet("color: #8c8c8c; font-size: 12px;")
         sqlite_layout.addWidget(self.db_stats_label)
         layout.addLayout(sqlite_layout)
@@ -562,7 +580,9 @@ class AIAnalysisPage(QWidget):
 
         self.progress_browser = QTextBrowser()
         self.progress_browser.setStyleSheet(TEXTBROWSER_STYLE)
-        self.progress_browser.setMaximumHeight(150)
+        self.progress_browser.setMinimumHeight(72)
+        self.progress_browser.setSizePolicy(
+            QSizePolicy.Expanding, QSizePolicy.Expanding)
         layout.addWidget(self.progress_browser)
 
         group.setLayout(layout)
@@ -575,7 +595,9 @@ class AIAnalysisPage(QWidget):
 
         self.result_browser = QTextBrowser()
         self.result_browser.setStyleSheet(TEXTBROWSER_STYLE)
-        self.result_browser.setMinimumHeight(200)
+        self.result_browser.setMinimumHeight(96)
+        self.result_browser.setSizePolicy(
+            QSizePolicy.Expanding, QSizePolicy.Expanding)
         layout.addWidget(self.result_browser)
 
         # 操作按钮

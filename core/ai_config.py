@@ -214,6 +214,8 @@ class AIConfig:
             "model": "deepseek-v4-flash",
             "temperature": 0.2,
             "max_tokens": DEFAULT_MAX_OUTPUT_TOKENS,
+            # 流式读超时（秒）：大报告 + 高 max_tokens 时 JSON 生成可能超过 10 分钟
+            "timeout": 1200,
         }
         cfg = dict(defaults)
         cfg.update(self.config.get("theme_extraction", {}) or {})

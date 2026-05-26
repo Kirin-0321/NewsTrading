@@ -111,6 +111,10 @@ class ThemeExtractor:
         self.model = model or ext_cfg.get("model") or "deepseek-v4-flash"
         self.temperature = ext_cfg.get("temperature", temperature)
         self.max_tokens = int(ext_cfg.get("max_tokens", max_tokens))
+        try:
+            self.timeout = float(ext_cfg.get("timeout", 1200))
+        except (TypeError, ValueError):
+            self.timeout = 1200.0
         self._last_finish_reason: Optional[str] = None
         self._last_raw_response: Optional[str] = None
 
@@ -155,6 +159,13 @@ class ThemeExtractor:
         try:
             raw_response = self._call_llm(report_text, progress_callback)
         except Exception as e:
+            err = str(e)
+            if "timed out" in err.lower():
+                return [], (
+                    f"调用 LLM 失败: {err}。"
+                    f"（读超时约 {int(self.timeout)}s；可在 config/ai_config.json 调高 "
+                    f"theme_extraction.timeout，或降低 theme_extraction.max_tokens）"
+                )
             return [], f"调用 LLM 失败: {e}"
 
         self._last_raw_response = raw_response
@@ -184,6 +195,14 @@ class ThemeExtractor:
             text = text[:idx].rstrip()
         return text
 
+    @staticmethod
+    def _http_timeout(seconds: float):
+        """构建 httpx 超时：流式场景 read 为相邻 chunk 间最大等待秒数。"""
+        from httpx import Timeout
+
+        sec = max(float(seconds), 60.0)
+        return Timeout(connect=15.0, read=sec, write=sec, pool=sec)
+
     def _call_llm(
         self,
         report_text: str,
@@ -199,12 +218,13 @@ class ThemeExtractor:
         if not api_key:
             raise ValueError(f"未配置 {self.provider} API Key")
 
+        http_timeout = self._http_timeout(self.timeout)
         if self.provider == "zhipu":
             try:
                 from zhipuai import ZhipuAI
             except ImportError:
                 raise ImportError("请安装 zhipuai: pip install zhipuai")
-            client = ZhipuAI(api_key=api_key)
+            client = ZhipuAI(api_key=api_key, timeout=http_timeout)
         else:
             try:
                 from openai import OpenAI
@@ -213,7 +233,7 @@ class ThemeExtractor:
             base_url = provider_cfg.get("base_url")
             if self.provider == "qwen" and not base_url:
                 base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-            client = OpenAI(api_key=api_key, base_url=base_url)
+            client = OpenAI(api_key=api_key, base_url=base_url, timeout=http_timeout)
 
         user_prompt = _USER_PROMPT_TEMPLATE.format(report_text=report_text)
 
@@ -232,6 +252,9 @@ class ThemeExtractor:
             "temperature": self.temperature,
             "stream": True,
         }
+        # 与主分析器一致：V4 默认 thinking，分类抽取必须关闭，否则长时间无 content 易触发读超时
+        if self.provider == "deepseek" and str(self.model).startswith("deepseek-v4"):
+            create_kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
 
         response = client.chat.completions.create(**create_kwargs)
 
@@ -242,6 +265,8 @@ class ThemeExtractor:
                 continue
             choice = chunk.choices[0]
             delta = choice.delta
+            # 消费 reasoning_content，保持 SSE 活跃，避免思考阶段长时间无数据导致读超时
+            _ = getattr(delta, "reasoning_content", None)
             content = getattr(delta, "content", None)
             if content:
                 content_parts.append(content)

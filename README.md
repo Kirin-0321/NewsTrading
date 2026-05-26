@@ -170,7 +170,7 @@ python main.py
 - `current_provider` — 当前服务商
 - `providers.*` — 各家的 `base_url`、`model`、`max_tokens` 等
 - `prompt_templates` — 标准 / 激进 / 稳健 / 价值 / 短线 五套分析模板
-- `theme_extraction` — 分析后自动抽题材：`enabled`、`auto_run`、`model` 等
+- `theme_extraction` — 分析后自动抽题材：`enabled`、`auto_run`、`model`、`timeout`（秒，默认 1200，大报告 JSON 较慢时可调高）等
 
 分析使用配置中的 `model`；**清洗**在 provider 为 deepseek 时固定使用 `deepseek-v4-flash`（与配置中的 model 无关）。
 
