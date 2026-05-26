@@ -230,11 +230,18 @@ class MarketDB:
             return set()
 
     def _apply_migration(self, ver: int, name: str, sql_path: Path) -> None:
-        """在单次连接中执行 .sql 并写入 schema_migrations。"""
+        """在单次连接中执行 .sql 并写入 schema_migrations。
+
+        迁移期间会**临时关闭外键约束**——SQLite 重建表（DROP/RENAME）
+        要求 FK 必须关，否则带 REFERENCES 的子表会被孤立。这是 SQLite
+        官方推荐的"12-step ALTER TABLE"流程的必要步骤。
+        """
         _log.info("apply migration %s (%s)", name, sql_path.name)
         sql_text = sql_path.read_text(encoding="utf-8")
         try:
             with self.connect() as conn:
+                # 临时关 FK；commit 时 SQLite 会做一次性的完整性检查
+                conn.execute("PRAGMA foreign_keys=OFF")
                 conn.executescript(sql_text)
                 conn.execute(
                     "CREATE TABLE IF NOT EXISTS schema_migrations ("
@@ -247,6 +254,15 @@ class MarketDB:
                     "(version, name, applied_at) VALUES (?, ?, ?)",
                     (ver, name, _now_iso()),
                 )
+                # 校验：foreign_key_check 应返回空
+                problems = conn.execute(
+                    "PRAGMA foreign_key_check"
+                ).fetchall()
+                if problems:
+                    raise MigrationError(
+                        f"迁移 {name} 后外键校验失败: {problems[:3]}"
+                    )
+                conn.execute("PRAGMA foreign_keys=ON")
         except sqlite3.Error as exc:
             raise MigrationError(
                 f"迁移 {name} 执行失败: {exc}"

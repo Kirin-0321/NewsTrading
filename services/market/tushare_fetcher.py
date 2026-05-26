@@ -1,0 +1,847 @@
+"""Tushare 行情数据取数 + 入库（Phase M1b）。
+
+接口调用清单（与 ``_tushare_field_audit.md §7.1`` 对齐）::
+
+    1.  index_daily       × 7 大指数      → fact_index_daily
+    2.  dc_index          (idx_type=概念) → dim_sector upsert
+    3.  moneyflow_ind_dc  (concept)       → fact_sector_daily
+    4.  limit_list_d      × 3 (U/Z/D)     → fact_limit_stock
+    5.  kpl_list          (T 日)          → fact_limit_stock 合并连板信息
+    6.  kpl_list          (T-1 日)        → 内存返回，供 metrics.calc_promotion_rate
+    7.  moneyflow_hsgt    (T 日; 空兜底 T-1) → fact_hsgt_daily
+    8.  top_list                          → fact_top_list（过滤可转债）
+    9.  top_inst                          → fact_top_inst
+    10. dc_daily          (top N 板块 5 天) → fact_sector_daily.pct_chg_5d 派生填充
+
+合计约 16 次 API。CLS 两个接口（``cls_stock_shock`` / ``cls_market_shock``）
+预留给 Phase M2 单独的 ``CLSEnricher`` 调用。
+
+设计约束
+--------
+* **幂等**：所有 ingest 都用 ``INSERT OR REPLACE``，重跑同一天不会重复入库。
+* **缓存**：默认检测 ``fact_index_daily`` 有当天数据则跳过 ingest，``force_refresh``
+  开关一开就先 DELETE 当天全部 fact_* 再重拉。
+* **金额单位**：所有 ``*_yi`` 后缀字段统一为「亿元」浮点；详见
+  ``_tushare_field_audit.md §4 单位速查表``。
+* **失败容忍**：单个接口异常不抛出，写入 ``warnings``，继续后续步骤。
+  对端到端流程而言"丢一个 fact 表"比"全盘失败"友好得多。
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import time
+from dataclasses import dataclass, field
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+
+from services.market.market_db import MarketDB
+from services.market.tushare_client import TushareClient, TushareError
+
+_log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# 常量
+# ---------------------------------------------------------------------------
+
+#: 7 大指数 ts_code → 内部 key（与 MarketSummary.indices 字段名对齐）
+INDEX_CODES: List[Tuple[str, str, str]] = [
+    ("000001.SH", "sh", "上证"),
+    ("399001.SZ", "sz", "深成指"),
+    ("399006.SZ", "cyb", "创业板"),
+    ("000300.SH", "hs300", "沪深300"),
+    ("000688.SH", "kc50", "科创50"),
+    ("000905.SH", "zz500", "中证500"),
+    ("000852.SH", "zz1000", "中证1000"),
+]
+
+LIMIT_TYPES = ["U", "Z", "D"]
+
+
+# ---------------------------------------------------------------------------
+# 数据类
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class FetchResult:
+    """``TushareMarketFetcher.fetch`` 的返回值。"""
+
+    trade_date: str
+    prev_trade_date: str
+    api_call_count: int = 0
+    elapsed_ms: int = 0
+
+    #: 北向资金实际取到的日期（可能因 T 日空回退到 prev）
+    hsgt_data_date: Optional[str] = None
+    hsgt_is_delayed: bool = False
+
+    #: 各 ingest 步骤写入的行数
+    ingested: Dict[str, int] = field(default_factory=dict)
+
+    #: 失败/降级的 warning
+    warnings: List[str] = field(default_factory=list)
+
+    #: 缓存命中跳过了哪些步骤
+    skipped: List[str] = field(default_factory=list)
+
+    #: kpl_list(prev_trade_date) 内存缓存，给 metrics.calc_promotion_rate 用
+    kpl_prev_rows: List[Dict[str, Any]] = field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# 主类
+# ---------------------------------------------------------------------------
+
+
+class TushareMarketFetcher:
+    """把指定交易日的所有 L1 行情数据取下并落到 ``market.db``。"""
+
+    def __init__(
+        self,
+        client: TushareClient,
+        db: MarketDB,
+    ) -> None:
+        self.client = client
+        self.db = db
+
+    # ------------------------------------------------------------------
+    # 主入口
+    # ------------------------------------------------------------------
+
+    def fetch(
+        self,
+        trade_date: str,
+        prev_trade_date: str,
+        *,
+        top_sector_n: int = 10,
+        force_refresh: bool = False,
+        progress_callback: Optional[Callable[[str], None]] = None,
+    ) -> FetchResult:
+        """把 ``trade_date`` 的全部行情数据拉到 ``market.db``。
+
+        Args:
+            trade_date: 目标交易日 ``YYYYMMDD``，由
+                ``trade_date.resolve_trade_date`` 给出。
+            prev_trade_date: 上一交易日 ``YYYYMMDD``，用于晋级率 + 北向兜底。
+            top_sector_n: 仅对前 N 个板块拉 5 日历史算 ``pct_chg_5d``。
+            force_refresh: True 时先清掉该日所有 fact 数据再重拉。
+            progress_callback: 每个步骤前调用一次 ``cb(message)``，
+                供 GUI Worker 实时更新进度文字。
+
+        Returns:
+            :class:`FetchResult`，含每步入库条数、警告、北向延迟标记等。
+        """
+        progress = progress_callback or (lambda _msg: None)
+        t0 = time.time()
+        api0 = self.client.call_count
+
+        result = FetchResult(
+            trade_date=trade_date, prev_trade_date=prev_trade_date
+        )
+
+        if force_refresh:
+            progress("清理已有数据…")
+            self._purge_trade_date(trade_date)
+        elif self._has_index_data(trade_date):
+            # 缓存命中：fact_index_daily 有当天数据，直接复用全部 fact_*
+            _log.info(
+                "fact_* 表已有 %s 数据，本次跳过 Tushare 拉取（force_refresh=False）",
+                trade_date,
+            )
+            result.skipped.append("all")
+            result.api_call_count = 0
+            result.elapsed_ms = int((time.time() - t0) * 1000)
+            return result
+
+        steps: List[Tuple[str, Callable[[FetchResult], None]]] = [
+            ("拉取 7 大指数", self._fetch_index_daily),
+            ("拉取板块字典 (dc_index)", self._fetch_sector_dict),
+            ("拉取板块资金流 (moneyflow_ind_dc)", self._fetch_sector_moneyflow),
+            ("拉取涨/跌/炸板 (limit_list_d × 3)", self._fetch_limit_list_d),
+            ("拉取连板信息 (kpl_list 今日)", self._fetch_kpl_today),
+            ("拉取昨日涨停 (kpl_list 昨)", self._fetch_kpl_prev),
+            ("拉取北向资金 (moneyflow_hsgt)", self._fetch_hsgt),
+            ("拉取龙虎榜个股 (top_list)", self._fetch_top_list),
+            ("拉取龙虎榜机构 (top_inst)", self._fetch_top_inst),
+        ]
+        for label, func in steps:
+            progress(label)
+            try:
+                func(result)
+            except Exception as exc:  # noqa: BLE001
+                msg = f"{label} 失败: {exc}"
+                _log.warning(msg, exc_info=True)
+                result.warnings.append(msg)
+
+        # 派生：top N 板块的 5 日累计涨幅
+        progress(f"派生 Top {top_sector_n} 板块 5 日累计…")
+        try:
+            self._enrich_sector_5d_pct(result, top_n=top_sector_n)
+        except Exception as exc:  # noqa: BLE001
+            msg = f"派生 5 日累计失败: {exc}"
+            _log.warning(msg, exc_info=True)
+            result.warnings.append(msg)
+
+        result.api_call_count = self.client.call_count - api0
+        result.elapsed_ms = int((time.time() - t0) * 1000)
+        return result
+
+    # ==================================================================
+    # 缓存检测 & 清理
+    # ==================================================================
+
+    def _has_index_data(self, trade_date: str) -> bool:
+        with self.db.connect(readonly=True) as conn:
+            row = conn.execute(
+                "SELECT 1 FROM fact_index_daily WHERE trade_date = ? LIMIT 1",
+                (trade_date,),
+            ).fetchone()
+        return row is not None
+
+    def _purge_trade_date(self, trade_date: str) -> None:
+        """把某交易日的所有 fact_* 数据清空（force_refresh=True 时调用）。"""
+        tables = [
+            "fact_index_daily",
+            "fact_sector_daily",
+            "fact_limit_stock",
+            "fact_hsgt_daily",
+            "fact_top_list",
+            "fact_top_inst",
+            "fact_cls_stock_shock",
+            "fact_cls_market_shock",
+        ]
+        with self.db.connect() as conn:
+            for t in tables:
+                conn.execute(
+                    f"DELETE FROM {t} WHERE trade_date = ?", (trade_date,)
+                )
+
+    # ==================================================================
+    # 各接口 fetch + ingest
+    # ==================================================================
+
+    # --- 1. index_daily × 7 ---
+
+    def _fetch_index_daily(self, result: FetchResult) -> None:
+        all_rows: List[dict] = []
+        for ts_code, _key, _label in INDEX_CODES:
+            try:
+                rows = self.client.call(
+                    "index_daily",
+                    params={
+                        "ts_code": ts_code,
+                        "trade_date": result.trade_date,
+                    },
+                )
+            except TushareError as exc:
+                result.warnings.append(f"index_daily {ts_code}: {exc}")
+                continue
+            for r in rows:
+                # 单位归一化：amount 千元 → 亿元
+                r["__amount_yi__"] = _safe_div(r.get("amount"), 1e5)
+            all_rows.extend(rows)
+
+        n = self._ingest_index_daily(all_rows)
+        result.ingested["fact_index_daily"] = n
+
+    def _ingest_index_daily(self, rows: Sequence[dict]) -> int:
+        if not rows:
+            return 0
+        payload = []
+        for r in rows:
+            payload.append(
+                (
+                    r.get("trade_date"),
+                    r.get("ts_code"),
+                    _to_float(r.get("close")),
+                    _to_float(r.get("pct_chg")),
+                    _to_float(r.get("__amount_yi__")),
+                    _to_float(r.get("vol")),
+                    json.dumps(_strip_internal(r), ensure_ascii=False),
+                )
+            )
+        with self.db.connect() as conn:
+            conn.executemany(
+                "INSERT OR REPLACE INTO fact_index_daily "
+                "(trade_date, ts_code, close, pct_chg, amount_yi, "
+                " vol, raw_json) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                payload,
+            )
+        return len(payload)
+
+    # --- 2. dc_index → dim_sector ---
+
+    def _fetch_sector_dict(self, result: FetchResult) -> None:
+        rows = self.client.call(
+            "dc_index",
+            params={"trade_date": result.trade_date},
+        )
+        n = self._ingest_dim_sector(rows, result.trade_date)
+        result.ingested["dim_sector"] = n
+        result.ingested["__dc_index_count__"] = len(rows)
+
+    def _ingest_dim_sector(
+        self, rows: Sequence[dict], trade_date: str
+    ) -> int:
+        """把 dc_index 返回的板块字典 upsert 进 dim_sector。
+
+        ``dim_sector`` 既有 PK(ts_code) 又有 UNIQUE(name, src)，dc_index
+        实际数据里可能两个 ts_code 共享同一 (name, src='dc')——例如同名概念
+        在不同子源出现。这里采用 **两阶段写入**：
+
+        1. ``INSERT OR IGNORE`` 把新 ts_code 写进去；命中 (name, src) 冲突
+           的额外条目自动忽略（保留先到者）。
+        2. 对所有 ts_code 单独 ``UPDATE last_seen_date``，刷新"最近一次出现"
+           标记，给后续过滤已下市/重命名板块用。
+        """
+        if not rows:
+            return 0
+
+        seen_keys: set[Tuple[str, str]] = set()
+        insert_payload: List[tuple] = []
+        update_payload: List[tuple] = []
+        for r in rows:
+            ts_code = r.get("ts_code")
+            name = r.get("name")
+            if not ts_code or not name:
+                continue
+            # 同批内去重，避免一次 dc_index 自带重复 (name, src) 行
+            key = (str(name), "dc")
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+
+            insert_payload.append(
+                (
+                    ts_code,
+                    name,
+                    r.get("idx_type") or "概念板块",
+                    "dc",
+                    None,
+                    trade_date,
+                )
+            )
+            update_payload.append((trade_date, ts_code))
+
+        if not insert_payload:
+            return 0
+        with self.db.connect() as conn:
+            conn.executemany(
+                "INSERT OR IGNORE INTO dim_sector "
+                "(ts_code, name, idx_type, src, list_date, last_seen_date) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                insert_payload,
+            )
+            conn.executemany(
+                "UPDATE dim_sector SET last_seen_date = ? "
+                "WHERE ts_code = ?",
+                update_payload,
+            )
+            inserted = conn.execute(
+                "SELECT COUNT(*) FROM dim_sector WHERE src = 'dc'"
+            ).fetchone()[0]
+        return int(inserted)
+
+    # --- 3. moneyflow_ind_dc → fact_sector_daily ---
+
+    def _fetch_sector_moneyflow(self, result: FetchResult) -> None:
+        rows = self.client.call(
+            "moneyflow_ind_dc",
+            params={
+                "trade_date": result.trade_date,
+                "content_type": "概念",
+            },
+        )
+        n = self._ingest_sector_daily(rows, result.trade_date)
+        result.ingested["fact_sector_daily"] = n
+
+    def _ingest_sector_daily(
+        self, rows: Sequence[dict], trade_date: str
+    ) -> int:
+        if not rows:
+            return 0
+        # 兜底：把本批次自带的 ts_code+name 全部 INSERT OR IGNORE 进
+        # dim_sector，避免外键失败（dc_index 可能漏拉，或字典里 src!='dc'）
+        dim_payload: List[tuple] = []
+        seen: set[str] = set()
+        for r in rows:
+            ts_code = r.get("ts_code")
+            name = r.get("name")
+            if not ts_code or not name or ts_code in seen:
+                continue
+            seen.add(str(ts_code))
+            dim_payload.append(
+                (ts_code, name, "概念板块", "dc", None, trade_date)
+            )
+
+        payload = []
+        for r in rows:
+            ts_code = r.get("ts_code")
+            if not ts_code:
+                continue
+            payload.append(
+                (
+                    trade_date,
+                    ts_code,
+                    _to_float(r.get("pct_change")),
+                    _safe_div(r.get("net_amount"), 1e8),
+                    _safe_div(r.get("buy_elg_amount"), 1e8),
+                    _safe_div(r.get("buy_lg_amount"), 1e8),
+                    None,  # limit_up_count 后续合并 kpl 后再填（M1b 留空）
+                    None,  # pct_chg_5d 派生步骤填
+                    _to_int(r.get("rank")),
+                    json.dumps(_strip_internal(r), ensure_ascii=False),
+                )
+            )
+        with self.db.connect() as conn:
+            if dim_payload:
+                conn.executemany(
+                    "INSERT OR IGNORE INTO dim_sector "
+                    "(ts_code, name, idx_type, src, "
+                    " list_date, last_seen_date) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    dim_payload,
+                )
+            conn.executemany(
+                "INSERT OR REPLACE INTO fact_sector_daily "
+                "(trade_date, ts_code, pct_chg, main_net_yi, "
+                " main_elg_yi, main_lg_yi, limit_up_count, "
+                " pct_chg_5d, rank_today, raw_json) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                payload,
+            )
+        return len(payload)
+
+    # --- 4. limit_list_d × 3 ---
+
+    def _fetch_limit_list_d(self, result: FetchResult) -> None:
+        total = 0
+        for limit_type in LIMIT_TYPES:
+            try:
+                rows = self.client.call(
+                    "limit_list_d",
+                    params={
+                        "trade_date": result.trade_date,
+                        "limit_type": limit_type,
+                    },
+                )
+            except TushareError as exc:
+                result.warnings.append(f"limit_list_d {limit_type}: {exc}")
+                continue
+            total += self._ingest_limit_stock(
+                rows, result.trade_date, limit_type
+            )
+        result.ingested["fact_limit_stock_initial"] = total
+
+    def _ingest_limit_stock(
+        self, rows: Sequence[dict], trade_date: str, limit_type: str
+    ) -> int:
+        if not rows:
+            return 0
+        payload = []
+        for r in rows:
+            ts_code = r.get("ts_code")
+            if not ts_code:
+                continue
+            payload.append(
+                (
+                    trade_date,
+                    ts_code,
+                    limit_type,
+                    None,  # status，留给 kpl_list 合并
+                    None,  # cons_nums，同上
+                    None,  # theme，同上
+                    r.get("first_time") or r.get("last_time"),
+                    _to_int(r.get("limit_times")),
+                    _to_float(r.get("close")),
+                    _to_float(r.get("pct_chg")),
+                    _safe_div(r.get("fd_amount"), 1e8),
+                    json.dumps(_strip_internal(r), ensure_ascii=False),
+                )
+            )
+        with self.db.connect() as conn:
+            conn.executemany(
+                "INSERT OR REPLACE INTO fact_limit_stock "
+                "(trade_date, ts_code, limit_type, status, cons_nums, "
+                " theme, limit_up_time, open_times, close, pct_chg, "
+                " fd_amount_yi, raw_json) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                payload,
+            )
+        return len(payload)
+
+    # --- 5. kpl_list 今日（合并到 fact_limit_stock） ---
+
+    def _fetch_kpl_today(self, result: FetchResult) -> None:
+        rows = self.client.call(
+            "kpl_list",
+            params={
+                "trade_date": result.trade_date,
+                "tag": "涨停",
+            },
+        )
+        n = self._merge_kpl_into_limit_stock(rows, result.trade_date)
+        result.ingested["fact_limit_stock_kpl_merged"] = n
+        result.ingested["__kpl_today_count__"] = len(rows)
+
+    def _merge_kpl_into_limit_stock(
+        self, kpl_rows: Sequence[dict], trade_date: str
+    ) -> int:
+        """把 kpl_list 的 status / cons_nums / theme 合并进 fact_limit_stock。
+
+        kpl_list 主键 (trade_date, ts_code)；目标表主键含 limit_type='U'。
+        """
+        if not kpl_rows:
+            return 0
+        from services.market.metrics import parse_cons_nums
+
+        payload: List[Tuple[Any, ...]] = []
+        for r in kpl_rows:
+            ts_code = r.get("ts_code")
+            if not ts_code:
+                continue
+            payload.append(
+                (
+                    r.get("status"),
+                    parse_cons_nums(r),
+                    r.get("theme"),
+                    r.get("lu_time") or r.get("first_time"),
+                    _to_int(r.get("open_times")),
+                    trade_date,
+                    ts_code,
+                )
+            )
+        with self.db.connect() as conn:
+            conn.executemany(
+                "UPDATE fact_limit_stock SET "
+                "  status = COALESCE(?, status), "
+                "  cons_nums = COALESCE(?, cons_nums), "
+                "  theme = COALESCE(?, theme), "
+                "  limit_up_time = COALESCE(?, limit_up_time), "
+                "  open_times = COALESCE(?, open_times) "
+                "WHERE trade_date = ? AND ts_code = ? AND limit_type = 'U'",
+                payload,
+            )
+            updated = conn.execute(
+                "SELECT COUNT(*) FROM fact_limit_stock "
+                "WHERE trade_date = ? AND limit_type = 'U' "
+                "AND cons_nums IS NOT NULL",
+                (trade_date,),
+            ).fetchone()[0]
+        return int(updated)
+
+    # --- 6. kpl_list 昨日（仅内存） ---
+
+    def _fetch_kpl_prev(self, result: FetchResult) -> None:
+        rows = self.client.call(
+            "kpl_list",
+            params={
+                "trade_date": result.prev_trade_date,
+                "tag": "涨停",
+            },
+        )
+        result.kpl_prev_rows = list(rows)
+        result.ingested["__kpl_prev_count__"] = len(rows)
+
+    # --- 7. moneyflow_hsgt（北向，T 日空兜底 T-1） ---
+
+    def _fetch_hsgt(self, result: FetchResult) -> None:
+        actual_date = result.trade_date
+        is_delayed = False
+        rows = self.client.call(
+            "moneyflow_hsgt",
+            params={"trade_date": result.trade_date},
+        )
+        if not rows:
+            # 兜底：T 日空 → 取 prev
+            rows = self.client.call(
+                "moneyflow_hsgt",
+                params={"trade_date": result.prev_trade_date},
+            )
+            if rows:
+                actual_date = result.prev_trade_date
+                is_delayed = True
+                result.warnings.append(
+                    f"北向资金 T 日({result.trade_date}) 无数据，"
+                    f"已回退到 T-1({result.prev_trade_date})"
+                )
+
+        n = self._ingest_hsgt(
+            rows, request_date=result.trade_date,
+            actual_date=actual_date, is_delayed=is_delayed,
+        )
+        result.ingested["fact_hsgt_daily"] = n
+        result.hsgt_data_date = actual_date if rows else None
+        result.hsgt_is_delayed = is_delayed
+
+    def _ingest_hsgt(
+        self,
+        rows: Sequence[dict],
+        *,
+        request_date: str,
+        actual_date: str,
+        is_delayed: bool,
+    ) -> int:
+        if not rows:
+            return 0
+        r = rows[0]
+        north = _safe_div(r.get("north_money"), 1e4)
+        south = _safe_div(r.get("south_money"), 1e4)
+        raw = json.dumps(_strip_internal(r), ensure_ascii=False)
+        with self.db.connect() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO fact_hsgt_daily "
+                "(trade_date, actual_date, is_delayed, "
+                " north_net_yi, south_net_yi, raw_json) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    request_date,
+                    actual_date,
+                    1 if is_delayed else 0,
+                    north,
+                    south,
+                    raw,
+                ),
+            )
+        return 1
+
+    # --- 8. top_list ---
+
+    def _fetch_top_list(self, result: FetchResult) -> None:
+        rows = self.client.call(
+            "top_list",
+            params={"trade_date": result.trade_date},
+        )
+        # 过滤可转债：ts_code 以 11 / 12 开头是转债
+        rows = [r for r in rows if not _is_convertible_bond(r.get("ts_code"))]
+        n = self._ingest_top_list(rows, result.trade_date)
+        result.ingested["fact_top_list"] = n
+
+    def _ingest_top_list(
+        self, rows: Sequence[dict], trade_date: str
+    ) -> int:
+        if not rows:
+            return 0
+        payload = []
+        seen: set = set()
+        for r in rows:
+            ts_code = r.get("ts_code")
+            reason = r.get("reason") or ""
+            if not ts_code:
+                continue
+            key = (trade_date, ts_code, reason)
+            if key in seen:
+                continue
+            seen.add(key)
+            payload.append(
+                (
+                    trade_date,
+                    ts_code,
+                    reason,
+                    _safe_div(r.get("net_amount"), 1e8),
+                    _to_float(r.get("pct_change")),
+                    json.dumps(_strip_internal(r), ensure_ascii=False),
+                )
+            )
+        with self.db.connect() as conn:
+            conn.executemany(
+                "INSERT OR REPLACE INTO fact_top_list "
+                "(trade_date, ts_code, rank_reason, net_amount_yi, "
+                " pct_chg, raw_json) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                payload,
+            )
+        return len(payload)
+
+    # --- 9. top_inst ---
+
+    def _fetch_top_inst(self, result: FetchResult) -> None:
+        rows = self.client.call(
+            "top_inst",
+            params={"trade_date": result.trade_date},
+        )
+        n = self._ingest_top_inst(rows, result.trade_date)
+        result.ingested["fact_top_inst"] = n
+
+    def _ingest_top_inst(
+        self, rows: Sequence[dict], trade_date: str
+    ) -> int:
+        if not rows:
+            return 0
+        payload = []
+        seen: set = set()
+        for r in rows:
+            ts_code = r.get("ts_code")
+            exalter = r.get("exalter") or ""
+            side_raw = str(r.get("side") or "").strip()
+            # 0 = 买，1 = 卖（按 audit §3.10）
+            if side_raw in ("0", "buy", "B", "BUY"):
+                side = "buy"
+            elif side_raw in ("1", "sell", "S", "SELL"):
+                side = "sell"
+            else:
+                # 未知 side 不入库（避免主键冲突）
+                continue
+            if not ts_code or not exalter:
+                continue
+            key = (trade_date, ts_code, exalter, side)
+            if key in seen:
+                continue
+            seen.add(key)
+            payload.append(
+                (
+                    trade_date,
+                    ts_code,
+                    exalter,
+                    side,
+                    _safe_div(r.get("net_buy"), 1e8),
+                    _safe_div(r.get("buy"), 1e8),
+                    _safe_div(r.get("sell"), 1e8),
+                    json.dumps(_strip_internal(r), ensure_ascii=False),
+                )
+            )
+        with self.db.connect() as conn:
+            conn.executemany(
+                "INSERT OR REPLACE INTO fact_top_inst "
+                "(trade_date, ts_code, exalter, side, "
+                " net_buy_yi, buy_amount_yi, sell_amount_yi, raw_json) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                payload,
+            )
+        return len(payload)
+
+    # --- 10. dc_daily 5 日累计派生 ---
+
+    def _enrich_sector_5d_pct(
+        self, result: FetchResult, *, top_n: int
+    ) -> None:
+        """对 ``fact_sector_daily`` 中当日 Top N 板块，取 5 日累计涨幅写回。
+
+        策略：用单次 ``dc_daily`` 接口拿 ``[prev_5, trade_date]`` 窗口
+        所有 ts_code 的数据（Tushare 默认全板块全量），然后按 ts_code 计算。
+        实际 API 调用 1 次。
+        """
+        with self.db.connect(readonly=True) as conn:
+            top_rows = conn.execute(
+                "SELECT ts_code FROM fact_sector_daily "
+                "WHERE trade_date = ? "
+                "ORDER BY pct_chg DESC NULLS LAST LIMIT ?",
+                (result.trade_date, top_n),
+            ).fetchall()
+        top_codes = [r[0] for r in top_rows]
+        if not top_codes:
+            return
+
+        # 估算 5 个交易日的自然日窗口（保险起见取 12 天，覆盖一个含小长假）
+        from datetime import datetime, timedelta
+
+        d_end = datetime.strptime(result.trade_date, "%Y%m%d")
+        start_str = (d_end - timedelta(days=12)).strftime("%Y%m%d")
+        try:
+            rows = self.client.call(
+                "dc_daily",
+                params={
+                    "start_date": start_str,
+                    "end_date": result.trade_date,
+                },
+            )
+        except TushareError as exc:
+            result.warnings.append(f"dc_daily(派生): {exc}")
+            return
+
+        # group by ts_code
+        from collections import defaultdict
+        from services.market.metrics import calc_sector_5d_pct
+
+        by_code: Dict[str, List[dict]] = defaultdict(list)
+        for r in rows:
+            code = r.get("ts_code")
+            if isinstance(code, str) and code in top_codes:
+                by_code[code].append(r)
+
+        payload: List[Tuple[Any, ...]] = []
+        for code, history in by_code.items():
+            pct5 = calc_sector_5d_pct(history)
+            if pct5 is not None:
+                payload.append((pct5, result.trade_date, code))
+
+        if not payload:
+            return
+        with self.db.connect() as conn:
+            conn.executemany(
+                "UPDATE fact_sector_daily SET pct_chg_5d = ? "
+                "WHERE trade_date = ? AND ts_code = ?",
+                payload,
+            )
+        result.ingested["fact_sector_daily_5d_enriched"] = len(payload)
+
+
+# ---------------------------------------------------------------------------
+# 工具
+# ---------------------------------------------------------------------------
+
+
+def _to_float(value: Any) -> Optional[float]:
+    if value is None or value == "":
+        return None
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    if f != f:  # NaN
+        return None
+    return f
+
+
+def _to_int(value: Any) -> Optional[int]:
+    if value is None or value == "":
+        return None
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_div(value: Any, divisor: float) -> Optional[float]:
+    """单位换算专用：``value / divisor``，缺失/异常返回 None。"""
+    f = _to_float(value)
+    if f is None or divisor == 0:
+        return None
+    return round(f / divisor, 4)
+
+
+def _is_convertible_bond(ts_code: Optional[str]) -> bool:
+    """根据代码前缀判断是否可转债。
+
+    SH: 110xxx / 113xxx / 118xxx
+    SZ: 123xxx / 128xxx
+    """
+    if not ts_code:
+        return False
+    code = str(ts_code).split(".")[0]
+    return (
+        code.startswith("110")
+        or code.startswith("113")
+        or code.startswith("118")
+        or code.startswith("123")
+        or code.startswith("128")
+    )
+
+
+def _strip_internal(d: Dict[str, Any]) -> Dict[str, Any]:
+    """从 dict 里剔除 ``__xxx__`` 内部临时字段，保留 raw_json 原貌。"""
+    return {
+        k: v
+        for k, v in d.items()
+        if not (k.startswith("__") and k.endswith("__"))
+    }
+
+
+__all__ = [
+    "INDEX_CODES",
+    "FetchResult",
+    "TushareMarketFetcher",
+]
