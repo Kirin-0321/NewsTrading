@@ -3,9 +3,9 @@
 > 记录时间: 2026-05-22（§1~14） · 更新: 2026-05-26（§15 盘后数据模块）  
 > 状态: **现行版 — P0 清理已完成；盘后数据自动化 M0~M5 全部落地**  
 > 关联:
-> - [盘后数据自动化-功能说明.md](./盘后数据自动化-功能说明.md) · [盘后数据自动化-施工方案.md](./盘后数据自动化-施工方案.md)
-> - [CLI评估回测-Agent优化初步设计.md](./CLI评估回测-Agent优化初步设计.md)（下一阶段）
-> - [review_report.md](./review_report.md)（OBSOLETE）
+> - [盘后数据自动化-功能说明.md](../features/05-26-2126-盘后数据自动化功能说明.md) · [盘后数据自动化-施工方案.md](./05-26-2126-盘后数据自动化施工方案.md)
+> - [CLI评估回测-Agent优化初步设计.md](./05-26-2126-CLI评估回测Agent优化初步设计.md)（下一阶段）
+> - [review_report.md](../reports/05-23-1800-第五轮代码评审-OBSOLETE.md)（OBSOLETE）
 
 ---
 
@@ -348,7 +348,7 @@ Step 2  services/storage + SQLite + 迁移脚本 ✅
 Step 3  crawl_sync / clean_sync / analysis service ✅
 Step 4  GUI Worker / 定时任务部分接入 ✅（分析/数据/清洗三页已接 SQLite）
 Step 5  SchedulerService 三种 task type ✅
-Step 6  agent/mcp_server.py ⏳（见 [CLI评估回测-Agent优化初步设计.md](./CLI评估回测-Agent优化初步设计.md)；Phase 0 CLI → Phase 1 Eval → Phase 2 Backtest → Phase 3 MCP）
+Step 6  agent/mcp_server.py ⏳（见 [CLI评估回测-Agent优化初步设计.md](./05-26-2126-CLI评估回测Agent优化初步设计.md)；Phase 0 CLI → Phase 1 Eval → Phase 2 Backtest → Phase 3 MCP）
 Step 7  历史 JSON 迁移 ✅（7218 条原始，29 条精选）
 Step 8  P0 死代码清理 ✅（2026-05-22）
         - 删除 workflows/ 目录、core/db_helper.py、watermark 函数
@@ -786,8 +786,8 @@ _maybe_extract_themes(force: Optional[bool])
 
 ## 15. 盘后数据模块（2026-05-26，M0~M5 全部落地）
 
-> 详细的施工 + 验收记录见 [盘后数据自动化-施工方案.md](./盘后数据自动化-施工方案.md)，
-> 主人视角的功能描述见 [盘后数据自动化-功能说明.md](./盘后数据自动化-功能说明.md)。
+> 详细的施工 + 验收记录见 [盘后数据自动化-施工方案.md](./05-26-2126-盘后数据自动化施工方案.md)，
+> 主人视角的功能描述见 [盘后数据自动化-功能说明.md](../features/05-26-2126-盘后数据自动化功能说明.md)。
 > 本节只做"架构层面"的速查 —— 是什么、放在哪、跟既有模块如何衔接。
 
 ### 15.1 目标
@@ -870,6 +870,11 @@ services/market/
 ```
 
 优先级链：`market_fetch 配置 → provider 配置 → prompt frontmatter → 代码默认`，任一层缺失自动降级。
+
+> ⚠️ **2026-05-26 21:00 review 发现**：当前 `config/ai_config.json` **完全没有 `market_fetch` 段**，
+> 全靠 `get_market_fetch_config()` 内置默认值兜底运行（功能正常）。
+> 如果主人想可视化调整 `enable_sectors / enable_traders / max_tokens` 等，
+> 需把上面的 jsonc 段实际复制到 `ai_config.json`。详见 [review_report_2.md](../reports/05-26-2100-第六轮项目评审.md) §H2。
 
 ### 15.7 与既有模块的衔接
 

@@ -394,8 +394,8 @@ python -c "from PyQt5.QtWidgets import QApplication"
 
 ## 开发说明
 
-- 架构与实施记录：`.huiye/架构方案.md`  
-- 代码 review：`.huiye/review_report.md`  
+- 架构与实施记录：`doc/design/05-26-2126-NewsTrading架构方案.md`  
+- 代码 review：`doc/reports/05-26-2100-第六轮项目评审.md`（最新）；历史归档见 `doc/reports/05-23-1800-第五轮代码评审-OBSOLETE.md`  
 - 历史 `doc/` 中关于 `workflows/` 的文档描述的是**已移除**的旧版任务流，请以本文与 `services/` 为准  
 - `agent/` 当前为 Python 函数导出；MCP Server 尚未实现  
 

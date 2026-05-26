@@ -161,7 +161,7 @@ class AINewsAnalyzer:
 
         model = provider_config.get("model", "gpt-4")
 
-        # 场景分流（参见 .huiye/架构方案.md §13）:
+        # 场景分流（参见 doc/design/05-26-2126-NewsTrading架构方案.md §13）:
         # DeepSeek V4 默认 thinking=enabled，须显式 disabled 才能关闭。
         create_kwargs = {
             "model": model,

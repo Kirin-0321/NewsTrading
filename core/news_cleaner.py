@@ -354,7 +354,7 @@ class NewsCleaner:
                 base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
             client = OpenAI(api_key=api_key, base_url=base_url)
 
-        # 场景分流（参见 .huiye/架构方案.md §13）:
+        # 场景分流（参见 doc/design/05-26-2126-NewsTrading架构方案.md §13）:
         # 清洗为分类任务，DeepSeek 系列固定走 v4-pro 非思考模式
         # —— pro 在 JSON 严格性 + 长上下文上显著好于 flash，成本可接受；
         # 其他服务商沿用 config 中的 model。
