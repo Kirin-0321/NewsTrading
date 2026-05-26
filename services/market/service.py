@@ -923,12 +923,18 @@ class MarketSummaryService:
 
     def _read_dragon_tiger(self, td: str) -> Dict[str, Any]:
         with self.db.connect(readonly=True) as conn:
+            # name 优先级：dim_stock（如果填了）→ raw_json.name（top_list 必有）
+            # 取 ANY_VALUE 是因为同一只股按 rank_reason 可能多条记录
             agg_rows = conn.execute(
-                "SELECT ts_code, "
-                " SUM(net_amount_yi) AS net_yi, "
-                " GROUP_CONCAT(rank_reason, ' | ') AS reasons "
-                "FROM fact_top_list WHERE trade_date = ? "
-                "GROUP BY ts_code "
+                "SELECT t.ts_code, "
+                " SUM(t.net_amount_yi) AS net_yi, "
+                " GROUP_CONCAT(t.rank_reason, ' | ') AS reasons, "
+                " COALESCE(d.name, MIN(json_extract(t.raw_json, '$.name'))) "
+                "   AS stock_name "
+                "FROM fact_top_list t "
+                "LEFT JOIN dim_stock d ON d.ts_code = t.ts_code "
+                "WHERE t.trade_date = ? "
+                "GROUP BY t.ts_code "
                 "ORDER BY net_yi DESC NULLS LAST",
                 (td,),
             ).fetchall()
@@ -948,7 +954,7 @@ class MarketSummaryService:
             reasons = reasons_str.split(" | ") if reasons_str else []
             stocks.append({
                 "ts_code": str(r["ts_code"]),
-                "name": None,                  # M2 阶段 join dim_stock
+                "name": str(r["stock_name"] or ""),
                 "net_amount_yi": _round(r["net_yi"], 2),
                 "reasons": [x.strip() for x in reasons if x.strip()],
             })
