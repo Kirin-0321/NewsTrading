@@ -308,42 +308,59 @@ class MarketSummaryPage(QWidget):
     # Tab 1: 总览
     # ------------------------------------------------------------------
 
+    # 指数卡片：key 与 tushare_fetcher.INDEX_CODES 第二列对齐
+    _INDEX_CARDS: list = [
+        ("sh", "上证综指"),
+        ("sz", "深证成指"),
+        ("cyb", "创业板指"),
+        ("hs300", "沪深 300"),
+        ("kc50", "科创 50"),
+        ("zz500", "中证 500"),
+        ("zz1000", "中证 1000"),
+    ]
+
     def _build_tab_overview(self) -> QWidget:
         wrap = QWidget()
         outer = QVBoxLayout(wrap)
         outer.setContentsMargins(12, 12, 12, 12)
         outer.setSpacing(12)
 
-        # 指数卡片组
-        idx_group = QGroupBox("大盘指数")
+        # 1) 指数卡片组 —— 3×3 = 9 格；前 7 格放指数，后 2 格放上涨/下跌家数 KPI
+        idx_group = QGroupBox("大盘指数 / 市场宽度")
         idx_layout = QGridLayout(idx_group)
         idx_layout.setHorizontalSpacing(10)
         idx_layout.setVerticalSpacing(8)
         self._index_cards: Dict[str, Dict[str, QLabel]] = {}
-        labels = [
-            ("sh", "上证综指"),
-            ("sz", "深证成指"),
-            ("cyb", "创业板指"),
-            ("sci", "科创 50"),
-            ("zz500", "中证 500"),
-            ("cybs", "创业板综"),
-        ]
-        for i, (key, label) in enumerate(labels):
+        for i, (key, label) in enumerate(self._INDEX_CARDS):
             card = self._make_index_card(label)
             self._index_cards[key] = card
             idx_layout.addWidget(card["widget"], i // 3, i % 3)
+        # 第 3 行后两格：上涨/下跌家数（沿用 index_card 样式以保持视觉对齐）
+        self.advance_card = self._make_index_card(
+            "上涨家数",
+            number_color=_COLOR_RED,
+            subtitle="（advance）",
+        )
+        self.decline_card = self._make_index_card(
+            "下跌家数",
+            number_color=_COLOR_GREEN,
+            subtitle="（decline）",
+        )
+        idx_layout.addWidget(self.advance_card["widget"], 2, 1)
+        idx_layout.addWidget(self.decline_card["widget"], 2, 2)
         outer.addWidget(idx_group)
 
-        # 量能 + 北向 + 情绪
+        # 2) 量能 + 资金流 + 涨跌停情绪
         mid_row = QHBoxLayout()
         mid_row.setSpacing(12)
 
-        flow_group = QGroupBox("成交 / 北向")
+        flow_group = QGroupBox("成交 / 资金流")
         flow_layout = QGridLayout(flow_group)
         self.turnover_label = self._make_kpi_label("—")
         self.prev_turnover_label = self._make_kpi_label("—")
         self.north_label = self._make_kpi_label("—")
         self.south_label = self._make_kpi_label("—")
+        self.main_net_label = self._make_kpi_label("—")
         flow_layout.addWidget(QLabel("两市成交:"), 0, 0)
         flow_layout.addWidget(self.turnover_label, 0, 1)
         flow_layout.addWidget(QLabel("昨日成交:"), 1, 0)
@@ -352,6 +369,8 @@ class MarketSummaryPage(QWidget):
         flow_layout.addWidget(self.north_label, 2, 1)
         flow_layout.addWidget(QLabel("南向净买:"), 3, 0)
         flow_layout.addWidget(self.south_label, 3, 1)
+        flow_layout.addWidget(QLabel("主力净流入:"), 4, 0)
+        flow_layout.addWidget(self.main_net_label, 4, 1)
         mid_row.addWidget(flow_group, 1)
 
         breadth_group = QGroupBox("涨跌停 / 情绪")
@@ -359,6 +378,7 @@ class MarketSummaryPage(QWidget):
         self.up_label = self._make_kpi_label("—", color=_COLOR_RED)
         self.down_label = self._make_kpi_label("—", color=_COLOR_GREEN)
         self.fail_label = self._make_kpi_label("—")
+        self.fail_rate_label = self._make_kpi_label("—")
         self.seal_label = self._make_kpi_label("—")
         self.promo_label = self._make_kpi_label("—")
         self.height_label = self._make_kpi_label("—")
@@ -366,45 +386,42 @@ class MarketSummaryPage(QWidget):
         breadth_layout.addWidget(self.up_label, 0, 1)
         breadth_layout.addWidget(QLabel("跌停:"), 0, 2)
         breadth_layout.addWidget(self.down_label, 0, 3)
-        breadth_layout.addWidget(QLabel("炸板:"), 1, 0)
+        breadth_layout.addWidget(QLabel("炸板数:"), 1, 0)
         breadth_layout.addWidget(self.fail_label, 1, 1)
-        breadth_layout.addWidget(QLabel("封板率:"), 1, 2)
-        breadth_layout.addWidget(self.seal_label, 1, 3)
-        breadth_layout.addWidget(QLabel("晋级率:"), 2, 0)
-        breadth_layout.addWidget(self.promo_label, 2, 1)
-        breadth_layout.addWidget(QLabel("最高板:"), 2, 2)
-        breadth_layout.addWidget(self.height_label, 2, 3)
+        breadth_layout.addWidget(QLabel("炸板率:"), 1, 2)
+        breadth_layout.addWidget(self.fail_rate_label, 1, 3)
+        breadth_layout.addWidget(QLabel("封板率:"), 2, 0)
+        breadth_layout.addWidget(self.seal_label, 2, 1)
+        breadth_layout.addWidget(QLabel("晋级率:"), 2, 2)
+        breadth_layout.addWidget(self.promo_label, 2, 3)
+        breadth_layout.addWidget(QLabel("最高板:"), 3, 0)
+        breadth_layout.addWidget(self.height_label, 3, 1, 1, 3)
         mid_row.addWidget(breadth_group, 1)
 
         outer.addLayout(mid_row)
 
-        # 元信息
-        meta_group = QGroupBox("元信息")
-        meta_layout = QGridLayout(meta_group)
-        self.meta_mode = QLabel("—")
-        self.meta_completeness = QLabel("—")
-        self.meta_generated_at = QLabel("—")
-        self.meta_api_calls = QLabel("—")
-        self.meta_elapsed = QLabel("—")
-        self.meta_merge_stats = QLabel("—")
-        meta_layout.addWidget(QLabel("模式:"), 0, 0)
-        meta_layout.addWidget(self.meta_mode, 0, 1)
-        meta_layout.addWidget(QLabel("完整度:"), 0, 2)
-        meta_layout.addWidget(self.meta_completeness, 0, 3)
-        meta_layout.addWidget(QLabel("生成时间:"), 1, 0)
-        meta_layout.addWidget(self.meta_generated_at, 1, 1)
-        meta_layout.addWidget(QLabel("API 调用:"), 1, 2)
-        meta_layout.addWidget(self.meta_api_calls, 1, 3)
-        meta_layout.addWidget(QLabel("耗时:"), 2, 0)
-        meta_layout.addWidget(self.meta_elapsed, 2, 1)
-        meta_layout.addWidget(QLabel("合并统计:"), 2, 2)
-        meta_layout.addWidget(self.meta_merge_stats, 2, 3, 1, 2)
-        outer.addWidget(meta_group)
+        # 3) 元信息 + 数据质量（A5 拆为左右两栏）
+        outer.addWidget(self._build_meta_quality_group())
 
         outer.addStretch()
         return wrap
 
-    def _make_index_card(self, title: str) -> Dict[str, Any]:
+    def _make_index_card(
+        self,
+        title: str,
+        *,
+        number_color: Optional[QColor] = None,
+        subtitle: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """生成通用"指数卡片"控件。
+
+        输入:
+            title        卡片标题（如 "上证综指" / "上涨家数"）
+            number_color 大字号数值的固定颜色（advance/decline 用红/绿；指数用 None=动态）
+            subtitle     标题下方淡灰小字（用于标注字段来源，可省）
+        输出:
+            dict{widget, title, close, pct, amount} —— 字段名沿用旧约定以兼容 _populate_overview
+        """
         card = QFrame()
         card.setFrameShape(QFrame.StyledPanel)
         card.setStyleSheet(
@@ -414,11 +431,18 @@ class MarketSummaryPage(QWidget):
         lay = QVBoxLayout(card)
         lay.setContentsMargins(10, 8, 10, 8)
         lay.setSpacing(2)
-        title_label = QLabel(title)
+        title_label = QLabel(
+            f"{title}  <span style='color:#BFBFBF;font-size:10px'>"
+            f"{subtitle}</span>" if subtitle else title
+        )
         title_label.setStyleSheet("color:#8C8C8C;font-size:12px;")
         close_label = QLabel("—")
+        color_css = (
+            f"color:{number_color.name()};"
+            if number_color is not None else "color:#262626;"
+        )
         close_label.setStyleSheet(
-            "font-size:18px;font-weight:bold;color:#262626;"
+            f"font-size:18px;font-weight:bold;{color_css}"
         )
         pct_label = QLabel("—")
         pct_label.setStyleSheet("font-size:13px;")
@@ -449,20 +473,79 @@ class MarketSummaryPage(QWidget):
         return lab
 
     # ------------------------------------------------------------------
+    # A5: 元信息 + 数据质量 左右两栏
+    # ------------------------------------------------------------------
+
+    def _build_meta_quality_group(self) -> QGroupBox:
+        """元信息区。左栏：基础信息 / 右栏：数据质量分层 + gaps/conflicts 摘要。
+
+        gaps / conflicts 的完整明细放进 tooltip（鼠标悬停可看），
+        避免占用界面空间又能让主人随时查得到。
+        """
+        group = QGroupBox("元信息 / 数据质量")
+        outer = QHBoxLayout(group)
+        outer.setSpacing(20)
+
+        # 左栏：基础信息
+        left = QGroupBox("基础信息")
+        left_lay = QGridLayout(left)
+        self.meta_mode = QLabel("—")
+        self.meta_generated_at = QLabel("—")
+        self.meta_api_calls = QLabel("—")
+        self.meta_elapsed = QLabel("—")
+        self.meta_merge_stats = QLabel("—")
+        left_lay.addWidget(QLabel("模式:"), 0, 0)
+        left_lay.addWidget(self.meta_mode, 0, 1)
+        left_lay.addWidget(QLabel("生成时间:"), 1, 0)
+        left_lay.addWidget(self.meta_generated_at, 1, 1)
+        left_lay.addWidget(QLabel("API 调用:"), 2, 0)
+        left_lay.addWidget(self.meta_api_calls, 2, 1)
+        left_lay.addWidget(QLabel("耗时:"), 3, 0)
+        left_lay.addWidget(self.meta_elapsed, 3, 1)
+        left_lay.addWidget(QLabel("合并统计:"), 4, 0)
+        left_lay.addWidget(self.meta_merge_stats, 4, 1)
+        outer.addWidget(left, 1)
+
+        # 右栏：数据质量
+        right = QGroupBox("数据质量")
+        right_lay = QGridLayout(right)
+        self.meta_completeness = QLabel("—")
+        self.meta_completeness.setStyleSheet(
+            "font-size:14px;font-weight:bold;color:#262626;"
+        )
+        self.meta_layer_detail = QLabel("—")
+        self.meta_layer_detail.setStyleSheet("color:#595959;")
+        self.meta_gaps_label = QLabel("缺失字段: —")
+        self.meta_gaps_label.setStyleSheet("color:#FA8C16;")
+        self.meta_conflicts_label = QLabel("合并冲突: —")
+        self.meta_conflicts_label.setStyleSheet("color:#722ED1;")
+        right_lay.addWidget(QLabel("总完整度:"), 0, 0)
+        right_lay.addWidget(self.meta_completeness, 0, 1)
+        right_lay.addWidget(QLabel("分层:"), 1, 0)
+        right_lay.addWidget(self.meta_layer_detail, 1, 1)
+        right_lay.addWidget(self.meta_gaps_label, 2, 0, 1, 2)
+        right_lay.addWidget(self.meta_conflicts_label, 3, 0, 1, 2)
+        outer.addWidget(right, 1)
+
+        return group
+
+    # ------------------------------------------------------------------
     # Tab 2: 板块
     # ------------------------------------------------------------------
 
     _SECTOR_COLS = [
         ("#", 32),
-        ("板块", 140),
-        ("涨跌幅", 76),
-        ("5日涨幅", 80),
-        ("涨停数", 60),
-        ("主力净流入(亿)", 110),
-        ("超大单(亿)", 90),
-        ("大单(亿)", 90),
-        ("催化（cls/ai）", 420),
+        ("板块（代码）", 200),
+        ("涨幅", 70),
+        ("5日", 70),
+        ("涨停", 50),
+        ("主力(亿)", 90),
+        ("龙头股 Top3", 320),
+        ("催化（cls/ai）", 320),
     ]
+    # high_risk 行背景色（pct_chg_5d 阈值由 GUI 自算 — 后端 high_risk 当前永远 None）
+    _RISK_HIGH_BG = QColor("#FFEBEE")    # 浅红：5 日累涨 > 15%
+    _RISK_MID_BG = QColor("#FFF8E1")     # 浅黄：5 日累涨 > 8%
 
     def _build_tab_sectors(self) -> QWidget:
         wrap = QWidget()
@@ -562,6 +645,15 @@ class MarketSummaryPage(QWidget):
         ("净买入(亿)", 100),
         ("营业部全名", 460),
     ]
+    # A4 新增「其他席位」表的列定义
+    _OTHER_TRADER_COLS = [
+        ("营业部全名", 380),
+        ("操作", 60),
+        ("关联股", 110),
+        ("净买入(亿)", 100),
+        ("买入(亿)", 90),
+        ("卖出(亿)", 90),
+    ]
 
     def _build_tab_dragon(self) -> QWidget:
         wrap = QWidget()
@@ -574,55 +666,58 @@ class MarketSummaryPage(QWidget):
         # 上：龙虎榜个股
         stocks_group = QGroupBox("📋 龙虎榜个股")
         sl = QVBoxLayout(stocks_group)
-        self.dt_stock_table = QTableWidget()
-        self.dt_stock_table.setColumnCount(len(self._DT_STOCK_COLS))
-        self.dt_stock_table.setHorizontalHeaderLabels(
-            [c[0] for c in self._DT_STOCK_COLS]
-        )
-        for i, (_, w) in enumerate(self._DT_STOCK_COLS):
-            self.dt_stock_table.setColumnWidth(i, w)
-        header = self.dt_stock_table.horizontalHeader()
-        if header is not None:
-            header.setSectionResizeMode(
-                len(self._DT_STOCK_COLS) - 1, QHeaderView.Stretch
-            )
-        self.dt_stock_table.verticalHeader().setVisible(False)
-        self.dt_stock_table.setAlternatingRowColors(True)
-        self.dt_stock_table.setEditTriggers(
-            QAbstractItemView.NoEditTriggers
-        )
-        self.dt_stock_table.setStyleSheet(TABLE_STYLE)
+        self.dt_stock_table = self._make_basic_table(self._DT_STOCK_COLS)
         sl.addWidget(self.dt_stock_table)
         split.addWidget(stocks_group)
 
-        # 下：已识别游资席位
-        traders_group = QGroupBox("⭐ 已识别游资席位")
+        # 中：已识别游资席位
+        traders_group = QGroupBox("⭐ 已识别游资席位（紫粉行）")
         tl = QVBoxLayout(traders_group)
-        self.trader_table = QTableWidget()
-        self.trader_table.setColumnCount(len(self._TRADER_COLS))
-        self.trader_table.setHorizontalHeaderLabels(
-            [c[0] for c in self._TRADER_COLS]
-        )
-        for i, (_, w) in enumerate(self._TRADER_COLS):
-            self.trader_table.setColumnWidth(i, w)
-        header = self.trader_table.horizontalHeader()
-        if header is not None:
-            header.setSectionResizeMode(
-                len(self._TRADER_COLS) - 1, QHeaderView.Stretch
-            )
-        self.trader_table.verticalHeader().setVisible(False)
-        self.trader_table.setAlternatingRowColors(True)
-        self.trader_table.setEditTriggers(
-            QAbstractItemView.NoEditTriggers
-        )
-        self.trader_table.setStyleSheet(TABLE_STYLE)
+        self.trader_table = self._make_basic_table(self._TRADER_COLS)
         tl.addWidget(self.trader_table)
         split.addWidget(traders_group)
 
+        # 下：其他席位（A4 新增）—— 未命中 dim_trader_alias.is_famous=1 的普通席位
+        other_group = QGroupBox(
+            "📊 其他席位（未识别 / 普通机构）— 直查 fact_top_inst"
+        )
+        ol = QVBoxLayout(other_group)
+        self.other_trader_table = self._make_basic_table(
+            self._OTHER_TRADER_COLS
+        )
+        ol.addWidget(self.other_trader_table)
+        split.addWidget(other_group)
+
         split.setStretchFactor(0, 3)
         split.setStretchFactor(1, 2)
+        split.setStretchFactor(2, 3)
         layout.addWidget(split, 1)
         return wrap
+
+    def _make_basic_table(
+        self, cols: list,
+    ) -> QTableWidget:
+        """统一构造 QTableWidget。
+
+        输入 cols: list of (header_text, width)
+        输出: 已设好列宽 / 表头 / 样式 / 只读 / 隐藏行号 的 QTableWidget。
+        """
+        tbl = QTableWidget()
+        tbl.setColumnCount(len(cols))
+        tbl.setHorizontalHeaderLabels([c[0] for c in cols])
+        for i, (_, w) in enumerate(cols):
+            tbl.setColumnWidth(i, w)
+        header = tbl.horizontalHeader()
+        if header is not None:
+            header.setSectionResizeMode(
+                len(cols) - 1, QHeaderView.Stretch
+            )
+        tbl.verticalHeader().setVisible(False)
+        tbl.setAlternatingRowColors(True)
+        tbl.setSelectionBehavior(QAbstractItemView.SelectRows)
+        tbl.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        tbl.setStyleSheet(TABLE_STYLE)
+        return tbl
 
     # ------------------------------------------------------------------
     # Tab 5: 异动时间线
@@ -697,6 +792,11 @@ class MarketSummaryPage(QWidget):
 
     def _populate_overview(self, summary: Dict[str, Any]) -> None:
         indices = summary.get("indices") or {}
+        breadth = summary.get("breadth") or {}
+        sentiment = summary.get("sentiment") or {}
+        cap = summary.get("capital_flow") or {}
+
+        # ------ 7 个指数卡片 ------
         for key, card in self._index_cards.items():
             info = indices.get(key) or {}
             close = info.get("close")
@@ -718,12 +818,27 @@ class MarketSummaryPage(QWidget):
                 if amount is not None else "成交 —"
             )
 
-        turnover = indices.get("total_turnover_yi")
-        prev_turnover = indices.get("prev_turnover_yi")
-        self.turnover_label.setText(_fmt_yi(turnover))
-        self.prev_turnover_label.setText(_fmt_yi(prev_turnover))
+        # ------ 上涨家数 / 下跌家数（后端当前为 placeholder = None）------
+        self._fill_breadth_card(
+            self.advance_card,
+            value=breadth.get("advance"),
+            suffix="家",
+            placeholder_hint="后端 service.py 暂未实装该字段，永远返回 None",
+        )
+        self._fill_breadth_card(
+            self.decline_card,
+            value=breadth.get("decline"),
+            suffix="家",
+            placeholder_hint="后端 service.py 暂未实装该字段，永远返回 None",
+        )
 
-        cap = summary.get("capital_flow") or {}
+        # ------ 量能 / 资金流 ------
+        self.turnover_label.setText(
+            _fmt_yi(indices.get("total_turnover_yi"))
+        )
+        self.prev_turnover_label.setText(
+            _fmt_yi(indices.get("prev_turnover_yi"))
+        )
         north = cap.get("north_net_yi")
         north_delay = cap.get("north_is_delayed")
         north_text = _fmt_yi(north)
@@ -738,34 +853,81 @@ class MarketSummaryPage(QWidget):
                 )
             )
         self.south_label.setText(_fmt_yi(cap.get("south_net_yi")))
+        main_net = cap.get("main_net_yi")
+        self.main_net_label.setText(
+            _fmt_yi(main_net) if main_net is not None else "—"
+        )
+        if main_net is None:
+            self.main_net_label.setToolTip(
+                "后端 service.py 暂未实装该字段（capital_flow.main_net_yi 永远 None）"
+            )
 
-        breadth = summary.get("breadth") or {}
-        sentiment = summary.get("sentiment") or {}
+        # ------ 涨跌停 / 情绪 ------
         self.up_label.setText(_fmt_int(breadth.get("limit_up")))
         self.down_label.setText(_fmt_int(breadth.get("limit_down")))
         self.fail_label.setText(_fmt_int(breadth.get("failed_limit")))
-        self.seal_label.setText(_fmt_rate(sentiment.get("seal_rate")))
-        self.promo_label.setText(
-            _fmt_rate(sentiment.get("promotion_rate"))
-        )
+        self.fail_rate_label.setText(_fmt_rate(sentiment.get("fail_rate")))
+        seal = sentiment.get("seal_rate")
+        seal_prev = sentiment.get("seal_rate_prev")
+        seal_text = _fmt_rate(seal)
+        if seal_prev is not None:
+            seal_text += f"  (昨 {_fmt_rate(seal_prev)})"
+        elif seal is not None:
+            seal_text += "  (昨 —)"
+        self.seal_label.setText(seal_text)
+        self.promo_label.setText(_fmt_rate(sentiment.get("promotion_rate")))
+        # 最高板：拼"X 板 · 股名 · 题材"
         height_val = sentiment.get("max_height")
         max_stock = sentiment.get("max_stock") or ""
+        max_sector = sentiment.get("max_sector") or ""
         if height_val:
-            self.height_label.setText(
-                f"{height_val} 板 · {max_stock}"
-                if max_stock else f"{height_val} 板"
-            )
+            parts = [f"{height_val} 板"]
+            if max_stock:
+                parts.append(str(max_stock))
+            if max_sector:
+                parts.append(str(max_sector))
+            self.height_label.setText(" · ".join(parts))
         else:
             self.height_label.setText("—")
 
+        # ------ A5 元信息 / 数据质量 ------
+        self._populate_meta_quality(summary)
+
+    def _fill_breadth_card(
+        self,
+        card: Dict[str, Any],
+        *,
+        value: Optional[int],
+        suffix: str,
+        placeholder_hint: str,
+    ) -> None:
+        """填充 advance/decline 卡片。
+
+        value 为 None 时显示 "—" 并在 tooltip 中提示是后端 placeholder。
+        """
+        if value is None:
+            card["close"].setText("—")
+            card["pct"].setText("（暂无数据）")
+            card["pct"].setStyleSheet("font-size:13px;color:#BFBFBF;")
+            card["amount"].setText("")
+            card["widget"].setToolTip(placeholder_hint)
+        else:
+            card["close"].setText(f"{int(value):,d}")
+            card["pct"].setText(suffix)
+            card["pct"].setStyleSheet("font-size:13px;color:#595959;")
+            card["amount"].setText("")
+            card["widget"].setToolTip("")
+
+    def _populate_meta_quality(self, summary: Dict[str, Any]) -> None:
+        """A5: 填充元信息左栏 + 数据质量右栏 + gaps/conflicts tooltip。"""
         meta = summary.get("meta") or {}
         quality = summary.get("quality") or {}
+        gaps = summary.get("gaps") or []
+        conflicts = summary.get("conflicts") or []
+
+        # 左栏
         self.meta_mode.setText(str(meta.get("mode") or "—"))
-        comp = quality.get("completeness_score") or 0
-        self.meta_completeness.setText(f"{float(comp) * 100:.1f}%")
-        self.meta_generated_at.setText(
-            str(meta.get("generated_at") or "—")
-        )
+        self.meta_generated_at.setText(str(meta.get("generated_at") or "—"))
         self.meta_api_calls.setText(str(meta.get("api_call_count") or "—"))
         elapsed_ms = meta.get("elapsed_ms")
         self.meta_elapsed.setText(
@@ -783,8 +945,84 @@ class MarketSummaryPage(QWidget):
         else:
             self.meta_merge_stats.setText("—")
 
+        # 右栏：完整度 + 分层
+        comp = quality.get("completeness_score") or 0
+        comp_pct = float(comp) * 100
+        comp_color = (
+            "#52C41A" if comp_pct >= 90 else
+            "#FA8C16" if comp_pct >= 60 else
+            "#F5222D"
+        )
+        self.meta_completeness.setText(f"{comp_pct:.2f}%")
+        self.meta_completeness.setStyleSheet(
+            f"font-size:14px;font-weight:bold;color:{comp_color};"
+        )
+        l1 = quality.get("l1_complete")
+        l2 = quality.get("l2_complete")
+        l3 = quality.get("l3_complete")
+        nfr = quality.get("numeric_field_rate")
+
+        def _layer_part(label: str, val: Optional[float]) -> str:
+            if val is None:
+                return f"{label} —"
+            return f"{label} {float(val) * 100:.0f}%"
+
+        self.meta_layer_detail.setText(
+            " / ".join([
+                _layer_part("L1", l1),
+                _layer_part("L2", l2),
+                _layer_part("L3", l3),
+                _layer_part("数值", nfr),
+            ])
+        )
+
+        # gaps / conflicts 摘要 + tooltip 详情
+        self.meta_gaps_label.setText(f"缺失字段: {len(gaps)} 项")
+        if gaps:
+            lines = [
+                f"• {g.get('field', '?')}: {g.get('reason', '')}"
+                for g in gaps[:20]
+            ]
+            if len(gaps) > 20:
+                lines.append(f"…（另有 {len(gaps) - 20} 项未展示）")
+            self.meta_gaps_label.setToolTip("\n".join(lines))
+            self.meta_gaps_label.setStyleSheet(
+                "color:#FA8C16;font-weight:bold;"
+            )
+        else:
+            self.meta_gaps_label.setToolTip("无缺失字段，盘后数据完整。")
+            self.meta_gaps_label.setStyleSheet("color:#52C41A;")
+
+        self.meta_conflicts_label.setText(f"合并冲突: {len(conflicts)} 项")
+        if conflicts:
+            lines = [
+                f"• [{c.get('type', '?')}] {c.get('field', '?')} "
+                f"winner={c.get('winner', '?')} "
+                f"loser={c.get('loser', '?')}"
+                for c in conflicts[:20]
+            ]
+            if len(conflicts) > 20:
+                lines.append(
+                    f"…（另有 {len(conflicts) - 20} 项未展示）"
+                )
+            self.meta_conflicts_label.setToolTip("\n".join(lines))
+            self.meta_conflicts_label.setStyleSheet(
+                "color:#722ED1;font-weight:bold;"
+            )
+        else:
+            self.meta_conflicts_label.setToolTip("merger 未发现 cls/ai 字段冲突。")
+            self.meta_conflicts_label.setStyleSheet("color:#52C41A;")
+
     def _populate_sectors(self, summary: Dict[str, Any]) -> None:
+        from gui.utils.market_db_helper import query_sector_leaders
+
         sectors = summary.get("sectors_top") or []
+        td = (
+            (summary.get("meta") or {}).get("trade_date")
+            or self._current_trade_date
+            or ""
+        )
+
         self.sector_table.setRowCount(len(sectors))
         for row, s in enumerate(sectors):
             pct = s.get("pct_chg")
@@ -792,45 +1030,73 @@ class MarketSummaryPage(QWidget):
             cats = s.get("catalysts") or []
             src = (s.get("catalysts_source") or "none").lower()
             match = s.get("catalysts_match") or ""
+            name = str(s.get("name") or "")
+            ts_code = str(s.get("ts_code") or "")
+            main_net = s.get("main_net_yi")
+
+            # 板块名 + 代码合并显示
+            name_cell = (
+                f"{name} [{ts_code}]" if name and ts_code else
+                name or ts_code or "—"
+            )
+
+            # 龙头股 Top3 —— 后端 leaders 当前是空数组，用 helper 查 fact_limit_stock 自算
+            leaders_text = self._format_sector_leaders(
+                name, td, fallback=s.get("leaders") or []
+            )
+
+            # high_risk 自算（后端 high_risk 当前永远 None）
+            risk_level, risk_bg, risk_tip = self._compute_high_risk(pct_5d)
 
             cells = [
                 str(s.get("rank") or row + 1),
-                str(s.get("name") or s.get("ts_code") or ""),
+                name_cell,
                 _fmt_pct(pct),
                 _fmt_pct(pct_5d),
                 _fmt_int(s.get("limit_up_count")),
-                _fmt_num(s.get("main_net_yi")),
-                _fmt_num(s.get("main_elg_yi")),
-                _fmt_num(s.get("main_lg_yi")),
+                _fmt_num(main_net),
+                leaders_text,
                 "  ·  ".join(cats) if cats else "—",
             ]
 
             for col, txt in enumerate(cells):
                 item = QTableWidgetItem(txt)
-                # 涨跌幅着色
+
+                # 先按 high_risk 给所有列上行底色（最后一列后续会被 cls/ai 色覆盖）
+                if risk_bg is not None:
+                    item.setBackground(QBrush(risk_bg))
+
+                # 板块名列：tooltip 显示 high_risk 详情
+                if col == 1 and risk_tip:
+                    item.setToolTip(risk_tip)
+
+                # 涨幅 / 5 日涨幅着色
                 if col == 2:
                     c = _pct_color(pct)
                     if c is not None:
                         item.setForeground(c)
-                        font = QFont()
-                        font.setBold(True)
-                        item.setFont(font)
+                        f = QFont()
+                        f.setBold(True)
+                        item.setFont(f)
                 elif col == 3:
                     c = _pct_color(pct_5d)
                     if c is not None:
                         item.setForeground(c)
-                elif col == 5:
-                    val = s.get("main_net_yi")
-                    if val is not None:
-                        try:
-                            f = float(val)
-                            item.setForeground(
-                                _COLOR_RED if f > 0 else _COLOR_GREEN
-                                if f < 0 else _COLOR_MUTED
-                            )
-                        except (TypeError, ValueError):
-                            pass
-                # catalysts 列上色
+                    if risk_level == "高":
+                        f = QFont()
+                        f.setBold(True)
+                        item.setFont(f)
+                elif col == 5 and main_net is not None:
+                    try:
+                        f_val = float(main_net)
+                        item.setForeground(
+                            _COLOR_RED if f_val > 0 else
+                            _COLOR_GREEN if f_val < 0 else _COLOR_MUTED
+                        )
+                    except (TypeError, ValueError):
+                        pass
+
+                # catalysts 列（最后一列）—— cls/ai 色块覆盖 high_risk 底色
                 if col == len(cells) - 1:
                     if src == "cls":
                         item.setBackground(QBrush(_COLOR_CLS))
@@ -845,6 +1111,86 @@ class MarketSummaryPage(QWidget):
                         item.setForeground(_COLOR_MUTED)
                         item.setToolTip("未命中：raw_news 中也找不到证据")
                 self.sector_table.setItem(row, col, item)
+
+    def _format_sector_leaders(
+        self,
+        sector_name: str,
+        trade_date: str,
+        *,
+        fallback: list,
+    ) -> str:
+        """从 fact_limit_stock 取该板块涨停股做龙头股代理，格式 "名(状态) · ..."。
+
+        输入:
+            sector_name 板块名（用于 LIKE 匹配 fact_limit_stock.theme）
+            trade_date  YYYYMMDD
+            fallback    后端 sectors_top[].leaders（M2 阶段填充，当前为空）
+        输出:
+            "{name}({状态}) · {name}({状态}) · ..."；查不到时返回 "—"
+        """
+        from gui.utils.market_db_helper import query_sector_leaders
+
+        # 1) 后端 leaders 优先（未来后端实装后自动接管）
+        if isinstance(fallback, list) and fallback:
+            parts = []
+            for ld in fallback[:3]:
+                if not isinstance(ld, dict):
+                    continue
+                n = str(ld.get("name") or ld.get("ts_code") or "")
+                st = str(ld.get("status") or "")
+                parts.append(f"{n}({st})" if st else n)
+            if parts:
+                return " · ".join(parts)
+
+        # 2) GUI 端自算
+        if not (sector_name and trade_date):
+            return "—"
+        rows = query_sector_leaders(sector_name, trade_date, limit=3)
+        if not rows:
+            return "—"
+        out = []
+        for r in rows:
+            n = str(r.get("name") or r.get("ts_code") or "")
+            cons = r.get("cons_nums")
+            try:
+                cons_int = int(cons) if cons is not None else None
+            except (TypeError, ValueError):
+                cons_int = None
+            if cons_int is not None and cons_int >= 2:
+                out.append(f"{n}({cons_int}板)")
+            elif cons_int == 1:
+                out.append(f"{n}(首)")
+            else:
+                out.append(n)
+        return " · ".join(out) if out else "—"
+
+    def _compute_high_risk(
+        self, pct_chg_5d: Optional[float],
+    ) -> tuple:
+        """根据 5 日累计涨幅判定板块高位风险等级。
+
+        输出 (level, bg_color_or_None, tooltip_or_None)
+            level   "高" / "中" / None
+            bg      QColor 或 None
+            tip     str 或 None
+        """
+        if pct_chg_5d is None:
+            return (None, None, None)
+        try:
+            v = float(pct_chg_5d)
+        except (TypeError, ValueError):
+            return (None, None, None)
+        if v > 15.0:
+            return (
+                "高", self._RISK_HIGH_BG,
+                f"⚠️ 高位风险：5 日累计涨幅 {v:+.2f}% > 15%，注意追高风险",
+            )
+        if v > 8.0:
+            return (
+                "中", self._RISK_MID_BG,
+                f"5 日累计涨幅 {v:+.2f}%，中等热度",
+            )
+        return (None, None, None)
 
     def _populate_ladder(self, summary: Dict[str, Any]) -> None:
         ladder = summary.get("limit_ladder") or {}
@@ -890,17 +1236,38 @@ class MarketSummaryPage(QWidget):
             parent.setExpanded(not bucket_name.startswith("首板"))
 
     def _populate_dragon_tiger(self, summary: Dict[str, Any]) -> None:
+        from gui.utils.market_db_helper import (
+            query_other_traders, query_stock_names,
+        )
+
         dt = summary.get("dragon_tiger") or {}
         stocks = dt.get("stocks") or []
         famous = dt.get("famous_traders") or []
+        td = (
+            (summary.get("meta") or {}).get("trade_date")
+            or self._current_trade_date
+            or ""
+        )
 
+        # 顺手补股票名（后端 service.py:712 写死 None）
+        name_map: Dict[str, str] = {}
+        if stocks:
+            need = [
+                str(s.get("ts_code") or "") for s in stocks
+                if (not s.get("name")) and s.get("ts_code")
+            ]
+            name_map = query_stock_names(need) if need else {}
+
+        # 上：龙虎榜个股
         self.dt_stock_table.setRowCount(len(stocks))
         for row, s in enumerate(stocks):
             net = s.get("net_amount_yi")
             reasons = s.get("reasons") or []
+            code = str(s.get("ts_code") or "")
+            name = str(s.get("name") or name_map.get(code) or "—")
             cells = [
-                str(s.get("ts_code") or ""),
-                str(s.get("name") or "—"),
+                code,
+                name,
                 _fmt_num(net),
                 "  ·  ".join(reasons) if reasons else "—",
             ]
@@ -917,6 +1284,7 @@ class MarketSummaryPage(QWidget):
                         pass
                 self.dt_stock_table.setItem(row, col, item)
 
+        # 中：已识别游资席位
         self.trader_table.setRowCount(len(famous))
         for row, t in enumerate(famous):
             side = str(t.get("side") or "")
@@ -944,6 +1312,37 @@ class MarketSummaryPage(QWidget):
                     f.setBold(True)
                     item.setFont(f)
                 self.trader_table.setItem(row, col, item)
+
+        # 下：其他席位（A4）—— GUI 直查 DB，不进 summary
+        other_rows = query_other_traders(td) if td else []
+        self.other_trader_table.setRowCount(len(other_rows))
+        for row, r in enumerate(other_rows):
+            side = str(r.get("side") or "")
+            side_label = (
+                "买入" if side.lower() in ("buy", "b") else
+                "卖出" if side.lower() in ("sell", "s") else side
+            )
+            net = r.get("net_buy_yi")
+            cells = [
+                str(r.get("exalter") or ""),
+                side_label,
+                str(r.get("ts_code") or ""),
+                _fmt_num(net),
+                _fmt_num(r.get("buy_amount_yi")),
+                _fmt_num(r.get("sell_amount_yi")),
+            ]
+            for col, txt in enumerate(cells):
+                item = QTableWidgetItem(txt)
+                if col == 3 and net is not None:
+                    try:
+                        f = float(net)
+                        item.setForeground(
+                            _COLOR_RED if f > 0 else
+                            _COLOR_GREEN if f < 0 else _COLOR_MUTED
+                        )
+                    except (TypeError, ValueError):
+                        pass
+                self.other_trader_table.setItem(row, col, item)
 
     def _populate_shock(self, summary: Dict[str, Any]) -> None:
         events = summary.get("market_shock") or []
