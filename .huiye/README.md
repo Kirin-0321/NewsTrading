@@ -5,7 +5,7 @@
 > ③ `_` 前缀的临时草稿 / 调试快照 / 字段审计 ④ 跨多份正式文档的"汇总索引"  
 >  
 > **其余一切正式文档已迁入 `doc/{子目录}/`**（迁移日志见 [doc/updates/05-26-2126-工作目录文档迁移.md](../doc/updates/05-26-2126-工作目录文档迁移.md)）  
-> 最后更新: 2026-05-26 23:00（龙虎榜个股名称从 raw_json 兜底补齐）
+> 最后更新: 2026-05-26 23:10（dim_stock 维度表完整映射建立，5522 行入库）
 
 ---
 
@@ -16,7 +16,8 @@
 | [盘后数据 GUI 优化效果方案](../doc/design/05-26-2116-盘后数据GUI优化效果方案.md) | **候选 #1（轻量）** — GUI 三层增强（A 必做 / B 建议 / C 选做） | 🟢 **Level A + Top20/Bottom10 + 4 字段补全已上线**，待主人验收 B/C |
 | [盘后数据近 7 天补全 + 后端 4 字段派生](../doc/updates/05-26-2230-盘后数据近7天补全.md) | 本轮变更日志 — 后端实装 leaders/limit_up_count 派生 + pct_chg_5d 全板块覆盖 + Top 20 catalysts | 🟢 已上线，覆盖率：pct_5d 95%、catalysts 70%、leaders/lu_count 15%（受数据源限制） |
 | [连板梯队 kpl 延迟全空修复 (v1+v2)](../doc/bugfix/05-26-2240-连板梯队kpl延迟全空修复.md) | v1 修 4 个 bug 让 ladder 不空；**v2 用历史 fact_limit_stock 递归推算连板数（T-1 仍涨停→2板）+ theme 兜底** | 🟢 已上线，46 只 → 首板 34/2连 8/3连 4，max_height=3 板 |
-| [龙虎榜个股名称缺失修复](../doc/bugfix/05-26-2300-龙虎榜个股名称缺失修复.md) | `dim_stock` 表 0 行 + `_read_dragon_tiger` 写死 `name=None`；改 SQL 走 `raw_json.name` 兜底 | 🟢 已上线，93/93 全部带名称；dim_stock 长期补全待主人决定 |
+| [龙虎榜个股名称缺失修复](../doc/bugfix/05-26-2300-龙虎榜个股名称缺失修复.md) | `dim_stock` 表 0 行 + `_read_dragon_tiger` 写死 `name=None`；改 SQL 走 `raw_json.name` 兜底 | 🟢 已上线，93/93 全部带名称 |
+| [dim_stock 维度表完整映射建立](../doc/features/05-26-2310-dim_stock维度表完整映射.md) | 新增 `fetch_dim_stock_full` + `tools/dim_stock_sync.py` CLI + `build()` 启动自动初始化；5522 只在市股一次入库 | 🟢 已上线，所有 ts_code 反查根治 |
 | [CLI 评估回测 / Agent 优化初步设计](../doc/design/05-26-2126-CLI评估回测Agent优化初步设计.md) | **候选 #2（重头）** — 把 30 天历史盘后数据用起来跑虚拟回测 | 🟡 设计已完成，**待主人决定是否开工** |
 
 ---

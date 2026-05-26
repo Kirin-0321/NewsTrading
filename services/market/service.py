@@ -249,7 +249,11 @@ class MarketSummaryService:
                     cached.elapsed_ms = int((time.time() - t0) * 1000)
                     return cached
 
-            # ---- 4) Tushare 拉数据 ----
+            # ---- 4) 启动检查：dim_stock 空则首次自动初始化 ----
+            # 让首次用户开箱即用，所有 ts_code → name 查询都能命中
+            self._ensure_dim_stock_initialized(result, progress)
+
+            # ---- 5) Tushare 拉数据 ----
             progress("启动 Tushare 取数…")
             api0 = self.client.call_count
             fetch_result = self.fetcher.fetch(
@@ -809,6 +813,42 @@ class MarketSummaryService:
             return (limit_up_count, leaders)
         except Exception:  # noqa: BLE001
             return (None, [])
+
+    def _ensure_dim_stock_initialized(
+        self,
+        result: "MarketSummaryResult",
+        progress: Callable[[str], None],
+    ) -> None:
+        """首次启动时，如 dim_stock 为空则自动拉一次 stock_basic 全量。
+
+        非阻塞：失败时只 warn，不打断后续 build 流程（GUI 仍能用 raw_json
+        兜底显示股名）。后续主人可手动 ``python tools/dim_stock_sync.py``。
+        """
+        try:
+            with self.db.connect(readonly=True) as conn:
+                cnt = int(
+                    conn.execute("SELECT COUNT(*) FROM dim_stock").fetchone()[0]
+                )
+        except Exception as exc:  # noqa: BLE001
+            _log.warning("dim_stock 行数检查失败: %s", exc)
+            return
+        if cnt > 0:
+            return
+
+        progress("首次启动，初始化 dim_stock（一次性，~5400 行）…")
+        try:
+            api0 = self.client.call_count
+            out = self.fetcher.fetch_dim_stock_full(include_delisted=False)
+            result.api_call_count += self.client.call_count - api0
+            msg = (
+                f"dim_stock 初始化完成: {out['total']} 行"
+            )
+            _log.info(msg)
+            result.warnings.append(msg)
+        except Exception as exc:  # noqa: BLE001
+            warn = f"dim_stock 自动初始化失败（不影响主流程，可后续手动同步）: {exc}"
+            _log.warning(warn)
+            result.warnings.append(warn)
 
     @staticmethod
     def _derive_cons_nums_from_history(

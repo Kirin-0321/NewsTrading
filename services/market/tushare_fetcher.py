@@ -907,6 +907,76 @@ class TushareMarketFetcher:
             )
         result.ingested["fact_sector_daily_5d_enriched"] = len(payload)
 
+    # ==================================================================
+    # 维度表（独立于日线流水线，按需手动 / 启动时自动）
+    # ==================================================================
+
+    def fetch_dim_stock_full(
+        self,
+        *,
+        include_delisted: bool = False,
+    ) -> Dict[str, int]:
+        """一次性拉全市场股票基础信息 → 入库 dim_stock。
+
+        Tushare 接口: ``stock_basic``（无 trade_date 参数，是字典型接口）
+        实际 API 调用: 1 次（``L``）+ 可选 1 次（``D``）
+
+        Args:
+            include_delisted: True 时同时拉退市股（``list_status='D'``），
+                让历史龙虎榜 ts_code 也能反查到名字（已下市的）。
+
+        Returns:
+            ``{"L": 在市股数, "D": 退市股数, "total": 写入总行数}``
+        """
+        out: Dict[str, int] = {"L": 0, "D": 0, "total": 0}
+
+        statuses = ["L"]
+        if include_delisted:
+            statuses.append("D")
+
+        for status in statuses:
+            try:
+                rows = self.client.call(
+                    "stock_basic",
+                    params={"list_status": status},
+                    fields="ts_code,name,market,industry,list_date",
+                )
+            except TushareError as exc:
+                _log.warning("stock_basic(%s) 拉取失败: %s", status, exc)
+                continue
+            n = self._ingest_dim_stock(rows)
+            out[status] = n
+            out["total"] += n
+            _log.info("dim_stock 写入 %s 状态 %d 只", status, n)
+
+        return out
+
+    def _ingest_dim_stock(self, rows: Sequence[dict]) -> int:
+        """把 stock_basic 返回行 upsert 进 dim_stock。"""
+        payload: List[tuple] = []
+        for r in rows:
+            ts_code = r.get("ts_code")
+            name = r.get("name")
+            if not ts_code or not name:
+                continue
+            payload.append((
+                str(ts_code),
+                str(name),
+                str(r.get("market") or "") or None,
+                str(r.get("industry") or "") or None,
+                str(r.get("list_date") or "") or None,
+            ))
+        if not payload:
+            return 0
+        with self.db.connect() as conn:
+            conn.executemany(
+                "INSERT OR REPLACE INTO dim_stock "
+                "(ts_code, name, market, industry, list_date) "
+                "VALUES (?, ?, ?, ?, ?)",
+                payload,
+            )
+        return len(payload)
+
 
 # ---------------------------------------------------------------------------
 # 工具
