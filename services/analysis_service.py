@@ -72,6 +72,9 @@ class AnalysisService:
         stocks_per_sector=5,
         max_news: Optional[int] = None,
         market_summary: Optional[str] = None,
+        auto_market: bool = False,
+        market_trade_date: Optional[str] = None,
+        market_mode: str = "hybrid",
         extract_themes: Optional[bool] = None,
         enable_deep_thinking: bool = True,
         cancel_check: Optional[Callable[[], bool]] = None,
@@ -85,6 +88,19 @@ class AnalysisService:
         """
         out = AnalysisResult()
         try:
+            # 可选：自动拉取盘后总结（用户手填的 market_summary 优先）
+            if (
+                auto_market
+                and not (market_summary and market_summary.strip())
+            ):
+                market_summary = self._auto_fetch_market_summary(
+                    out,
+                    trade_date=market_trade_date,
+                    mode=market_mode,
+                    cancel_check=cancel_check,
+                    progress_callback=progress_callback,
+                )
+
             news_list = self.load_news(source, start, end, hours)
             if not news_list:
                 out.error = "选定时间范围内没有新闻数据"
@@ -152,6 +168,58 @@ class AnalysisService:
             out.error = str(e)
 
         return out
+
+    @staticmethod
+    def _auto_fetch_market_summary(
+        result: AnalysisResult,
+        *,
+        trade_date: Optional[str],
+        mode: str,
+        cancel_check: Optional[Callable[[], bool]],
+        progress_callback: Optional[Callable],
+    ) -> Optional[str]:
+        """``analyze(auto_market=True)`` 时调 MarketSummaryService.build()。
+
+        失败不阻塞主分析，只往 progress 写一行警告，
+        返回 None 让后续 analyze 继续走「仅基于新闻」路径。
+        """
+        try:
+            from services.market.service import MarketSummaryService
+
+            if progress_callback:
+                progress_callback(
+                    "正在自动获取盘后数据（模式 {}）...".format(mode)
+                )
+            svc = MarketSummaryService()
+            ms = svc.build(
+                trade_date=trade_date,
+                mode=mode,
+                cancel_check=cancel_check,
+                progress_callback=(
+                    (lambda msg: progress_callback(
+                        f"[盘后] {msg}"
+                    )) if progress_callback else None
+                ),
+            )
+            if ms.ok and ms.summary_md:
+                if progress_callback:
+                    progress_callback(
+                        "已自动获取盘后数据（完整度 "
+                        f"{ms.completeness * 100:.1f}%, "
+                        f"用时 {ms.elapsed_ms / 1000:.1f}s）"
+                    )
+                return ms.summary_md
+            if progress_callback:
+                progress_callback(
+                    "⚠️ 自动获取盘后数据失败: "
+                    f"{ms.error or '未知错误'}（继续仅基于新闻分析）"
+                )
+        except Exception as e:
+            if progress_callback:
+                progress_callback(
+                    f"⚠️ 盘后数据模块加载失败: {e}（继续仅基于新闻分析）"
+                )
+        return None
 
     @staticmethod
     def _maybe_extract_themes(

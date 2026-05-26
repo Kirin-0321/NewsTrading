@@ -20,6 +20,7 @@ from gui.pages.theme_prediction_page import ThemePredictionPage
 from gui.pages.schedule_page import SchedulePage
 from gui.pages.news_cleaning_page import NewsCleaningPage
 from gui.pages.prompt_manager_page import PromptManagerPage
+from gui.pages.market_summary_page import MarketSummaryPage
 from core.scheduler_service import SchedulerService
 
 
@@ -83,6 +84,7 @@ class MainWindow(QMainWindow):
             'crawler': CrawlerPage(),
             'data': DataPage(),
             'export': ExportPage(),
+            'market_summary': MarketSummaryPage(),
             'ai_analysis': AIAnalysisPage(),
             'theme_prediction': ThemePredictionPage(),
             'cleaning': NewsCleaningPage(),
@@ -126,6 +128,7 @@ class MainWindow(QMainWindow):
             ('cleaning', '🧹 新闻清洗'),
 #            ('analysis', '📊 新闻分析（弃用）'),
             ('export', '📤 数据导出'),
+            ('market_summary', '📊 盘后数据'),
             ('ai_analysis', '🤖 AI分析'),
             ('theme_prediction', '🎯 预测题材'),
             ('schedule', '⏰ 定时任务'),

@@ -106,6 +106,29 @@ def run_task_sync(task: Dict) -> Dict:
                 "error": result.error,
             }
 
+        if task_type == "market_fetch":
+            from services.market.service import MarketSummaryService
+
+            ms = MarketSummaryService().build(
+                trade_date=params.get("trade_date"),
+                mode=params.get("mode", "hybrid"),
+                top_sector_n=params.get("top_sector_n", 10),
+                force_refresh=params.get("force_refresh", False),
+            )
+            return {
+                "ok": ms.ok,
+                "type": task_type,
+                "result": {
+                    "trade_date": ms.trade_date,
+                    "completeness": ms.completeness,
+                    "elapsed_ms": ms.elapsed_ms,
+                    "api_call_count": ms.api_call_count,
+                    "mode": ms.mode,
+                    "from_cache": ms.from_cache,
+                },
+                "error": ms.error,
+            }
+
         return {"ok": False, "type": task_type, "error": f"未知任务类型: {task_type}"}
 
     except Exception as e:
