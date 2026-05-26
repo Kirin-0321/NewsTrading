@@ -97,10 +97,12 @@ class AIAnalysisPage(QWidget):
         self.load_template_list()
 
     def showEvent(self, event):
-        """页面显示时刷新统计"""
+        """页面显示时刷新统计 + 重新读取模板列表（防止管理页改完没同步）"""
         super().showEvent(event)
         if hasattr(self, "_refresh_db_stats"):
             self._refresh_db_stats()
+        if hasattr(self, "template_combo"):
+            self.load_template_list()
 
     def create_config_group(self):
         """创建AI配置组"""
@@ -155,7 +157,7 @@ class AIAnalysisPage(QWidget):
         return group
 
     def create_template_group(self):
-        """创建提示词模板组"""
+        """创建提示词模板组（仅选择，新建/编辑请去"提示词管理"页）。"""
         group = QGroupBox("📝 提示词模板")
         layout = QVBoxLayout()
 
@@ -167,44 +169,51 @@ class AIAnalysisPage(QWidget):
         self.template_combo.setStyleSheet(COMBOBOX_STYLE)
         template_layout.addWidget(template_label)
         template_layout.addWidget(self.template_combo, 1)
+
+        self.refresh_templates_btn = QPushButton("🔄")
+        self.refresh_templates_btn.setToolTip("重新读取 prompts/ 目录")
+        self.refresh_templates_btn.clicked.connect(self.load_template_list)
+        self.refresh_templates_btn.setFixedWidth(36)
+        template_layout.addWidget(self.refresh_templates_btn)
+
+        self.manage_templates_btn = QPushButton("📝 管理模板…")
+        self.manage_templates_btn.setToolTip(
+            "跳转到'提示词管理'页面，在那里新建/编辑/删除"
+        )
+        self.manage_templates_btn.clicked.connect(self._goto_prompt_manager)
+        template_layout.addWidget(self.manage_templates_btn)
+
         layout.addLayout(template_layout)
 
-        # 模板管理按钮
-        btn_layout = QHBoxLayout()
-        btn_layout.addStretch()
-
-        self.new_template_btn = QPushButton("➕ 新建")
-        self.new_template_btn.clicked.connect(self.new_template)
-        btn_layout.addWidget(self.new_template_btn)
-
-        self.edit_template_btn = QPushButton("✏️ 编辑")
-        self.edit_template_btn.clicked.connect(self.edit_template)
-        btn_layout.addWidget(self.edit_template_btn)
-
-        self.delete_template_btn = QPushButton("🗑️ 删除")
-        self.delete_template_btn.setStyleSheet(BUTTON_DANGER)
-        self.delete_template_btn.clicked.connect(self.delete_template)
-        btn_layout.addWidget(self.delete_template_btn)
-
-        layout.addLayout(btn_layout)
+        hint = QLabel(
+            "💡 新建 / 编辑 / 删除请在侧边栏【📝 提示词管理】中操作，"
+            "保存后此处会自动刷新。"
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #8c8c8c; font-size: 12px;")
+        layout.addWidget(hint)
 
         group.setLayout(layout)
         return group
 
     def load_template_list(self):
-        """加载分析模板列表（config/ai_config.json）"""
+        """加载分析模板列表（从 prompts/analysis/*.md 读取）"""
         try:
             from core.ai_config import AIConfig
 
             config = AIConfig()
             templates = config.get_prompt_templates()
 
+            previous = self.template_combo.currentData()
+
+            self.template_combo.blockSignals(True)
             self.template_combo.clear()
             for key, template in templates.items():
                 display_name = template.get("name", key)
                 self.template_combo.addItem(display_name, key)
+            self.template_combo.blockSignals(False)
 
-            current = config.get_current_prompt_template()
+            current = previous or config.get_current_prompt_template()
             for i in range(self.template_combo.count()):
                 if self.template_combo.itemData(i) == current:
                     self.template_combo.setCurrentIndex(i)
@@ -218,107 +227,14 @@ class AIAnalysisPage(QWidget):
         """兼容旧调用，统一走 load_template_list。"""
         self.load_template_list()
 
-    def new_template(self):
-        """新建模板"""
-        from PyQt5.QtWidgets import QDialog
-        dialog = PromptTemplateDialog(self)
-        if dialog.exec_() == QDialog.Accepted:
-            result = dialog.get_result()
-            if result:
-                from core.ai_config import AIConfig
-                import time
-
-                config = AIConfig()
-                template_id = f"custom_{int(time.time())}"
-                config.save_template(
-                    template_id,
-                    result['name'],
-                    result['system_prompt'],
-                    result['user_prompt_template']
-                )
-                self.load_templates()
-                QMessageBox.information(self, "成功", "模板已保存")
-
-    def edit_template(self):
-        """编辑模板"""
-        from PyQt5.QtWidgets import QDialog
-        
-        template_id = self.template_combo.currentData()
-        if not template_id:
-            return
-
-        from core.ai_config import AIConfig
-        import time
-        
-        config = AIConfig()
-        template_data = config.get_template(template_id)
-
-        # 内置模板编辑时提示另存为
-        from core.ai_config import BUILTIN_PROMPT_TEMPLATES
-        is_builtin = template_id in BUILTIN_PROMPT_TEMPLATES
-        
-        if is_builtin:
-            reply = QMessageBox.question(
-                self, 
-                "编辑内置模板", 
-                "内置模板不可直接修改，是否要另存为新模板？",
-                QMessageBox.Yes | QMessageBox.No
-            )
-            if reply != QMessageBox.Yes:
-                return
-
-        dialog = PromptTemplateDialog(self, template_id, template_data)
-        if dialog.exec_() == QDialog.Accepted:
-            result = dialog.get_result()
-            if result:
-                # 内置模板另存为新模板
-                if is_builtin:
-                    new_template_id = f"custom_{int(time.time())}"
-                    config.save_template(
-                        new_template_id,
-                        result['name'],
-                        result['system_prompt'],
-                        result['user_prompt_template']
-                    )
-                    QMessageBox.information(
-                        self, "成功", f"已另存为新模板: {result['name']}")
-                else:
-                    # 自定义模板直接更新
-                    config.save_template(
-                        template_id,
-                        result['name'],
-                        result['system_prompt'],
-                        result['user_prompt_template']
-                    )
-                    QMessageBox.information(self, "成功", "模板已更新")
-                
-                self.load_templates()
-
-    def delete_template(self):
-        """删除模板"""
-        template_id = self.template_combo.currentData()
-        if not template_id:
-            return
-
-        # 内置模板不允许删除
-        from core.ai_config import BUILTIN_PROMPT_TEMPLATES
-        if template_id in BUILTIN_PROMPT_TEMPLATES:
-            QMessageBox.warning(self, "提示", "内置模板不可删除")
-            return
-
-        reply = QMessageBox.question(
-            self, "确认", "确定要删除这个模板吗？",
-            QMessageBox.Yes | QMessageBox.No
-        )
-
-        if reply == QMessageBox.Yes:
-            from core.ai_config import AIConfig
-            config = AIConfig()
-            if config.delete_template(template_id):
-                self.load_templates()
-                QMessageBox.information(self, "成功", "模板已删除")
-            else:
-                QMessageBox.warning(self, "失败", "删除失败")
+    def _goto_prompt_manager(self) -> None:
+        """跳转到主窗口的'提示词管理'页面。"""
+        try:
+            window = self.window()
+            if hasattr(window, "show_page"):
+                window.show_page("prompt_manager")
+        except Exception as e:
+            print(f"[AIAnalysis] 跳转提示词管理失败: {e}")
 
     def create_source_group(self):
         """创建数据源选择组（SQLite）"""

@@ -19,6 +19,30 @@ from services.storage.database import init_database  # noqa: E402
 
 init_database()
 
+from services.market import MarketDB  # noqa: E402
+
+
+def _init_market_db_on_startup() -> None:
+    """初始化 ``data/market.db`` 并跑迁移（首次运行会建 14 张表 + 30+ 游资种子）。
+
+    自动备份逻辑：若库已存在且有未应用迁移，迁移前会复制一份到
+    ``data/backups/``。任何失败只会写到 stderr，不阻断 GUI 启动。
+    """
+    try:
+        db = MarketDB()
+        applied = db.ensure_schema()
+        if applied:
+            print(
+                "[启动] market.db 迁移完成: "
+                + ", ".join(str(v) for v in applied),
+                file=sys.stderr,
+            )
+    except Exception as exc:  # noqa: BLE001
+        print(f"[启动] market.db 初始化失败: {exc}", file=sys.stderr)
+
+
+_init_market_db_on_startup()
+
 from core.prompt_loader import PromptLoader  # noqa: E402
 
 

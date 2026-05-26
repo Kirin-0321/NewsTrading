@@ -81,6 +81,34 @@ CREATE TABLE IF NOT EXISTS theme_news (
 );
 CREATE INDEX IF NOT EXISTS idx_theme_news_theme   ON theme_news(theme_id);
 CREATE INDEX IF NOT EXISTS idx_theme_news_news_id ON theme_news(news_id);
+
+-- AI 分析报告索引（Phase M1, 2026-05-26）
+-- 报告正文仍在 data/AI_analysis/*.md，本表只存元数据 + path 索引，
+-- 便于后续 Eval/回测按 prompt_id / 日期范围 / 是否抽过题材等条件查询。
+CREATE TABLE IF NOT EXISTS ai_reports (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    report_date       TEXT NOT NULL,        -- YYYYMMDD
+    file_path         TEXT NOT NULL UNIQUE, -- 相对仓库根的路径
+    provider          TEXT,                 -- deepseek/openai/qwen/...
+    model             TEXT,
+    prompt_category   TEXT,                 -- 'analysis'
+    prompt_id         TEXT,                 -- news_focused / trinity_resonance / ...
+    prompt_version    TEXT,
+    news_range_start  TEXT,                 -- 涉及新闻的时间范围
+    news_range_end    TEXT,
+    news_count        INTEGER,
+    used_market_date  TEXT,                 -- 用到的盘后数据日期 YYYYMMDD，可空
+    theme_extracted   INTEGER NOT NULL DEFAULT 0, -- 1=已抽过题材入 theme_predictions
+    file_size         INTEGER,              -- 字节
+    md5               TEXT,                 -- 文件 md5（去重 / 校验用）
+    created_at        TEXT NOT NULL         -- ISO 时间
+);
+CREATE INDEX IF NOT EXISTS idx_ai_reports_date
+    ON ai_reports(report_date DESC);
+CREATE INDEX IF NOT EXISTS idx_ai_reports_prompt
+    ON ai_reports(prompt_id, prompt_version);
+CREATE INDEX IF NOT EXISTS idx_ai_reports_theme_flag
+    ON ai_reports(theme_extracted, report_date DESC);
 """
 
 # v2 schema 指纹：每张题材表应该存在的列。如果检测到旧列就 DROP 重建。
@@ -104,7 +132,21 @@ def _ensure_clean_status_columns(conn: sqlite3.Connection) -> None:
     """老库补 clean_status / clean_reason 字段，并直接抛弃旧的 curated/rejected 表。
 
     旧分类不做迁移：原始新闻全部回到 pending，需要重新跑清洗。
+
+    若 ``raw_news`` 表尚不存在（首次初始化的新库），跳过补字段逻辑——
+    后续 ``executescript(_SCHEMA)`` 会按最新 schema 直接建表。
     """
+    # 新库兜底：raw_news 还没建出来，没什么字段可补
+    if not conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' "
+        "AND name='raw_news'"
+    ).fetchone():
+        # 仍要把可能残留的旧分类表清掉（即使是新库也无害）
+        for legacy in ("curated_news", "rejected_news"):
+            conn.execute(f"DROP TABLE IF EXISTS {legacy}")
+        conn.commit()
+        return
+
     cols = {r[1] for r in conn.execute("PRAGMA table_info(raw_news)").fetchall()}
     changed = False
     if "clean_status" not in cols:

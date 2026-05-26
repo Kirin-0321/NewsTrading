@@ -113,7 +113,9 @@ class PromptManagerPage(QWidget):
 
     def _build_toolbar(self) -> QWidget:
         wrap = QFrame()
-        wrap.setStyleSheet("QFrame { background: #ffffff; border-radius: 6px; }")
+        wrap.setStyleSheet(
+            "QFrame { background: #ffffff; border-radius: 6px; }"
+        )
         row = QHBoxLayout(wrap)
         row.setContentsMargins(12, 8, 12, 8)
         row.setSpacing(8)
@@ -123,7 +125,9 @@ class PromptManagerPage(QWidget):
         for cat_id, label in _CATEGORY_LABELS:
             self.category_combo.addItem(label, cat_id)
         self.category_combo.setStyleSheet(COMBOBOX_STYLE)
-        self.category_combo.currentIndexChanged.connect(self._on_category_changed)
+        self.category_combo.currentIndexChanged.connect(
+            self._on_category_changed
+        )
         row.addWidget(self.category_combo)
 
         row.addStretch()
@@ -148,9 +152,7 @@ class PromptManagerPage(QWidget):
         self.list_widget = QListWidget()
         self.list_widget.setAlternatingRowColors(True)
         self.list_widget.itemSelectionChanged.connect(self._on_selection_changed)
-        self.list_widget.itemDoubleClicked.connect(
-            lambda _it: self.edit_template()
-        )
+        self.list_widget.itemDoubleClicked.connect(self._on_double_clicked)
         left_layout.addWidget(self.list_widget)
 
         self.list_summary = QLabel("0 / 0")
@@ -304,6 +306,9 @@ class PromptManagerPage(QWidget):
     def _on_category_changed(self, _index: int) -> None:
         self._current_id = None
         self.refresh()
+
+    def _on_double_clicked(self, _item) -> None:
+        self.edit_template()
 
     def _on_selection_changed(self) -> None:
         item = self.list_widget.currentItem()

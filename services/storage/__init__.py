@@ -4,6 +4,12 @@
 不再保留 curated_news / rejected_news 子表。
 """
 
+from services.storage.ai_reports_store import (
+    AIReportRecord,
+    AIReportsStore,
+    get_ai_reports_store,
+    record_report,
+)
 from services.storage.database import get_db_path, init_database
 from services.storage.news_utils import (
     CLEAN_CURATED,
@@ -36,6 +42,10 @@ __all__ = [
     "init_database",
     "get_raw_store",
     "get_theme_store",
+    "get_ai_reports_store",
+    "record_report",
+    "AIReportRecord",
+    "AIReportsStore",
     "RawStore",
     "ThemeStore",
     "CLEAN_PENDING",

@@ -19,6 +19,7 @@ from gui.pages.ai_analysis_page import AIAnalysisPage
 from gui.pages.theme_prediction_page import ThemePredictionPage
 from gui.pages.schedule_page import SchedulePage
 from gui.pages.news_cleaning_page import NewsCleaningPage
+from gui.pages.prompt_manager_page import PromptManagerPage
 from core.scheduler_service import SchedulerService
 
 
@@ -85,11 +86,17 @@ class MainWindow(QMainWindow):
             'ai_analysis': AIAnalysisPage(),
             'theme_prediction': ThemePredictionPage(),
             'cleaning': NewsCleaningPage(),
-            'schedule': SchedulePage(scheduler_service=self.scheduler_service)
+            'schedule': SchedulePage(scheduler_service=self.scheduler_service),
+            'prompt_manager': PromptManagerPage(),
         }
 
         for page in self.pages.values():
             self.content_stack.addWidget(page)
+
+        # 连接"提示词管理"页面信号 -> 让依赖方刷新模板下拉
+        prompt_mgr = self.pages.get('prompt_manager')
+        if prompt_mgr is not None:
+            prompt_mgr.prompts_changed.connect(self._on_prompts_changed)
 
         # 默认显示爬虫页面
         self.show_page('crawler')
@@ -122,6 +129,7 @@ class MainWindow(QMainWindow):
             ('ai_analysis', '🤖 AI分析'),
             ('theme_prediction', '🎯 预测题材'),
             ('schedule', '⏰ 定时任务'),
+            ('prompt_manager', '📝 提示词管理'),
         ]
 
         self.nav_buttons = {}
@@ -155,6 +163,16 @@ class MainWindow(QMainWindow):
             # 如果页面有refresh方法，调用它
             if hasattr(page, 'refresh'):
                 page.refresh()
+
+    def _on_prompts_changed(self, category: str) -> None:
+        """提示词管理页保存/删除后，刷新依赖该 category 的页面。"""
+        if category == "analysis":
+            ai_page = self.pages.get("ai_analysis")
+            if ai_page is not None and hasattr(ai_page, "load_template_list"):
+                try:
+                    ai_page.load_template_list()
+                except Exception as e:
+                    print(f"[MainWindow] 刷新 AI 分析模板列表失败: {e}")
     
     def on_scheduled_task(self, task):
         """定时任务触发：按 type 分发到 services 或 GUI"""
