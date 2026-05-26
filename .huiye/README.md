@@ -5,7 +5,7 @@
 > ③ `_` 前缀的临时草稿 / 调试快照 / 字段审计 ④ 跨多份正式文档的"汇总索引"  
 >  
 > **其余一切正式文档已迁入 `doc/{子目录}/`**（迁移日志见 [doc/updates/05-26-2126-工作目录文档迁移.md](../doc/updates/05-26-2126-工作目录文档迁移.md)）  
-> 最后更新: 2026-05-27 00:20（AI 分析页面盘后总结自动填入 ─ showEvent + last_settled_trade_date）
+> 最后更新: 2026-05-27 00:50（短线投机 prompt 双模板：scalper 实战派 + data_driven 数据派；DeepSeek V4 实跑对比 + 辉夜自评）
 
 ---
 
@@ -21,6 +21,7 @@
 | [export_market_summary CLI 上线](../doc/updates/05-26-2325-export-market-summary-CLI.md) | 纯导出工具，从 market_summaries 缓存读 + 用最新 renderer 重渲染，秒级、零 API；支持单日 / 批量 / MD/JSON/both / `--use-cached-md` 对比新旧 | 🟢 已上线，给辉夜边改 renderer 边验证用 |
 | [AI 数据完整度 4 批次升级](../doc/updates/05-26-2355-AI数据完整度4批次升级.md) | summary 覆盖度 85% → 98%：Batch 1 纯渲染（Top 20/连板元信息/上榜原因/gaps bug）/ Batch 2 后端补字段（seal_rate_prev/main_net_yi/promotion_detail/sectors_bottom）/ Batch 3 板块异动加涨跌幅+龙虎榜其他席位 / Batch 4 advance/decline 全市场涨跌家数（新表 fact_market_breadth + Tushare daily 接口） | 🟢 7 天全量回填完成，所有新字段历史已覆盖 |
 | [AI 分析页面盘后总结自动填入](../doc/features/05-27-0020-AI分析页面盘后总结自动填入.md) | showEvent 触发 → `last_settled_trade_date(now)` 算「下午 4 点分界 + 周末跳到周五」→ 读 market_summaries 自动 setPlainText；仅在为空时填，状态标志防覆盖 | 🟢 已上线，9 个时间边界 case 全部验证通过 |
+| [短线投机 Prompt 双模板自评](../doc/reports/05-27-0050-短线投机Prompt双模板对比自评.md) | 新增 `speculator_scalper`（实战派，4225 字）+ `speculator_data_driven`（数据派，13056 字）两个模板；DeepSeek V4 deep_thinking 实跑对比 + `tools/compare_speculator_prompts.py` 一次性对比脚本 | 🟢 已上线，辉夜偏向 scalper 实战派（明牌六字段完整、风险点给具体盘中观察锚点） |
 | [CLI 评估回测 / Agent 优化初步设计](../doc/design/05-26-2126-CLI评估回测Agent优化初步设计.md) | **候选 #2（重头）** — 把 30 天历史盘后数据用起来跑虚拟回测 | 🟡 设计已完成，**待主人决定是否开工** |
 
 ---
