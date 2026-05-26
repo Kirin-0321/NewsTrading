@@ -10,11 +10,14 @@
         ├─ A3 _populate_sectors → query_sector_leaders()
         ├─ A4 _populate_dragon_tiger → query_other_traders()
         └─ A4 _populate_dragon_tiger → query_stock_names() (顺手补股票名)
+    ai_analysis_page.py
+        └─ showEvent → last_settled_trade_date() + get_cached_summary_md()
 """
 
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 from services.market.market_db import get_market_db
@@ -277,9 +280,90 @@ def query_stock_names(ts_codes: List[str]) -> Dict[str, str]:
         return {}
 
 
+# ---------------------------------------------------------------------------
+# 自动填入 AI 分析页面盘后总结（M6 / 2026-05-27）
+# ---------------------------------------------------------------------------
+
+
+def last_settled_trade_date(
+    now: Optional[datetime] = None,
+) -> Optional[str]:
+    """算「最近一个已收盘的交易日」（GUI 自动填入用）。
+
+    边界规则
+    --------
+    * ``now.hour >= 16``（下午 4 点及之后）→ 候选 = 今天
+    * 否则 → 候选 = 昨天
+    * 把候选作为上界，向前找 ``dim_trade_calendar.is_open=1`` 的最近一行
+      （周末 / 春节假期等会自动跳过到上一个开市日）
+
+    举例
+    ----
+    * 2026-05-27 02:00（周三凌晨，hour<16）→ 候选=20260526（周二）→ 周二开市 → 返回 20260526
+    * 2026-05-27 16:30（周三下午 4 点后）→ 候选=20260527 → 周三开市 → 返回 20260527
+    * 2026-05-30 11:00（周六）→ 候选=20260529（周五，hour<16）→ 周五开市 → 返回 20260529
+    * 2026-05-31 22:00（周日）→ 候选=20260531（周日，hour>=16）→ 非开市 → 自动回退到 20260529
+
+    Args:
+        now: 测试时可注入；省略则取 ``datetime.now()``。
+
+    Returns:
+        ``YYYYMMDD`` 字符串；``dim_trade_calendar`` 表为空或回看仍未命中时返回 ``None``。
+    """
+    now = now or datetime.now()
+    if now.hour >= 16:
+        candidate = now
+    else:
+        candidate = now - timedelta(days=1)
+    target = candidate.strftime("%Y%m%d")
+
+    db = get_market_db()
+    try:
+        with db.connect(readonly=True) as conn:
+            row = conn.execute(
+                "SELECT trade_date FROM dim_trade_calendar "
+                "WHERE trade_date <= ? AND is_open = 1 "
+                "ORDER BY trade_date DESC LIMIT 1",
+                (target,),
+            ).fetchone()
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("last_settled_trade_date 查询失败: %s", exc)
+        return None
+    return str(row[0]) if row else None
+
+
+def get_cached_summary_md(trade_date: str) -> Optional[str]:
+    """从 ``market_summaries`` 表读取某日已渲染的 compact Markdown。
+
+    Args:
+        trade_date: ``YYYYMMDD``
+
+    Returns:
+        ``summary_md`` 字符串；该日无缓存（market_fetch 还没跑过）时返回 ``None``。
+    """
+    if not trade_date:
+        return None
+    db = get_market_db()
+    try:
+        with db.connect(readonly=True) as conn:
+            row = conn.execute(
+                "SELECT summary_md FROM market_summaries "
+                "WHERE trade_date = ?",
+                (trade_date,),
+            ).fetchone()
+    except Exception as exc:  # noqa: BLE001
+        _log.warning(
+            "get_cached_summary_md(%s) 失败: %s", trade_date, exc
+        )
+        return None
+    return str(row[0]) if row and row[0] else None
+
+
 __all__ = [
     "query_other_traders",
     "query_sector_leaders",
     "query_sectors_extended",
     "query_stock_names",
+    "last_settled_trade_date",
+    "get_cached_summary_md",
 ]

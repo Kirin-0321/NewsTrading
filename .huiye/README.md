@@ -5,7 +5,7 @@
 > ③ `_` 前缀的临时草稿 / 调试快照 / 字段审计 ④ 跨多份正式文档的"汇总索引"  
 >  
 > **其余一切正式文档已迁入 `doc/{子目录}/`**（迁移日志见 [doc/updates/05-26-2126-工作目录文档迁移.md](../doc/updates/05-26-2126-工作目录文档迁移.md)）  
-> 最后更新: 2026-05-26 23:25（export_market_summary.py CLI 上线，纯导出/秒级）
+> 最后更新: 2026-05-27 00:20（AI 分析页面盘后总结自动填入 ─ showEvent + last_settled_trade_date）
 
 ---
 
@@ -19,6 +19,8 @@
 | [龙虎榜个股名称缺失修复](../doc/bugfix/05-26-2300-龙虎榜个股名称缺失修复.md) | `dim_stock` 表 0 行 + `_read_dragon_tiger` 写死 `name=None`；改 SQL 走 `raw_json.name` 兜底 | 🟢 已上线，93/93 全部带名称 |
 | [dim_stock 维度表完整映射建立](../doc/features/05-26-2310-dim_stock维度表完整映射.md) | 新增 `fetch_dim_stock_full` + `tools/dim_stock_sync.py` CLI + `build()` 启动自动初始化；5522 只在市股一次入库 | 🟢 已上线，所有 ts_code 反查根治 |
 | [export_market_summary CLI 上线](../doc/updates/05-26-2325-export-market-summary-CLI.md) | 纯导出工具，从 market_summaries 缓存读 + 用最新 renderer 重渲染，秒级、零 API；支持单日 / 批量 / MD/JSON/both / `--use-cached-md` 对比新旧 | 🟢 已上线，给辉夜边改 renderer 边验证用 |
+| [AI 数据完整度 4 批次升级](../doc/updates/05-26-2355-AI数据完整度4批次升级.md) | summary 覆盖度 85% → 98%：Batch 1 纯渲染（Top 20/连板元信息/上榜原因/gaps bug）/ Batch 2 后端补字段（seal_rate_prev/main_net_yi/promotion_detail/sectors_bottom）/ Batch 3 板块异动加涨跌幅+龙虎榜其他席位 / Batch 4 advance/decline 全市场涨跌家数（新表 fact_market_breadth + Tushare daily 接口） | 🟢 7 天全量回填完成，所有新字段历史已覆盖 |
+| [AI 分析页面盘后总结自动填入](../doc/features/05-27-0020-AI分析页面盘后总结自动填入.md) | showEvent 触发 → `last_settled_trade_date(now)` 算「下午 4 点分界 + 周末跳到周五」→ 读 market_summaries 自动 setPlainText；仅在为空时填，状态标志防覆盖 | 🟢 已上线，9 个时间边界 case 全部验证通过 |
 | [CLI 评估回测 / Agent 优化初步设计](../doc/design/05-26-2126-CLI评估回测Agent优化初步设计.md) | **候选 #2（重头）** — 把 30 天历史盘后数据用起来跑虚拟回测 | 🟡 设计已完成，**待主人决定是否开工** |
 
 ---
@@ -94,9 +96,9 @@
   M4 ████████████████████ 100%   AnalysisService 集成 + 定时任务 + ai_reports 索引
   M5 ████████████████████ 100%   历史回填（30 天 hybrid 全跑通，平均完整度 95.24%）
 
-  ➕ GUI 优化（M6 候选）🟢 85%
+  ➕ GUI 优化（M6 候选）🟢 98%
      方案见 doc/design/05-26-2116-盘后数据GUI优化效果方案.md
-     A 字段补全 ✅ 已上线（完整度 60% → 85%）
+     A 字段补全 ✅ 已上线
        ├─ A1 7 大指数 3x3 卡片
        ├─ A2 涨/跌家数 + 北向 + 五日累计 + 涨停标杆等 5 行 KPI
        ├─ A3 板块表加「龙头股 Top3」列 + 高/中风险底色
@@ -104,13 +106,22 @@
        └─ A5 数据质量明细组（L1/L2/L3 + numeric_field + gaps/conflicts）
      A+ 板块行情扩展 ✅ 已上线（Top 10 → Top 20 + Bottom 10）
      ➕ 后端 4 字段补全 ✅ 已上线（pct_5d 全板块 / leaders / lu_count / catalysts × 2）
-     B 新增 Tab（建议，~2.5d，完整度 → 96%）  ⚪ 待主人勾选
-     C 交互下钻（选做，~2d，完整度 → 100%）  ⚪ 待主人勾选
+     ➕ AI 数据 4 批次升级 ✅ 已上线（2026-05-26 23:55，详见 doc/updates/05-26-2355-）
+       ├─ Batch 1 纯渲染：Top 20 / 连板 N板·题材·炸N次 / 龙虎榜上榜原因 / gaps bug
+       ├─ Batch 2 后端补字段：seal_rate_prev / main_net_yi / promotion_detail / sectors_bottom
+       ├─ Batch 3 板块异动加涨跌幅 + 龙虎榜其他席位（沪深股通/机构/大券商）
+       └─ Batch 4 advance/decline 全市场涨跌家数（新表 fact_market_breadth）
+     B 新增 Tab（建议，~2.5d）  ⚪ 待主人勾选
+     C 交互下钻（选做，~2d）  ⚪ 待主人勾选
 
 数据：data/market.db 44 MB / 30 天 market_summaries / 4888 条 CLS 异动
      / 21660 条龙虎榜机构席位 / 46 个知名游资别名
      ➕ 2026-05-26 22:30 force-refresh 7 天数据：sectors_top 20 条/天，
        pct_chg_5d 460/486 板块/天，catalysts ~17/天（CLS+AI 合计）
+     ➕ 2026-05-26 23:55 再次 force-refresh 7 天（4 批次升级合入）：
+       新增 fact_market_breadth 单行表（advance/decline/大涨/大跌/样本）
+       新增 sectors_bottom + market_shock 加涨跌幅 + dragon_tiger.other_traders
+       7 天平均完整度 95.5%，平均 62.9s/天，累计 API 148 次
 
 CLI 评估回测 / Agent 优化
   ⚪ 0% — 设计已完成，未开工

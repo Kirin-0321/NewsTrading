@@ -51,8 +51,9 @@ class MarketSummaryRenderer:
             summary.get("capital_flow") or {}
         ))
         parts.append("")
-        parts.append(self._render_sectors_top(
-            summary.get("sectors_top") or []
+        parts.append(self._render_sectors(
+            summary.get("sectors_top") or [],
+            summary.get("sectors_bottom") or [],
         ))
         parts.append("")
         parts.append(self._render_limit_ladder(
@@ -143,17 +144,53 @@ class MarketSummaryRenderer:
         )
         adv = breadth.get("advance")
         dec = breadth.get("decline")
+        unc = breadth.get("unchanged")
+        adv5 = breadth.get("advance_5")
+        dec5 = breadth.get("decline_5")
+        adv_pct = breadth.get("advance_pct")
+        total = breadth.get("total")
         if adv is not None or dec is not None:
-            lines.append(f"- 上涨 {_v(adv)} / 下跌 {_v(dec)}")
+            mid_bits: List[str] = [
+                f"上涨 **{_v(adv)}**",
+                f"下跌 **{_v(dec)}**",
+            ]
+            if unc is not None:
+                mid_bits.append(f"平 {_v(unc)}")
+            if total is not None:
+                mid_bits.append(f"样本 {_v(total)}")
+            line = " / ".join(mid_bits)
+            if adv_pct is not None:
+                line += f"（涨家数占比 {_fmt_pct_ratio(adv_pct)}）"
+            lines.append(f"- {line}")
+            if adv5 is not None or dec5 is not None:
+                lines.append(
+                    f"- 大涨(≥5%) **{_v(adv5)}** / "
+                    f"大跌(≤-5%) **{_v(dec5)}**"
+                )
 
         seal_rate = sentiment.get("seal_rate")
+        seal_rate_prev = sentiment.get("seal_rate_prev")
         promo = sentiment.get("promotion_rate")
         fail = sentiment.get("fail_rate")
+        prev_suffix = ""
+        if seal_rate_prev is not None:
+            prev_suffix = (
+                f"（昨日 {_fmt_pct_ratio(seal_rate_prev)}）"
+            )
         lines.append(
-            f"- 封板率 **{_fmt_pct_ratio(seal_rate)}** / "
+            f"- 封板率 **{_fmt_pct_ratio(seal_rate)}**{prev_suffix} / "
             f"晋级率 {_fmt_pct_ratio(promo)} / "
             f"炸板率 {_fmt_pct_ratio(fail)}"
         )
+        promo_detail = sentiment.get("promotion_detail") or {}
+        if promo_detail:
+            prev_u = promo_detail.get("prev_u_count")
+            still_u = promo_detail.get("today_still_u_count")
+            failed = promo_detail.get("today_failed_count")
+            lines.append(
+                f"- 晋级明细: 昨涨停 {_v(prev_u)} 只 → 今继续涨停 "
+                f"**{_v(still_u)}** 只 / 失败 {_v(failed)} 只"
+            )
 
         height = sentiment.get("max_height")
         stock = sentiment.get("max_stock")
@@ -179,42 +216,86 @@ class MarketSummaryRenderer:
             lines.append(f"- 南向资金净流入: {_fmt_num(south)} 亿")
         main = cf.get("main_net_yi")
         if main is not None:
-            lines.append(f"- 全市场主力净流入: {_fmt_num(main)} 亿")
+            src = cf.get("main_net_source")
+            note = f"（口径：{src}）" if src else ""
+            lines.append(
+                f"- 全市场主力净流入: **{_fmt_num(main)} 亿**{note}"
+            )
         return "\n".join(lines)
 
-    def _render_sectors_top(
-        self, sectors: Sequence[Dict[str, Any]]
+    def _render_sectors(
+        self,
+        top: Sequence[Dict[str, Any]],
+        bottom: Sequence[Dict[str, Any]],
     ) -> str:
-        lines: List[str] = ["## 四、板块涨幅 Top 10", ""]
-        if not sectors:
+        """板块强弱榜：Top N 涨幅 + Bottom N 跌幅 一节内分两表。"""
+        lines: List[str] = ["## 四、板块强弱榜", ""]
+
+        # ---- Top ----
+        cap_top = min(20, len(top))
+        lines.append(f"### 涨幅 Top {cap_top}")
+        if not top:
             lines.append("（无数据）")
-            return "\n".join(lines)
-        lines.append(
-            "| # | 板块 | 涨幅 | 5日累计 | 主力净流入(亿) | 涨停数 | 龙头 | 催化 |"
-        )
-        lines.append(
-            "|---|------|------|--------|--------------|------|------|------|"
-        )
-        for s in sectors[:10]:
-            leaders = s.get("leaders") or []
-            leader_str = "／".join(
-                _format_leader(le) for le in leaders[:3]
-            ) or EMPTY
-            catalysts = s.get("catalysts") or []
-            catalyst_str = "；".join(
-                str(c.get("text") if isinstance(c, dict) else c)
-                for c in catalysts[:2]
-            ) or EMPTY
+        else:
             lines.append(
-                f"| {_v(s.get('rank'))} "
-                f"| {_v(s.get('name'))} "
-                f"| {_fmt_pct(s.get('pct_chg'))} "
-                f"| {_fmt_pct(s.get('pct_chg_5d'))} "
-                f"| {_fmt_num(s.get('main_net_yi'))} "
-                f"| {_v(s.get('limit_up_count'))} "
-                f"| {leader_str} "
-                f"| {catalyst_str} |"
+                "| # | 板块 | 涨幅 | 5日累计 | "
+                "主力净流入(亿) | 涨停数 | 龙头 | 催化 |"
             )
+            lines.append(
+                "|---|------|------|--------|"
+                "--------------|------|------|------|"
+            )
+            for s in top[:cap_top]:
+                leaders = s.get("leaders") or []
+                leader_str = "／".join(
+                    _format_leader(le) for le in leaders[:3]
+                ) or EMPTY
+                catalysts = s.get("catalysts") or []
+                catalyst_str = "；".join(
+                    str(c.get("text") if isinstance(c, dict) else c)
+                    for c in catalysts[:2]
+                ) or EMPTY
+                lines.append(
+                    f"| {_v(s.get('rank'))} "
+                    f"| {_v(s.get('name'))} "
+                    f"| {_fmt_pct(s.get('pct_chg'))} "
+                    f"| {_fmt_pct(s.get('pct_chg_5d'))} "
+                    f"| {_fmt_num(s.get('main_net_yi'))} "
+                    f"| {_v(s.get('limit_up_count'))} "
+                    f"| {leader_str} "
+                    f"| {catalyst_str} |"
+                )
+
+        # ---- Bottom ----
+        cap_bot = min(10, len(bottom))
+        lines.append("")
+        lines.append(f"### 跌幅 Bottom {cap_bot}")
+        if not bottom:
+            lines.append("（无数据）")
+        else:
+            lines.append(
+                "| # | 板块 | 跌幅 | 5日累计 | "
+                "主力净流出(亿) | 跌停数 | 笨蛋 |"
+            )
+            lines.append(
+                "|---|------|------|--------|"
+                "--------------|------|------|"
+            )
+            for s in bottom[:cap_bot]:
+                laggards = s.get("laggards") or []
+                laggard_str = "／".join(
+                    _format_leader(le) for le in laggards[:3]
+                ) or EMPTY
+                lines.append(
+                    f"| {_v(s.get('rank'))} "
+                    f"| {_v(s.get('name'))} "
+                    f"| {_fmt_pct(s.get('pct_chg'))} "
+                    f"| {_fmt_pct(s.get('pct_chg_5d'))} "
+                    f"| {_fmt_num(s.get('main_net_yi'))} "
+                    f"| {_v(s.get('limit_down_count'))} "
+                    f"| {laggard_str} |"
+                )
+
         return "\n".join(lines)
 
     def _render_limit_ladder(
@@ -254,9 +335,16 @@ class MarketSummaryRenderer:
                 reverse=True,
             )[:5]
             for x in top5:
+                reasons = x.get("reasons") or []
+                reason_str = ""
+                if reasons:
+                    head = "；".join(str(r) for r in reasons[:2])
+                    extra = "" if len(reasons) <= 2 else f"… 等 {len(reasons)} 条"
+                    reason_str = f"，上榜原因：{head}{extra}"
                 lines.append(
                     f"  - {_v(x.get('name'))}（{_v(x.get('ts_code'))}）"
                     f"净买入 **{_fmt_num(x.get('net_amount_yi'))} 亿**"
+                    f"{reason_str}"
                 )
         famous = dt.get("famous_traders") or []
         if famous:
@@ -269,7 +357,28 @@ class MarketSummaryRenderer:
                     f"[{side}] {_v(f.get('stock'))} "
                     f"净额 {_fmt_num(f.get('net_buy_yi'))} 亿"
                 )
-        if not stocks and not famous:
+        others = dt.get("other_traders") or []
+        if others:
+            lines.append(
+                f"- 其他席位 Top {min(10, len(others))}（按 |净额| 排序）:"
+            )
+            for o in others[:10]:
+                side_raw = str(o.get("side") or "").lower()
+                side = "买" if side_raw == "buy" else "卖"
+                stock_label = (
+                    f"{o.get('stock_name')}({o.get('stock')})"
+                    if o.get("stock_name") else _v(o.get("stock"))
+                )
+                exalter = str(o.get("exalter") or "")
+                # 营业部名经常很长，截断显示
+                if len(exalter) > 22:
+                    exalter = exalter[:22] + "…"
+                lines.append(
+                    f"  - {exalter} "
+                    f"[{side}] {stock_label} "
+                    f"净额 {_fmt_num(o.get('net_buy_yi'))} 亿"
+                )
+        if not stocks and not famous and not others:
             lines.append("（今日龙虎榜暂无数据）")
         return "\n".join(lines)
 
@@ -287,10 +396,20 @@ class MarketSummaryRenderer:
         )
         for s in sorted_shocks[:15]:
             arrow = "↑" if str(s.get("status") or "").lower() == "up" else "↓"
+            # sector_pct_chg + sector_main_net_yi 由 service._enrich_market_shock
+            # 注入，命中不上的板块字段为 None，正常显示 —
+            pct = s.get("sector_pct_chg")
+            main = s.get("sector_main_net_yi")
+            tail_bits: List[str] = [f"共 {_v(s.get('shock_count'))} 只票"]
+            if pct is not None:
+                tail_bits.append(f"板块当日 {_fmt_pct(pct)}")
+            if main is not None:
+                tail_bits.append(f"主力净 {_fmt_num(main)} 亿")
+            tail = "（" + "／".join(tail_bits) + "）"
             lines.append(
                 f"- {_v(s.get('first_shock_time'))} "
                 f"{arrow} {_v(s.get('sector'))} "
-                f"（共 {_v(s.get('shock_count'))} 只票）"
+                f"{tail}"
             )
         return "\n".join(lines)
 
@@ -332,9 +451,22 @@ class MarketSummaryRenderer:
             lines.append("**缺失字段（前 10 条）**:")
             for g in gaps[:10]:
                 if isinstance(g, dict):
-                    lines.append(
-                        f"- `{g.get('field', '')}`: {g.get('reason', '')}"
-                    )
+                    field = g.get("field") or g.get("path") or ""
+                    reason = g.get("reason")
+                    if not reason:
+                        layer = g.get("layer")
+                        filled = g.get("filled_count")
+                        total = g.get("total_count")
+                        ratio = g.get("filled_ratio")
+                        bits = []
+                        if layer:
+                            bits.append(str(layer))
+                        if filled is not None and total is not None:
+                            bits.append(f"{filled}/{total}")
+                        if isinstance(ratio, (int, float)):
+                            bits.append(_fmt_pct_ratio(ratio))
+                        reason = " ".join(bits) or "（无原因）"
+                    lines.append(f"- `{field}`: {reason}")
                 else:
                     lines.append(f"- {g}")
         return "\n".join(lines)
@@ -408,13 +540,29 @@ def _format_leader(le: Any) -> str:
 
 
 def _format_ladder_item(item: Any) -> str:
+    """连板梯队单只股票渲染。
+
+    输出形如 ``泰坦股份[003036.SZ] 2板·量子科技·炸2次``，缺失字段静默跳过。
+    """
     if not isinstance(item, dict):
         return str(item)
     name = item.get("name") or ""
     code = item.get("code") or ""
     theme = item.get("theme") or ""
-    suffix = f"({theme})" if theme else ""
-    return f"{name}[{code}]{suffix}" if code else f"{name}{suffix}"
+    cons = item.get("cons_nums")
+    open_times = item.get("open_times")
+
+    extras: List[str] = []
+    if isinstance(cons, int) and cons >= 1:
+        extras.append(f"{cons}板")
+    if theme:
+        extras.append(str(theme))
+    if isinstance(open_times, int) and open_times > 0:
+        extras.append(f"炸{open_times}次")
+    suffix = (" " + "·".join(extras)) if extras else ""
+
+    head = f"{name}[{code}]" if code else name
+    return f"{head}{suffix}"
 
 
 __all__ = ["MarketSummaryRenderer"]

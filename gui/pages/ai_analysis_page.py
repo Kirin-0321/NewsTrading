@@ -25,6 +25,9 @@ class AIAnalysisPage(QWidget):
         super().__init__()
         self.worker = None
         self.last_report = None
+        # 仅在「真正成功填入数据」后置 True，避免每次切换 tab 都覆盖主人输入
+        # 而找不到数据 / dim_trade_calendar 空时下次 showEvent 仍会重试
+        self._summary_auto_filled_with_data = False
         self.init_ui()
 
     def init_ui(self):
@@ -103,6 +106,54 @@ class AIAnalysisPage(QWidget):
             self._refresh_db_stats()
         if hasattr(self, "template_combo"):
             self.load_template_list()
+        if hasattr(self, "summary_input"):
+            self._auto_fill_market_summary()
+
+    def _auto_fill_market_summary(self) -> None:
+        """summary_input 为空时，自动填入「最近一个已收盘交易日」的盘后总结。
+
+        触发：每次 showEvent。仅在两种情况下真正写入：
+            1) ``self._summary_auto_filled_with_data`` 还是 False（首次）
+            2) ``summary_input`` 当前内容为空（主人没手动填）
+
+        边界规则交给 ``last_settled_trade_date`` 处理：
+            * 下午 4 点前 → 候选日 = 昨天
+            * 下午 4 点后 → 候选日 = 今天
+            * 周末 / 节假日 → 由 ``dim_trade_calendar`` 自动回退到上一开市日
+
+        找不到数据时：不写入，仅更新 placeholder 提示主人去跑 ``tools/market_fetch.py``。
+        """
+        if self._summary_auto_filled_with_data:
+            return
+        if self.summary_input.toPlainText().strip():
+            return
+
+        try:
+            from gui.utils.market_db_helper import (
+                last_settled_trade_date,
+                get_cached_summary_md,
+            )
+        except Exception:  # noqa: BLE001
+            return
+
+        td = last_settled_trade_date()
+        if td is None:
+            self.summary_input.setPlaceholderText(
+                "未找到交易日历缓存，请先打开【盘后数据】页面拉一次数据，"
+                "或执行：python tools/market_fetch_backfill.py --days 7"
+            )
+            return
+
+        md = get_cached_summary_md(td)
+        if md:
+            self.summary_input.setPlainText(md)
+            self._summary_auto_filled_with_data = True
+        else:
+            self.summary_input.setPlaceholderText(
+                f"未找到 {td} 的盘后总结缓存。请先执行："
+                f"python tools/market_fetch.py {td}\n\n"
+                "也可手动输入盘后总结，AI 将结合新闻分析…"
+            )
 
     def create_config_group(self):
         """创建AI配置组"""

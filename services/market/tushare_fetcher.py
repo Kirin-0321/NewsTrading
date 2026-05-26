@@ -89,6 +89,9 @@ class FetchResult:
     #: kpl_list(prev_trade_date) 内存缓存，给 metrics.calc_promotion_rate 用
     kpl_prev_rows: List[Dict[str, Any]] = field(default_factory=list)
 
+    #: daily 接口拉到的全市场涨跌家数（M6 新增）
+    market_breadth: Dict[str, Any] = field(default_factory=dict)
+
 
 # ---------------------------------------------------------------------------
 # 主类
@@ -167,6 +170,7 @@ class TushareMarketFetcher:
             ("拉取龙虎榜机构 (top_inst)", self._fetch_top_inst),
             ("拉取财联社个股异动 (cls_stock_shock)", self._fetch_cls_stock_shock),
             ("拉取财联社板块异动 (cls_market_shock)", self._fetch_cls_market_shock),
+            ("拉取全市场涨跌家数 (daily)", self._fetch_market_breadth),
         ]
         for label, func in steps:
             progress(label)
@@ -215,6 +219,7 @@ class TushareMarketFetcher:
             "fact_top_inst",
             "fact_cls_stock_shock",
             "fact_cls_market_shock",
+            "fact_market_breadth",
         ]
         with self.db.connect() as conn:
             for t in tables:
@@ -832,7 +837,79 @@ class TushareMarketFetcher:
             )
         return len(payload)
 
-    # --- 12. dc_daily 5 日累计派生 ---
+    # --- 12. daily 全市场涨跌家数 ---
+
+    def _fetch_market_breadth(self, result: FetchResult) -> None:
+        """全市场涨/跌家数。
+
+        调 ``tushare.daily(trade_date=...)`` 一次（默认 6000 行上限，
+        A 股全市场 ~5400 只够用）。按 pct_chg 分桶聚合后写
+        ``fact_market_breadth`` 单行；本字段不需要历史明细，重拉即可。
+        """
+        try:
+            rows = self.client.call(
+                "daily",
+                params={"trade_date": result.trade_date},
+            )
+        except TushareError as exc:
+            result.warnings.append(f"daily(market_breadth): {exc}")
+            return
+        if not rows:
+            result.warnings.append(
+                f"daily({result.trade_date}) 返回空（节假日 / 接口异常）"
+            )
+            return
+
+        adv = dec = unc = adv5 = dec5 = total = 0
+        for r in rows:
+            pct = r.get("pct_chg")
+            if pct is None:
+                continue
+            try:
+                p = float(pct)
+            except (TypeError, ValueError):
+                continue
+            total += 1
+            if p > 0:
+                adv += 1
+                if p >= 5.0:
+                    adv5 += 1
+            elif p < 0:
+                dec += 1
+                if p <= -5.0:
+                    dec5 += 1
+            else:
+                unc += 1
+
+        if total <= 0:
+            result.warnings.append("daily 聚合后 total=0，跳过 market_breadth 入库")
+            return
+
+        adv_pct = round(adv / total, 4) if total > 0 else None
+        result.market_breadth = {
+            "advance": adv,
+            "decline": dec,
+            "unchanged": unc,
+            "advance_5": adv5,
+            "decline_5": dec5,
+            "advance_pct": adv_pct,
+            "total": total,
+        }
+        with self.db.connect() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO fact_market_breadth "
+                "(trade_date, advance, decline, unchanged, "
+                " advance_5, decline_5, advance_pct, total, raw_json) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    result.trade_date,
+                    adv, dec, unc, adv5, dec5, adv_pct, total,
+                    json.dumps(result.market_breadth, ensure_ascii=False),
+                ),
+            )
+        result.ingested["fact_market_breadth"] = 1
+
+    # --- 13. dc_daily 5 日累计派生 ---
 
     def _enrich_sector_5d_pct(
         self, result: FetchResult, *, top_n: int = 0

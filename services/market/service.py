@@ -309,6 +309,8 @@ class MarketSummaryService:
                     "market_shock_events": merge_stats.market_shock_events,
                     "conflicts": merge_stats.conflicts,
                 }
+                # market_shock JOIN fact_sector_daily 补 sector_pct_chg 等
+                self._enrich_market_shock(summary, td)
             else:
                 # tushare-only: 仍把 market_shock / regulation / catalysts
                 # 字段留空（merger 不接入）
@@ -443,6 +445,9 @@ class MarketSummaryService:
         # sectors_top
         sectors_top = self._read_sectors_top(td, top_sector_n, gaps)
 
+        # sectors_bottom（涨幅倒数 10，跌停股龙头）
+        sectors_bottom = self._read_sectors_bottom(td, 10, gaps)
+
         # dragon_tiger
         dragon_tiger = self._read_dragon_tiger(td)
 
@@ -462,6 +467,7 @@ class MarketSummaryService:
             "sentiment": sentiment,
             "capital_flow": capital_flow,
             "sectors_top": sectors_top,
+            "sectors_bottom": sectors_bottom,
             "limit_ladder": ladder,
             "dragon_tiger": dragon_tiger,
             "market_shock": [],
@@ -567,6 +573,24 @@ class MarketSummaryService:
                 "WHERE trade_date = ? AND limit_type = 'U'",
                 (td,),
             ).fetchall()
+            # T-1 涨停 / 炸板数 —— seal_rate_prev 用
+            prev_row = conn.execute(
+                "SELECT "
+                " SUM(CASE WHEN limit_type='U' THEN 1 ELSE 0 END) AS u_cnt, "
+                " SUM(CASE WHEN limit_type='Z' THEN 1 ELSE 0 END) AS z_cnt "
+                "FROM fact_limit_stock WHERE trade_date = ?",
+                (ptd,),
+            ).fetchone()
+            prev_u = int(prev_row["u_cnt"] or 0) if prev_row else 0
+            prev_z = int(prev_row["z_cnt"] or 0) if prev_row else 0
+
+            # 全市场涨跌家数（fact_market_breadth 由 daily 接口聚合入库）
+            mb_row = conn.execute(
+                "SELECT advance, decline, unchanged, "
+                "       advance_5, decline_5, advance_pct, total "
+                "FROM fact_market_breadth WHERE trade_date = ?",
+                (td,),
+            ).fetchone()
             kpl_dicts = [dict(r) for r in kpl_rows]
             null_cons_codes = [
                 r["ts_code"] for r in kpl_rows if r["cons_nums"] is None
@@ -608,9 +632,19 @@ class MarketSummaryService:
             "limit_up": u_cnt or None,
             "limit_down": d_cnt or None,
             "failed_limit": z_cnt or None,
-            "advance": None,
-            "decline": None,
+            "advance": int(mb_row["advance"]) if mb_row and mb_row["advance"] is not None else None,
+            "decline": int(mb_row["decline"]) if mb_row and mb_row["decline"] is not None else None,
+            "unchanged": int(mb_row["unchanged"]) if mb_row and mb_row["unchanged"] is not None else None,
+            "advance_5": int(mb_row["advance_5"]) if mb_row and mb_row["advance_5"] is not None else None,
+            "decline_5": int(mb_row["decline_5"]) if mb_row and mb_row["decline_5"] is not None else None,
+            "advance_pct": float(mb_row["advance_pct"]) if mb_row and mb_row["advance_pct"] is not None else None,
+            "total": int(mb_row["total"]) if mb_row and mb_row["total"] is not None else None,
         }
+        if mb_row is None:
+            gaps.append({
+                "field": "breadth.advance",
+                "reason": "fact_market_breadth 该日无数据（daily 接口未拉到 / 接口失败）",
+            })
         if not u_cnt:
             gaps.append({
                 "field": "breadth.limit_up",
@@ -640,10 +674,33 @@ class MarketSummaryService:
         promo_rate = calc_promotion_rate(
             kpl_dicts, fetch_result.kpl_prev_rows
         )
+        # 昨日封板率
+        seal_rate_prev = calc_seal_rate(prev_u, prev_z)
+        # 晋级率明细：T-1 涨停股在 T 仍涨停 / 没涨停
+        prev_codes = {
+            str(r.get("ts_code"))
+            for r in (fetch_result.kpl_prev_rows or [])
+            if r.get("ts_code")
+        }
+        today_u_codes = {
+            str(d.get("ts_code")) for d in kpl_dicts if d.get("ts_code")
+        }
+        still_u = len(prev_codes & today_u_codes)
+        prev_total = len(prev_codes)
+        promotion_detail = (
+            {
+                "prev_u_count": prev_total,
+                "today_still_u_count": still_u,
+                "today_failed_count": max(prev_total - still_u, 0),
+            }
+            if prev_total > 0
+            else None
+        )
         sentiment = {
             "seal_rate": seal_rate,
-            "seal_rate_prev": None,
+            "seal_rate_prev": seal_rate_prev,
             "promotion_rate": promo_rate,
+            "promotion_detail": promotion_detail,
             "fail_rate": fail_rate,
             "max_height": height if height > 0 else None,
             "max_stock": stock,
@@ -663,12 +720,39 @@ class MarketSummaryService:
         fetch_result: FetchResult,
         gaps: List[Dict[str, Any]],
     ) -> Dict[str, Any]:
+        """北向 + 主力资金。
+
+        ``main_net_yi`` 派生口径：SUM(fact_sector_daily.main_net_yi)
+        即「同花顺概念板块主力净流入合计」。注意同一只股可属多概念，
+        该数值仅作市场宏观风向参考，不等于个股层主力净流入合计。
+        ``main_net_source`` 字段标注口径以避免 AI 误解。
+        """
         with self.db.connect(readonly=True) as conn:
             row = conn.execute(
                 "SELECT actual_date, is_delayed, north_net_yi, south_net_yi "
                 "FROM fact_hsgt_daily WHERE trade_date = ?",
                 (td,),
             ).fetchone()
+            sec_row = conn.execute(
+                "SELECT SUM(main_net_yi) AS s, COUNT(*) AS n "
+                "FROM fact_sector_daily WHERE trade_date = ?",
+                (td,),
+            ).fetchone()
+
+        main_net_yi: Optional[float] = None
+        main_net_source: Optional[str] = None
+        if sec_row and sec_row["n"] and sec_row["s"] is not None:
+            main_net_yi = _round(sec_row["s"], 2)
+            main_net_source = (
+                f"sum_sector_daily(n={int(sec_row['n'])}; "
+                "注：同股属多概念存在重复)"
+            )
+        else:
+            gaps.append({
+                "field": "capital_flow.main_net_yi",
+                "reason": "fact_sector_daily 该日无数据，无法派生板块主力合计",
+            })
+
         if not row:
             gaps.append({
                 "field": "capital_flow.north_net_yi",
@@ -679,7 +763,8 @@ class MarketSummaryService:
                 "north_data_date": None,
                 "north_is_delayed": False,
                 "south_net_yi": None,
-                "main_net_yi": None,
+                "main_net_yi": main_net_yi,
+                "main_net_source": main_net_source,
             }
         return {
             "north_net_yi": _round(row["north_net_yi"], 2),
@@ -688,7 +773,8 @@ class MarketSummaryService:
             ),
             "north_is_delayed": bool(row["is_delayed"]),
             "south_net_yi": _round(row["south_net_yi"], 2),
-            "main_net_yi": None,
+            "main_net_yi": main_net_yi,
+            "main_net_source": main_net_source,
         }
 
     # --- sectors top N ---
@@ -761,6 +847,120 @@ class MarketSummaryService:
                     },
                 })
         return out
+
+    def _read_sectors_bottom(
+        self,
+        td: str,
+        bottom_n: int,
+        gaps: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """读取当日涨幅倒数 N 板块，派生 limit_down_count / laggards。
+
+        ``laggards`` = 同板块 ``fact_limit_stock.theme LIKE`` 命中的 D 股
+        按 ``pct_chg ASC, fd_amount_yi DESC`` 取前 3 只。
+        和 sectors_top 对称结构，便于 renderer 复用。
+        """
+        with self.db.connect(readonly=True) as conn:
+            rows = conn.execute(
+                "SELECT s.ts_code, s.pct_chg, s.main_net_yi, s.main_elg_yi, "
+                "       s.main_lg_yi, s.pct_chg_5d, "
+                "       s.rank_today, d.name "
+                "FROM fact_sector_daily s "
+                "LEFT JOIN dim_sector d ON d.ts_code = s.ts_code "
+                "WHERE s.trade_date = ? "
+                "ORDER BY s.pct_chg ASC NULLS LAST LIMIT ?",
+                (td, bottom_n),
+            ).fetchall()
+        if not rows:
+            gaps.append({
+                "field": "sectors_bottom",
+                "reason": "fact_sector_daily 该日无数据",
+            })
+            return []
+
+        out: List[Dict[str, Any]] = []
+        with self.db.connect(readonly=True) as conn:
+            for i, r in enumerate(rows, 1):
+                sector_name = str(r["name"] or "")
+                limit_down_count, laggards = self._derive_sector_laggards(
+                    conn, td, sector_name
+                )
+                out.append({
+                    "rank": i,
+                    "ts_code": str(r["ts_code"]),
+                    "name": sector_name,
+                    "pct_chg": safe_pct_chg(r["pct_chg"]),
+                    "pct_chg_5d": safe_pct_chg(r["pct_chg_5d"], bound=200.0),
+                    "limit_down_count": limit_down_count,
+                    "main_net_yi": _round(r["main_net_yi"], 2),
+                    "main_elg_yi": _round(r["main_elg_yi"], 2),
+                    "main_lg_yi": _round(r["main_lg_yi"], 2),
+                    "laggards": laggards,
+                    "field_sources": {
+                        "pct_chg": "tushare",
+                        "main_net_yi": "tushare",
+                        "limit_down_count": (
+                            "derived_from_limit_stock"
+                            if limit_down_count is not None else "none"
+                        ),
+                        "laggards": (
+                            "derived_from_limit_stock"
+                            if laggards else "none"
+                        ),
+                    },
+                })
+        return out
+
+    @staticmethod
+    def _derive_sector_laggards(
+        conn: Any,
+        trade_date: str,
+        sector_name: str,
+        *,
+        limit: int = 3,
+    ) -> Tuple[Optional[int], List[Dict[str, Any]]]:
+        """从 fact_limit_stock 按 theme LIKE 派生 (跌停数, 笨蛋股列表)。
+
+        和 _derive_sector_leaders 对称，只是 limit_type='D'，按 pct_chg ASC 排。
+        """
+        if not sector_name:
+            return (None, [])
+        try:
+            pattern = f"%{sector_name}%"
+            count_row = conn.execute(
+                "SELECT COUNT(*) FROM fact_limit_stock "
+                "WHERE trade_date = ? AND limit_type = 'D' "
+                "AND theme LIKE ?",
+                (trade_date, pattern),
+            ).fetchone()
+            limit_down_count = (
+                int(count_row[0]) if count_row and count_row[0] else None
+            )
+
+            laggard_rows = conn.execute(
+                "SELECT COALESCE(d.name, "
+                "         json_extract(l.raw_json, '$.name')) AS name, "
+                "       l.pct_chg, l.status "
+                "FROM fact_limit_stock l "
+                "LEFT JOIN dim_stock d ON d.ts_code = l.ts_code "
+                "WHERE l.trade_date = ? AND l.limit_type = 'D' "
+                "  AND l.theme LIKE ? "
+                "ORDER BY COALESCE(l.pct_chg, 0) ASC, "
+                "         COALESCE(l.fd_amount_yi, 0) DESC "
+                "LIMIT ?",
+                (trade_date, pattern, int(limit)),
+            ).fetchall()
+            laggards = [
+                {
+                    "name": str(r["name"] or ""),
+                    "pct_chg": r["pct_chg"],
+                    "status": r["status"],
+                }
+                for r in laggard_rows
+            ]
+            return (limit_down_count, laggards)
+        except Exception:  # noqa: BLE001
+            return (None, [])
 
     @staticmethod
     def _derive_sector_leaders(
@@ -959,6 +1159,51 @@ class MarketSummaryService:
                 out[code] = str(r["theme"] or "")
         return out
 
+    # --- market_shock enrichment ---
+
+    def _enrich_market_shock(
+        self, summary: Dict[str, Any], td: str
+    ) -> None:
+        """给 market_shock 时间线追加 sector_pct_chg / sector_main_net_yi。
+
+        匹配口径：``dim_sector.name`` 完全相等。CLS 板块名与同花顺概念名
+        可能有差异，匹配不上的事件仅保留原字段，不影响渲染。
+        """
+        shocks = summary.get("market_shock") or []
+        if not shocks:
+            return
+        sector_names = sorted({
+            str(s.get("sector"))
+            for s in shocks
+            if s.get("sector")
+        })
+        if not sector_names:
+            return
+        placeholders = ",".join("?" * len(sector_names))
+        with self.db.connect(readonly=True) as conn:
+            rows = conn.execute(
+                f"SELECT d.name, s.pct_chg, s.main_net_yi "
+                f"FROM fact_sector_daily s "
+                f"JOIN dim_sector d ON d.ts_code = s.ts_code "
+                f"WHERE s.trade_date = ? AND d.name IN ({placeholders})",
+                (td, *sector_names),
+            ).fetchall()
+        by_name = {str(r["name"]): r for r in rows}
+        matched = 0
+        for sh in shocks:
+            name = str(sh.get("sector") or "")
+            r = by_name.get(name)
+            if r is not None:
+                sh["sector_pct_chg"] = safe_pct_chg(r["pct_chg"])
+                sh["sector_main_net_yi"] = _round(r["main_net_yi"], 2)
+                matched += 1
+        # 记入 meta，方便观察匹配率
+        if shocks:
+            summary.setdefault("meta", {})["market_shock_match"] = {
+                "matched": matched,
+                "total": len(shocks),
+            }
+
     # --- dragon tiger ---
 
     def _read_dragon_tiger(self, td: str) -> Dict[str, Any]:
@@ -987,6 +1232,21 @@ class MarketSummaryService:
                 "ORDER BY ABS(t.net_buy_yi) DESC",
                 (td,),
             ).fetchall()
+            # 其他席位：未识别为知名游资的所有营业部 / 机构席位
+            #   口径 = (a.is_famous IS NULL OR a.is_famous = 0)；按 |净额| DESC
+            other_rows = conn.execute(
+                "SELECT t.ts_code, t.exalter, t.side, t.net_buy_yi, "
+                "       a.alias, a.is_famous, "
+                "       COALESCE(d.name, '') AS stock_name "
+                "FROM fact_top_inst t "
+                "LEFT JOIN dim_trader_alias a ON a.exalter = t.exalter "
+                "LEFT JOIN dim_stock d ON d.ts_code = t.ts_code "
+                "WHERE t.trade_date = ? "
+                "  AND (a.is_famous IS NULL OR a.is_famous = 0) "
+                "ORDER BY ABS(t.net_buy_yi) DESC "
+                "LIMIT 10",
+                (td,),
+            ).fetchall()
 
         stocks = []
         for r in agg_rows:
@@ -1011,9 +1271,21 @@ class MarketSummaryService:
                 "source": "alias_table",
             })
 
+        other_traders = []
+        for r in other_rows:
+            side_str = str(r["side"] or "")
+            other_traders.append({
+                "exalter": str(r["exalter"] or ""),
+                "stock": str(r["ts_code"] or ""),
+                "stock_name": str(r["stock_name"] or ""),
+                "side": side_str,
+                "net_buy_yi": _round(r["net_buy_yi"], 2),
+            })
+
         return {
             "stocks": stocks,
             "famous_traders": famous_traders,
+            "other_traders": other_traders,
         }
 
     # ==================================================================
