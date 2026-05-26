@@ -177,10 +177,12 @@ class TushareMarketFetcher:
                 _log.warning(msg, exc_info=True)
                 result.warnings.append(msg)
 
-        # 派生：top N 板块的 5 日累计涨幅
-        progress(f"派生 Top {top_sector_n} 板块 5 日累计…")
+        # 派生：全板块 5 日累计涨幅
+        # 旧版仅算 Top N（top_sector_n），但 dc_daily 接口本来就拉全板块，
+        # 写全量仅多数百次 UPDATE（毫秒级）→ GUI Top 20 / Bottom 10 都能用
+        progress("派生全板块 5 日累计…")
         try:
-            self._enrich_sector_5d_pct(result, top_n=top_sector_n)
+            self._enrich_sector_5d_pct(result, top_n=0)
         except Exception as exc:  # noqa: BLE001
             msg = f"派生 5 日累计失败: {exc}"
             _log.warning(msg, exc_info=True)
@@ -833,24 +835,32 @@ class TushareMarketFetcher:
     # --- 12. dc_daily 5 日累计派生 ---
 
     def _enrich_sector_5d_pct(
-        self, result: FetchResult, *, top_n: int
+        self, result: FetchResult, *, top_n: int = 0
     ) -> None:
-        """对 ``fact_sector_daily`` 中当日 Top N 板块，取 5 日累计涨幅写回。
+        """对 ``fact_sector_daily`` 当日板块，取 5 日累计涨幅写回。
 
-        策略：用单次 ``dc_daily`` 接口拿 ``[prev_5, trade_date]`` 窗口
-        所有 ts_code 的数据（Tushare 默认全板块全量），然后按 ts_code 计算。
-        实际 API 调用 1 次。
+        策略：dc_daily 接口本来就拉全板块全量，按 ts_code 算后批量 UPDATE。
+        实际 API 调用 1 次；UPDATE 行数 = 实际能算出 5 日涨幅的板块数（~500）。
+
+        Args:
+            result: FetchResult，必须含 trade_date。
+            top_n: 派生范围限制。
+                * ``top_n <= 0``（默认）→ 全板块都算（推荐，给 GUI Top 20 / Bottom 10
+                  都填上 pct_chg_5d，写库成本毫秒级）
+                * ``top_n > 0`` → 仅当日 Top N 板块（旧行为，保留向后兼容）
         """
-        with self.db.connect(readonly=True) as conn:
-            top_rows = conn.execute(
-                "SELECT ts_code FROM fact_sector_daily "
-                "WHERE trade_date = ? "
-                "ORDER BY pct_chg DESC NULLS LAST LIMIT ?",
-                (result.trade_date, top_n),
-            ).fetchall()
-        top_codes = [r[0] for r in top_rows]
-        if not top_codes:
-            return
+        top_codes: Optional[set] = None
+        if top_n and top_n > 0:
+            with self.db.connect(readonly=True) as conn:
+                top_rows = conn.execute(
+                    "SELECT ts_code FROM fact_sector_daily "
+                    "WHERE trade_date = ? "
+                    "ORDER BY pct_chg DESC NULLS LAST LIMIT ?",
+                    (result.trade_date, top_n),
+                ).fetchall()
+            top_codes = {r[0] for r in top_rows}
+            if not top_codes:
+                return
 
         # 估算 5 个交易日的自然日窗口（保险起见取 12 天，覆盖一个含小长假）
         from datetime import datetime, timedelta
@@ -869,15 +879,17 @@ class TushareMarketFetcher:
             result.warnings.append(f"dc_daily(派生): {exc}")
             return
 
-        # group by ts_code
         from collections import defaultdict
         from services.market.metrics import calc_sector_5d_pct
 
         by_code: Dict[str, List[dict]] = defaultdict(list)
         for r in rows:
             code = r.get("ts_code")
-            if isinstance(code, str) and code in top_codes:
-                by_code[code].append(r)
+            if not isinstance(code, str):
+                continue
+            if top_codes is not None and code not in top_codes:
+                continue
+            by_code[code].append(r)
 
         payload: List[Tuple[Any, ...]] = []
         for code, history in by_code.items():

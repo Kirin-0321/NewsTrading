@@ -188,7 +188,7 @@ class MarketSummaryPage(QWidget):
 
         self.tabs = QTabWidget()
         self.tabs.addTab(self._build_tab_overview(), "📊 总览")
-        self.tabs.addTab(self._build_tab_sectors(), "🏢 板块 Top 10")
+        self.tabs.addTab(self._build_tab_sectors(), "🏢 板块行情")
         self.tabs.addTab(self._build_tab_ladder(), "🚀 涨停 & 连板")
         self.tabs.addTab(self._build_tab_dragon(), "🐉 龙虎榜")
         self.tabs.addTab(self._build_tab_shock(), "⚡ 异动时间线")
@@ -551,6 +551,7 @@ class MarketSummaryPage(QWidget):
         wrap = QWidget()
         layout = QVBoxLayout(wrap)
         layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
 
         legend = QHBoxLayout()
         legend.setSpacing(12)
@@ -559,30 +560,32 @@ class MarketSummaryPage(QWidget):
         legend.addWidget(self._color_legend(_COLOR_AI, "AI 兜底"))
         legend.addWidget(self._color_legend(_COLOR_NONE, "未命中"))
         legend.addStretch()
+        legend.addWidget(QLabel(
+            "<span style='color:#8C8C8C;font-size:12px'>"
+            "（Top 11+/Bottom 板块 5 日列与催化均为空 — 后端只对 Top 10 注入）"
+            "</span>"
+        ))
         layout.addLayout(legend)
 
-        self.sector_table = QTableWidget()
-        self.sector_table.setColumnCount(len(self._SECTOR_COLS))
-        self.sector_table.setHorizontalHeaderLabels(
-            [c[0] for c in self._SECTOR_COLS]
-        )
-        for i, (_, w) in enumerate(self._SECTOR_COLS):
-            self.sector_table.setColumnWidth(i, w)
-        header = self.sector_table.horizontalHeader()
-        if header is not None:
-            header.setSectionResizeMode(
-                len(self._SECTOR_COLS) - 1, QHeaderView.Stretch
-            )
-        self.sector_table.verticalHeader().setVisible(False)
-        self.sector_table.setAlternatingRowColors(True)
-        self.sector_table.setSelectionBehavior(
-            QAbstractItemView.SelectRows
-        )
-        self.sector_table.setEditTriggers(
-            QAbstractItemView.NoEditTriggers
-        )
-        self.sector_table.setStyleSheet(TABLE_STYLE)
-        layout.addWidget(self.sector_table, 1)
+        split = QSplitter(Qt.Vertical)
+
+        # 上：涨幅 Top 20（前 10 含 cls/ai catalysts，11~20 由 GUI 直查补足）
+        top_group = QGroupBox("📈 涨幅 Top 20")
+        tg = QVBoxLayout(top_group)
+        self.sector_table = self._make_basic_table(self._SECTOR_COLS)
+        tg.addWidget(self.sector_table)
+        split.addWidget(top_group)
+
+        # 下：跌幅 Top 10（GUI 直查 fact_sector_daily）
+        bot_group = QGroupBox("📉 跌幅 Top 10")
+        bg = QVBoxLayout(bot_group)
+        self.sector_table_bottom = self._make_basic_table(self._SECTOR_COLS)
+        bg.addWidget(self.sector_table_bottom)
+        split.addWidget(bot_group)
+
+        split.setStretchFactor(0, 2)
+        split.setStretchFactor(1, 1)
+        layout.addWidget(split, 1)
         return wrap
 
     def _color_legend(self, color: QColor, text: str) -> QWidget:
@@ -1014,16 +1017,55 @@ class MarketSummaryPage(QWidget):
             self.meta_conflicts_label.setStyleSheet("color:#52C41A;")
 
     def _populate_sectors(self, summary: Dict[str, Any]) -> None:
-        from gui.utils.market_db_helper import query_sector_leaders
+        """填充板块 Tab 上下两块：Top 20（含后端 Top 10 + helper 补 11~20）/ Bottom 10。"""
+        from gui.utils.market_db_helper import query_sectors_extended
 
-        sectors = summary.get("sectors_top") or []
+        backend_top = summary.get("sectors_top") or []  # 后端 Top 10，含 cls/ai
         td = (
             (summary.get("meta") or {}).get("trade_date")
             or self._current_trade_date
             or ""
         )
 
-        self.sector_table.setRowCount(len(sectors))
+        # 取扩展榜单：Top 20 + Bottom 10（直查 fact_sector_daily）
+        ext = (
+            query_sectors_extended(td, top_n=20, bottom_n=10)
+            if td else {"top": [], "bottom": []}
+        )
+        # 合并 Top 20：后端 Top 10（保留 cls/ai catalysts）+ helper 补的 11~20
+        existing_codes = {
+            s.get("ts_code") for s in backend_top if s.get("ts_code")
+        }
+        extras_top = [
+            s for s in ext["top"]
+            if s.get("ts_code") and s.get("ts_code") not in existing_codes
+        ]
+        top_20 = (list(backend_top) + extras_top)[:20]
+        for i, s in enumerate(top_20, 1):
+            s["rank"] = i
+
+        bottom_10 = ext["bottom"]
+        for i, s in enumerate(bottom_10, 1):
+            s["rank"] = i
+
+        self._fill_sector_table(self.sector_table, top_20, td)
+        self._fill_sector_table(self.sector_table_bottom, bottom_10, td)
+
+    def _fill_sector_table(
+        self,
+        table: QTableWidget,
+        sectors: list,
+        trade_date: str,
+    ) -> None:
+        """通用板块表填充。
+
+        输入:
+            table       目标 QTableWidget（Top 20 表 或 Bottom 10 表）
+            sectors     sectors_top[] 同结构 list
+            trade_date  YYYYMMDD（传给 _format_sector_leaders 调 helper）
+        输出: 无（原地 mutate table）
+        """
+        table.setRowCount(len(sectors))
         for row, s in enumerate(sectors):
             pct = s.get("pct_chg")
             pct_5d = s.get("pct_chg_5d")
@@ -1034,18 +1076,13 @@ class MarketSummaryPage(QWidget):
             ts_code = str(s.get("ts_code") or "")
             main_net = s.get("main_net_yi")
 
-            # 板块名 + 代码合并显示
             name_cell = (
                 f"{name} [{ts_code}]" if name and ts_code else
                 name or ts_code or "—"
             )
-
-            # 龙头股 Top3 —— 后端 leaders 当前是空数组，用 helper 查 fact_limit_stock 自算
             leaders_text = self._format_sector_leaders(
-                name, td, fallback=s.get("leaders") or []
+                name, trade_date, fallback=s.get("leaders") or []
             )
-
-            # high_risk 自算（后端 high_risk 当前永远 None）
             risk_level, risk_bg, risk_tip = self._compute_high_risk(pct_5d)
 
             cells = [
@@ -1062,15 +1099,12 @@ class MarketSummaryPage(QWidget):
             for col, txt in enumerate(cells):
                 item = QTableWidgetItem(txt)
 
-                # 先按 high_risk 给所有列上行底色（最后一列后续会被 cls/ai 色覆盖）
                 if risk_bg is not None:
                     item.setBackground(QBrush(risk_bg))
 
-                # 板块名列：tooltip 显示 high_risk 详情
                 if col == 1 and risk_tip:
                     item.setToolTip(risk_tip)
 
-                # 涨幅 / 5 日涨幅着色
                 if col == 2:
                     c = _pct_color(pct)
                     if c is not None:
@@ -1096,7 +1130,6 @@ class MarketSummaryPage(QWidget):
                     except (TypeError, ValueError):
                         pass
 
-                # catalysts 列（最后一列）—— cls/ai 色块覆盖 high_risk 底色
                 if col == len(cells) - 1:
                     if src == "cls":
                         item.setBackground(QBrush(_COLOR_CLS))
@@ -1110,7 +1143,7 @@ class MarketSummaryPage(QWidget):
                         item.setBackground(QBrush(_COLOR_NONE))
                         item.setForeground(_COLOR_MUTED)
                         item.setToolTip("未命中：raw_news 中也找不到证据")
-                self.sector_table.setItem(row, col, item)
+                table.setItem(row, col, item)
 
     def _format_sector_leaders(
         self,

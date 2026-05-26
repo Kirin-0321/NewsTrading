@@ -354,6 +354,6 @@ class TaskDialog(QDialog):
             task["params"] = {
                 "mode": self.market_mode_combo.currentData() or "hybrid",
                 "force_refresh": self.market_force_check.isChecked(),
-                "top_sector_n": 10,
+                "top_sector_n": 20,
             }
         return task

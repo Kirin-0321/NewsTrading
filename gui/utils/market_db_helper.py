@@ -114,6 +114,146 @@ def query_sector_leaders(
         return []
 
 
+def query_sectors_extended(
+    trade_date: str,
+    *,
+    top_n: int = 20,
+    bottom_n: int = 10,
+) -> Dict[str, List[Dict[str, Any]]]:
+    """直查 fact_sector_daily 取当日涨幅 Top N + 跌幅 Top N。
+
+    用途:
+        后端 _read_sectors_top 默认只取 Top 10 进 summary，本函数为 GUI 提供
+        扩展榜单数据，供「Top 20 / Bottom 10」面板填充。
+
+    口径说明:
+        因为后端 _enrich_sector_5d_pct 只对当日 Top 10 算 pct_chg_5d，
+        本函数返回的 Top 11~N 及全部 Bottom 板块的 pct_chg_5d 通常为 None；
+        catalysts/catalysts_source 字段也保持空（未跑 cls/ai 注入）。
+        所以"扩展段"板块的 GUI 显示中：5 日列、high_risk 行底色、催化色块
+        都会自动走 placeholder 路径，这是预期行为。
+
+    输入:
+        trade_date  YYYYMMDD
+        top_n       涨幅榜返回前 N 名（默认 20）
+        bottom_n    跌幅榜返回前 N 名（默认 10）
+    输出:
+        {"top": [...], "bottom": [...]}
+        每条 dict 字段对齐 sectors_top[]：
+        rank / ts_code / name / pct_chg / pct_chg_5d / limit_up_count /
+        main_net_yi / main_elg_yi / main_lg_yi / leaders / catalysts /
+        catalysts_source / high_risk
+    """
+    if not trade_date:
+        return {"top": [], "bottom": []}
+
+    base_sql = (
+        "SELECT s.ts_code, s.pct_chg, s.main_net_yi, s.main_elg_yi, "
+        "       s.main_lg_yi, s.pct_chg_5d, "
+        "       s.rank_today, d.name "
+        "FROM fact_sector_daily s "
+        "LEFT JOIN dim_sector d ON d.ts_code = s.ts_code "
+        "WHERE s.trade_date = ? "
+    )
+
+    db = get_market_db()
+    try:
+        with db.connect(readonly=True) as conn:
+            top_rows = conn.execute(
+                base_sql
+                + "ORDER BY s.pct_chg DESC NULLS LAST LIMIT ?",
+                (trade_date, int(top_n)),
+            ).fetchall()
+            bottom_rows = conn.execute(
+                base_sql
+                + "ORDER BY s.pct_chg ASC NULLS LAST LIMIT ?",
+                (trade_date, int(bottom_n)),
+            ).fetchall()
+
+            def _normalize(rows) -> List[Dict[str, Any]]:
+                out = []
+                for i, r in enumerate(rows, 1):
+                    name = str(r["name"] or "")
+                    lu, leaders = _derive_sector_leaders(conn, trade_date, name)
+                    out.append({
+                        "rank": i,
+                        "ts_code": str(r["ts_code"] or ""),
+                        "name": name,
+                        "pct_chg": r["pct_chg"],
+                        "pct_chg_5d": r["pct_chg_5d"],
+                        "limit_up_count": lu,
+                        "main_net_yi": r["main_net_yi"],
+                        "main_elg_yi": r["main_elg_yi"],
+                        "main_lg_yi": r["main_lg_yi"],
+                        "leaders": leaders,
+                        "catalysts": [],
+                        "catalysts_source": "none",
+                        "high_risk": None,
+                    })
+                return out
+
+            return {
+                "top": _normalize(top_rows),
+                "bottom": _normalize(bottom_rows),
+            }
+    except Exception as exc:  # noqa: BLE001
+        _log.warning(
+            "query_sectors_extended 失败 td=%s: %s", trade_date, exc,
+        )
+        return {"top": [], "bottom": []}
+
+
+def _derive_sector_leaders(
+    conn: Any,
+    trade_date: str,
+    sector_name: str,
+    *,
+    limit: int = 3,
+) -> tuple:
+    """从 fact_limit_stock 按 theme LIKE 派生 (涨停数, leaders 列表)。
+
+    与 services.market.service._derive_sector_leaders 同口径，供 GUI
+    扩展段（Top 11~20 / Bottom 10）补全 limit_up_count 与 leaders 字段。
+    返回 leader dict 字段：name / pct_chg / status / cons_nums。
+    """
+    if not sector_name:
+        return (None, [])
+    try:
+        pattern = f"%{sector_name}%"
+        cnt = conn.execute(
+            "SELECT COUNT(*) FROM fact_limit_stock "
+            "WHERE trade_date = ? AND limit_type = 'U' AND theme LIKE ?",
+            (trade_date, pattern),
+        ).fetchone()
+        limit_up_count = int(cnt[0]) if cnt and cnt[0] else None
+
+        rows = conn.execute(
+            "SELECT COALESCE(d.name, "
+            "         json_extract(l.raw_json, '$.name')) AS name, "
+            "       l.pct_chg, l.status, l.cons_nums "
+            "FROM fact_limit_stock l "
+            "LEFT JOIN dim_stock d ON d.ts_code = l.ts_code "
+            "WHERE l.trade_date = ? AND l.limit_type = 'U' "
+            "  AND l.theme LIKE ? "
+            "ORDER BY COALESCE(l.cons_nums, 1) DESC, "
+            "         COALESCE(l.fd_amount_yi, 0) DESC "
+            "LIMIT ?",
+            (trade_date, pattern, int(limit)),
+        ).fetchall()
+        leaders = [
+            {
+                "name": str(r["name"] or ""),
+                "pct_chg": r["pct_chg"],
+                "status": r["status"],
+                "cons_nums": r["cons_nums"],
+            }
+            for r in rows
+        ]
+        return (limit_up_count, leaders)
+    except Exception:  # noqa: BLE001
+        return (None, [])
+
+
 def query_stock_names(ts_codes: List[str]) -> Dict[str, str]:
     """批量查 ts_code → name 映射。
 
@@ -140,5 +280,6 @@ def query_stock_names(ts_codes: List[str]) -> Dict[str, str]:
 __all__ = [
     "query_other_traders",
     "query_sector_leaders",
+    "query_sectors_extended",
     "query_stock_names",
 ]
