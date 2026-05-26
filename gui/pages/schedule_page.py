@@ -21,6 +21,7 @@ TASK_TYPE_LABELS = {
     "crawl_sync": "数据获取（爬取入库）",
     "clean_sync": "数据清理（AI清洗）",
     "analyze": "新闻分析",
+    "market_fetch": "盘后数据拉取",
 }
 
 
@@ -259,6 +260,17 @@ class TaskDialog(QDialog):
         self.hours_row_label = QLabel("分析时间窗口(小时):")
         form.addRow(self.hours_row_label, self.hours_spin)
 
+        # 盘后数据专用：模式 + 强制重拉
+        self.market_mode_combo = QComboBox()
+        self.market_mode_combo.addItem("hybrid（推荐）", "hybrid")
+        self.market_mode_combo.addItem("tushare-only（无 AI）", "tushare-only")
+        self.market_mode_row_label = QLabel("盘后数据模式:")
+        form.addRow(self.market_mode_row_label, self.market_mode_combo)
+
+        self.market_force_check = QCheckBox("无视缓存，强制重新获取")
+        self.market_force_row_label = QLabel("强制重拉:")
+        form.addRow(self.market_force_row_label, self.market_force_check)
+
         self.enabled_check = QCheckBox()
         self.enabled_check.setChecked(True)
         form.addRow("启用:", self.enabled_check)
@@ -283,16 +295,27 @@ class TaskDialog(QDialog):
         ttype = self.type_combo.currentData()
         is_crawl = ttype == "crawl_sync"
         is_analyze = ttype == "analyze"
+        is_market = ttype == "market_fetch"
         self.scroll_spin.setVisible(is_crawl)
         self.scroll_row_label.setVisible(is_crawl)
         self.wait_spin.setVisible(is_crawl)
         self.wait_row_label.setVisible(is_crawl)
         self.hours_spin.setVisible(is_analyze)
         self.hours_row_label.setVisible(is_analyze)
+        self.market_mode_combo.setVisible(is_market)
+        self.market_mode_row_label.setVisible(is_market)
+        self.market_force_check.setVisible(is_market)
+        self.market_force_row_label.setVisible(is_market)
         if is_crawl:
             idx = self.schedule_mode.findData("interval")
             if idx >= 0:
                 self.schedule_mode.setCurrentIndex(idx)
+        elif is_market:
+            # 盘后数据强烈建议每日 16:00 跑
+            idx = self.schedule_mode.findData("daily")
+            if idx >= 0:
+                self.schedule_mode.setCurrentIndex(idx)
+            self.time_edit.setTime(QTime(16, 0))
 
     def get_task(self):
         ttype = self.type_combo.currentData()
@@ -326,5 +349,11 @@ class TaskDialog(QDialog):
                 "time_range_hours": self.hours_spin.value(),
                 "template": "short_term",
                 "provider": "deepseek",
+            }
+        elif ttype == "market_fetch":
+            task["params"] = {
+                "mode": self.market_mode_combo.currentData() or "hybrid",
+                "force_refresh": self.market_force_check.isChecked(),
+                "top_sector_n": 10,
             }
         return task

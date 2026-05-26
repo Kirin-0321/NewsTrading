@@ -216,18 +216,32 @@ class AIEnricher:
         raw_news_text: Optional[str] = None,
     ) -> AIEnrichPatch:
         patch = AIEnrichPatch(trade_date=trade_date)
-        patch.sectors = self.enrich_sectors(
-            trade_date=trade_date,
-            unmatched_sectors=unmatched_sectors,
-            known_cls_plates=known_cls_plates,
-            market_kpi_text=market_kpi_text,
-            raw_news_text=raw_news_text,
-        )
-        patch.traders = self.enrich_traders(
-            unmatched_exalters=unmatched_exalters,
-            known_aliases=known_aliases,
-            trade_date=trade_date,
-        )
+        if self.enabled_sectors() and unmatched_sectors:
+            patch.sectors = self.enrich_sectors(
+                trade_date=trade_date,
+                unmatched_sectors=unmatched_sectors,
+                known_cls_plates=known_cls_plates,
+                market_kpi_text=market_kpi_text,
+                raw_news_text=raw_news_text,
+            )
+        else:
+            patch.sectors = AIEnrichPart(
+                prompt_id=DEFAULT_SECTORS_PROMPT_ID,
+                warnings=["sectors enrich disabled by config"]
+                if not self.enabled_sectors() else [],
+            )
+        if self.enabled_traders() and unmatched_exalters:
+            patch.traders = self.enrich_traders(
+                unmatched_exalters=unmatched_exalters,
+                known_aliases=known_aliases,
+                trade_date=trade_date,
+            )
+        else:
+            patch.traders = AIEnrichPart(
+                prompt_id=DEFAULT_TRADERS_PROMPT_ID,
+                warnings=["traders enrich disabled by config"]
+                if not self.enabled_traders() else [],
+            )
         return patch
 
     # ------------------------------------------------------------------
@@ -283,11 +297,20 @@ class AIEnricher:
             or tmpl.model_default
             or DEFAULT_MODEL
         )
+        # temperature / timeout / max_tokens：market_fetch 配置 >
+        # prompt 默认 > 模块默认
+        mf_cfg = self._market_fetch_config()
         temperature = (
-            tmpl.temperature_default
-            if tmpl.temperature_default is not None
-            else DEFAULT_TEMPERATURE
+            mf_cfg.get("temperature")
+            if mf_cfg.get("temperature") is not None
+            else (
+                tmpl.temperature_default
+                if tmpl.temperature_default is not None
+                else DEFAULT_TEMPERATURE
+            )
         )
+        timeout_sec = int(mf_cfg.get("timeout") or DEFAULT_TIMEOUT_SEC)
+        max_tokens = int(mf_cfg.get("max_tokens") or DEFAULT_MAX_OUTPUT_TOKENS)
 
         part.provider = provider
         part.model = model
@@ -300,9 +323,9 @@ class AIEnricher:
                 model=model,
                 system_text=system_text,
                 user_text=user_text,
-                temperature=temperature,
-                timeout_sec=DEFAULT_TIMEOUT_SEC,
-                max_output_tokens=DEFAULT_MAX_OUTPUT_TOKENS,
+                temperature=float(temperature),
+                timeout_sec=timeout_sec,
+                max_output_tokens=max_tokens,
             )
         except Exception as e:
             part.elapsed_ms = int((time.time() - t0) * 1000)
@@ -360,16 +383,46 @@ class AIEnricher:
             out = out.replace("{" + str(k) + "}", str(v))
         return out
 
-    def _cfg_market_fetch_value(self, key: str) -> Optional[str]:
+    def _market_fetch_config(self) -> Dict[str, Any]:
+        """读取 ``ai_config.get_market_fetch_config()`` 结果，缓存到实例。
+
+        老版 ``ai_config.py`` 没有这个方法时返回空 dict（一切走默认值）。
+        """
+        cached = getattr(self, "_mf_cfg_cache", None)
+        if cached is not None:
+            return cached
         getter = getattr(self.ai_config, "get_market_fetch_config", None)
-        if not callable(getter):
-            return None
-        try:
-            cfg = getter() or {}
-        except Exception:
-            return None
-        v = cfg.get(key)
+        cfg: Dict[str, Any] = {}
+        if callable(getter):
+            try:
+                cfg = dict(getter() or {})
+            except Exception as e:
+                _log.warning("get_market_fetch_config 调用失败: %s", e)
+                cfg = {}
+        self._mf_cfg_cache = cfg
+        return cfg
+
+    def _cfg_market_fetch_value(self, key: str) -> Optional[str]:
+        v = self._market_fetch_config().get(key)
         return str(v) if v else None
+
+    # ------------------------------------------------------------------
+    # 总开关
+    # ------------------------------------------------------------------
+
+    def enabled_sectors(self) -> bool:
+        cfg = self._market_fetch_config()
+        if cfg.get("enabled") is False:
+            return False
+        v = cfg.get("enable_sectors")
+        return True if v is None else bool(v)
+
+    def enabled_traders(self) -> bool:
+        cfg = self._market_fetch_config()
+        if cfg.get("enabled") is False:
+            return False
+        v = cfg.get("enable_traders")
+        return True if v is None else bool(v)
 
     # ------------------------------------------------------------------
     # 当日新闻拼接

@@ -102,9 +102,10 @@ python main.py
 | 数据管理 | 浏览库内统计、合并去重（语义去重） |
 | 新闻清洗 | 对未清洗增量做 AI keep/remove |
 | 数据导出 | 按时间范围导出 JSON / Markdown / TXT 到 `data/exports/` |
+| **📊 盘后数据** | Tushare + 财联社 + AI 兜底生成日盘后总结，写入 `data/market.db` |
 | AI 分析 | 从原始库或精选库生成报告，可选盘后总结、自动抽题材 |
 | 预测题材 | 查看 / 手动从报告抽取题材快照 |
-| 定时任务 | 管理 `crawl_sync` / `clean_sync` / `analyze` 调度 |
+| 定时任务 | 管理 `crawl_sync` / `clean_sync` / `analyze` / `market_fetch` 调度 |
 
 ### 典型日流程
 
@@ -127,6 +128,7 @@ python main.py
 | `crawl_sync` | 爬取并入库；`params.auto_clean: true` 时完成后自动清洗 |
 | `clean_sync` | 仅清洗未处理原始数据 |
 | `analyze` | 按时间窗口分析精选库（或 `source: raw`） |
+| `market_fetch` | 拉取 Tushare 行情 + CLS 异动，生成盘后总结入 `market.db` |
 
 支持 **每日定点**（`time`: `"09:00"`）或 **按小时间隔**（`interval_hours`: `1`）。
 
@@ -150,6 +152,97 @@ python main.py
   }
 }
 ```
+
+盘后数据定时示例（推荐每日 16:00，A 股收盘后约 30 分钟数据齐全）：
+
+```json
+{
+  "id": "uuid",
+  "name": "盘后数据拉取",
+  "type": "market_fetch",
+  "time": "16:00",
+  "enabled": true,
+  "params": {
+    "mode": "hybrid",
+    "force_refresh": false,
+    "top_sector_n": 10
+  }
+}
+```
+
+---
+
+## 盘后数据模块（`data/market.db`）
+
+独立的 SQLite 数据库，存放 Tushare 行情 + 财联社异动 + AI 兜底产出的当日盘后总结。
+
+### 数据来源与模式
+
+| 模式 | Tushare 11 接口 | CLS 异动 | AI 兜底 | 耗时 | 完整度 | 适用场景 |
+|------|:----:|:---:|:---:|:----:|:-----:|---------|
+| `tushare-only` | ✅ | ❌ | ❌ | ~10s | 60~75% | 网络差 / 抢速度 |
+| `hybrid`（推荐） | ✅ | ✅ | ✅ 仅未命中板块 | 30~60s | 90~95% | **日常用** |
+| `ai-full` | = hybrid | = hybrid | = hybrid | = hybrid | = hybrid | M5 起将启用 |
+
+### GUI 入口
+
+侧边栏「**📊 盘后数据**」：选交易日 + 模式 → 「🔄 获取」 → 7 个 Tab 全填充：
+
+- **📊 总览** — 6 张指数卡片 / 量能 / 北向 / 涨跌停 / 封板率 / 晋级率 / 最高板
+- **🏢 板块 Top 10** — 涨幅、资金流四档、催化（CLS 浅蓝 / AI 浅黄 / 未命中灰）
+- **🚀 涨停 & 连板** — QTreeWidget 四桶（≥4 / 3 / 2 / 首板）
+- **🐉 龙虎榜** — 个股净买 + 已识别游资席位（紫粉高亮）
+- **⚡ 异动时间线** — `cls_market_shock` 升序时间轴
+- **📝 Markdown** — compact 摘要（可直接 ➡️ 发送到 AI 分析）
+- **🔍 原始 JSON** — 完整 canonical summary
+
+### CLI 入口
+
+```bash
+# 最近一个交易日 hybrid 模式
+python tools/market_fetch.py
+
+# 指定日期 + 模式
+python tools/market_fetch.py 20260525 hybrid
+python tools/market_fetch.py 20260525 tushare-only
+```
+
+### AI 分析自动联动
+
+「AI 分析」页面手填的「盘后总结」框为空时，可在调用 `AnalysisService.analyze(auto_market=True)`
+让系统自动拉当日盘后并填入。失败仅写一行 progress，不阻断主分析。
+
+### 配置（`config/ai_config.json::market_fetch`）
+
+```json
+{
+  "market_fetch": {
+    "enabled": true,
+    "provider": "deepseek",
+    "model": "deepseek-v4-pro",
+    "temperature": 0.2,
+    "max_tokens": 2000,
+    "timeout": 90,
+    "enable_sectors": true,
+    "enable_traders": true
+  }
+}
+```
+
+- 设 `enable_sectors: false` → 关板块 AI 兜底（板块催化只走 CLS）
+- 设 `enable_traders: false` → 关游资 AI 识别（只读 `dim_trader_alias` 表）
+- 设 `enabled: false` → 完全关 AI 兜底，等同 `tushare-only`
+
+### `data/market.db` 表结构
+
+| 表 | 用途 |
+|----|------|
+| `fact_index_daily` / `fact_sector_daily` / `fact_limit_stock` 等 11 张 `fact_*` | 各 Tushare 接口的原始数据 + `raw_json` |
+| `fact_cls_stock_shock` / `fact_cls_market_shock` | 财联社异动原始数据 |
+| `market_summaries` | 当日 canonical JSON + compact Markdown + 完整度 |
+| `ai_enrich_patches` | AI 兜底产出的 patch（prompt_id / version / tokens） |
+| `dim_trader_alias` | 营业部全名 → 简称 / `is_famous` 映射，GUI 可编辑 |
+| `dim_trade_calendar` / `dim_sector` / `dim_stock` | 维度表，跨库 JOIN 用 |
 
 ---
 

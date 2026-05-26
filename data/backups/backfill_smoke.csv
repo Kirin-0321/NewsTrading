@@ -1,0 +1,4 @@
+trade_date,ok,mode,from_cache,completeness,elapsed_ms,api_call_count,wall_seconds,error
+20260522,1,hybrid,1,0.9545,19,20,0.02,
+20260525,1,hybrid,1,0.9545,16,21,0.02,
+20260526,1,hybrid,0,0.9091,148356,20,148.36,

@@ -80,5 +80,15 @@
     "temperature": 0.2,
     "max_tokens": 65536,
     "timeout": 1200
+  },
+  "market_fetch": {
+    "enabled": true,
+    "provider": "deepseek",
+    "model": "deepseek-v4-pro",
+    "temperature": 0.2,
+    "max_tokens": 2000,
+    "timeout": 90,
+    "enable_sectors": true,
+    "enable_traders": true
   }
 }

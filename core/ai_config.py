@@ -254,6 +254,59 @@ class AIConfig:
         cfg["max_tokens"] = max(configured_int, self.get_max_output_tokens(provider))
         return cfg
 
+    def get_market_fetch_config(self) -> Dict:
+        """获取盘后数据 AI 兜底配置。
+
+        作用域: ``services.market.ai_enricher`` 的板块/游资兜底调用。
+        当 ``ai_config.json`` 中没有 ``market_fetch`` 段时返回默认值；
+        ``ai_enricher`` 内部会按
+        ``market_fetch 配置 > provider 配置 > prompt 默认 > 全局默认``
+        的优先级择最终模型。
+
+        默认值：
+            - provider: deepseek
+            - model: deepseek-v4-pro（JSON 严格、不开 thinking 控本）
+            - temperature: 0.2（题材识别求稳）
+            - max_tokens: 2000（patch 输出体量小，不必拉满）
+            - timeout: 90（连同 service 整体不超 2 分钟）
+            - enable_sectors / enable_traders: True（可关 AI 兜底变成"CLS only"）
+        """
+        defaults = {
+            "enabled": True,
+            "provider": "deepseek",
+            "model": "deepseek-v4-pro",
+            "temperature": 0.2,
+            "max_tokens": 2000,
+            "timeout": 90,
+            "enable_sectors": True,
+            "enable_traders": True,
+        }
+        cfg = dict(defaults)
+        cfg.update(self.config.get("market_fetch", {}) or {})
+
+        def _to_int(v, fallback: int) -> int:
+            try:
+                return int(v) if v is not None else fallback
+            except (TypeError, ValueError):
+                return fallback
+
+        def _to_float(v, fallback: float) -> float:
+            try:
+                return float(v) if v is not None else fallback
+            except (TypeError, ValueError):
+                return fallback
+
+        cfg["max_tokens"] = _to_int(
+            cfg.get("max_tokens"), int(defaults["max_tokens"]),
+        )
+        cfg["timeout"] = _to_int(
+            cfg.get("timeout"), int(defaults["timeout"]),
+        )
+        cfg["temperature"] = _to_float(
+            cfg.get("temperature"), float(defaults["temperature"]),
+        )
+        return cfg
+
     def set_analysis_param(self, key: str, value):
         """设置分析参数"""
         if 'analysis_params' not in self.config:

@@ -4,6 +4,7 @@ GUI 与 Agent 共用此入口。
 """
 
 import json
+import logging
 import os
 import tempfile
 from dataclasses import dataclass, field
@@ -12,6 +13,8 @@ from typing import Callable, Dict, List, Literal, Optional
 
 from services.storage import CLEAN_CURATED, get_raw_store
 from core.ai_news_analyzer import AnalysisCancelledError
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -25,6 +28,8 @@ class AnalysisResult:
     cancelled: bool = False
     theme_count: int = 0
     theme_error: Optional[str] = None
+    report_id: Optional[int] = None
+    market_summary_used: bool = False
 
 
 class AnalysisService:
@@ -152,12 +157,34 @@ class AnalysisService:
                 out.report_path = result.get("report_file")
                 out.result_text = result.get("result")
                 out.time_range = result.get("time_range") or out.time_range
+                # M4.4 / M4.5 — 先入 ai_reports 索引，便于后续 Eval/回测
+                self._record_ai_report(
+                    out,
+                    provider=provider,
+                    template_id=template_id,
+                    market_trade_date=market_trade_date,
+                    auto_market_used=bool(
+                        market_summary and market_summary.strip()
+                    ),
+                )
                 self._maybe_extract_themes(
                     out,
                     progress_callback,
                     force=extract_themes,
                     cancel_check=cancel_check,
                 )
+                # 题材抽取若成功，回写 theme_extracted=1
+                if out.theme_count and out.report_path:
+                    try:
+                        from services.storage import get_ai_reports_store
+
+                        get_ai_reports_store().mark_theme_extracted(
+                            out.report_path, True
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            "ai_reports.mark_theme_extracted 失败: %s", e
+                        )
             else:
                 out.error = result.get("error", "分析失败")
 
@@ -168,6 +195,89 @@ class AnalysisService:
             out.error = str(e)
 
         return out
+
+    @staticmethod
+    def _record_ai_report(
+        out: AnalysisResult,
+        *,
+        provider: Optional[str],
+        template_id: Optional[str],
+        market_trade_date: Optional[str],
+        auto_market_used: bool,
+    ) -> None:
+        """把刚生成的 AI 报告索引化到 ``ai_reports`` 表（M4.4/M4.5）。
+
+        失败仅写 logger.warning，不影响主分析流程。
+        """
+        if not out.report_path:
+            return
+        try:
+            from core.ai_config import AIConfig
+            from core.prompt_loader import PromptError, get_loader
+            from services.storage import record_report
+        except ImportError as e:
+            logger.warning("ai_reports 索引模块缺失: %s", e)
+            return
+
+        # provider / model
+        provider = provider or "openai"
+        try:
+            cfg = AIConfig()
+            current_provider = provider or cfg.get_current_provider()
+            provider_cfg = cfg.get_provider_config(current_provider) or {}
+            model = str(provider_cfg.get("model") or "")
+        except Exception:
+            current_provider, model = provider, ""
+
+        # prompt_id / version
+        prompt_id = template_id or ""
+        prompt_version = ""
+        if prompt_id:
+            try:
+                tmpl = get_loader().get("analysis", prompt_id)
+                prompt_version = str(tmpl.version or "")
+            except PromptError:
+                pass
+            except Exception:
+                pass
+
+        # report_date 从 report_path 文件名 / 当前时间推
+        report_date = datetime.now().strftime("%Y-%m-%d")
+
+        # 时间范围
+        tr = out.time_range or {}
+        news_start = (str(tr.get("start") or "") or None)
+        news_end = (str(tr.get("end") or "") or None)
+
+        # 是否用了 market_summary
+        used_market_date = (
+            market_trade_date or "auto"
+        ) if auto_market_used else None
+        out.market_summary_used = auto_market_used
+
+        try:
+            rid = record_report(
+                file_path=out.report_path,
+                report_date=report_date,
+                provider=current_provider,
+                model=model or None,
+                prompt_category="analysis",
+                prompt_id=prompt_id or None,
+                prompt_version=prompt_version or None,
+                news_range_start=news_start,
+                news_range_end=news_end,
+                news_count=out.news_count or None,
+                used_market_date=used_market_date,
+                theme_extracted=False,
+            )
+            if rid:
+                out.report_id = rid
+                logger.info(
+                    "ai_reports 已索引 id=%s path=%s",
+                    rid, out.report_path,
+                )
+        except Exception as e:
+            logger.warning("ai_reports 写入失败: %s", e)
 
     @staticmethod
     def _auto_fetch_market_summary(
