@@ -254,7 +254,8 @@ class AIAnalysisPage(QWidget):
         template_data = config.get_template(template_id)
 
         # 内置模板编辑时提示另存为
-        is_builtin = template_id in ['default', 'conservative', 'aggressive']
+        from core.ai_config import BUILTIN_PROMPT_TEMPLATES
+        is_builtin = template_id in BUILTIN_PROMPT_TEMPLATES
         
         if is_builtin:
             reply = QMessageBox.question(
@@ -300,7 +301,8 @@ class AIAnalysisPage(QWidget):
             return
 
         # 内置模板不允许删除
-        if template_id in ['default', 'conservative', 'aggressive']:
+        from core.ai_config import BUILTIN_PROMPT_TEMPLATES
+        if template_id in BUILTIN_PROMPT_TEMPLATES:
             QMessageBox.warning(self, "提示", "内置模板不可删除")
             return
 

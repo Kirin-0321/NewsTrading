@@ -15,6 +15,8 @@
     - 默认 deepseek-v4-flash + temperature=0.2，分类任务降低随机性
     - stream=True + response_format=json_object：chunk 实时推 UI，避免 60-90s 假死
     - 4 级 JSON 容错：直接 loads → 正则提 {} → 截断修复 → 字符级救援
+    - Phase M0 起 prompt 从 prompts/theme_extraction/extract_themes.md 加载，
+      不再硬编码常量
 """
 
 import json
@@ -24,6 +26,7 @@ from datetime import datetime
 from typing import Callable, Dict, List, Optional, Tuple
 
 from core.ai_config import AIConfig, DEFAULT_MAX_OUTPUT_TOKENS
+from core.prompt_loader import PromptError, get_loader
 
 
 _REPORT_REF_HEADER = "## 📰 引用新闻详情"
@@ -36,62 +39,19 @@ _VALID_CATEGORY = {"科技AI", "新能源", "基建", "消费", "医药", "金�
 _VALID_ROLE = {"核心", "上游", "中游", "下游", "潜力", "边缘"}
 _VALID_RELATION = {"主因", "共振", "风险", "背景"}
 
-_SYSTEM_PROMPT = """你是一名股票题材分析助手。你的任务是阅读一份 A 股盘后分析报告（Markdown），把报告中提到的所有题材（板块/方向）抽取为结构化 JSON。
+_PROMPT_CATEGORY = "theme_extraction"
+_PROMPT_ID = "extract_themes"
 
-【字段规范】严格按以下 schema 输出，未知字段直接省略键名（不要填 null）：
 
-{
-  "themes": [
-    {
-      "theme_name": "题材名（必填，如 '具身智能/人形机器人'）",
-      "theme_category": "大类（科技AI/新能源/基建/消费/医药/金融/军工/周期/其他）",
-      "strength_score": 0-100 整数（必填，综合优先级与影响强度打分）,
-      "strength_level": "极强/强/中/弱（必填，对应🔴🟠🟡🟢）",
-      "priority_rank": 报告'板块优先级排序'中的序号（整数）,
-      "duration": "短期/中期/长期",
-      "expectation_gap": "高/中高/中/中低/低",
-      "sentiment": "利好/利空/中性（必填）",
-      "is_cold": 0 或 1（必填，钝化/冷处理题材填 1，如中东、黄金、霍尔木兹等）,
-      "reason": "1-3 句话核心逻辑（必填），融合：①利好/利空逻辑 ②催化事件，用'。'分隔",
-      "risk_note": "仅在题材确有明显风险时填写（短句）",
-      "stocks": [
-        {
-          "name": "股票中文名（必填）",
-          "code": "如 '601689.SH'（不确定则省略）",
-          "role": "核心/上游/中游/下游/潜力/边缘",
-          "reason": "入选原因"
-        }
-      ],
-      "news": ["新闻107", "新闻125"]
-    }
-  ]
-}
+def _load_extractor_prompts() -> Tuple[str, str]:
+    """从 prompts/theme_extraction/extract_themes.md 加载题材抽取 prompt。
 
-【news 字段格式】
-- 标准形式：字符串数组 ["新闻107", "新闻125"]，每项就是报告里的锚点 ref。
-- 不要输出 title 或新闻原文——脚本会通过报告底部反查数据库取原文。
-- 若必须标注关系类型，用扩展形式 [{"ref":"新闻107","rel":"主因"}]，否则一律用字符串数组。
-
-【抽取规则】
-1. 报告中"板块机会汇总""多逻辑共振""预期差挖掘""板块优先级排序""重点观察标的"等章节出现的所有题材都要抽
-2. 同一题材在不同章节重复出现时，合并为一条，信息取最完整版本
-3. 强度评分参考：🔴极强 80-100 / 🟠强 60-79 / 🟡中 40-59 / 🟢弱 0-39；并与多逻辑共振数、⭐数综合
-4. strength_score 与 strength_level 必须自洽（按上面区间）
-5. 风险提示、钝化题材也要抽，sentiment 填 '利空' 或 '中性'，is_cold 填 1（如适用）
-6. stocks 数组要尽可能完整：核心标的、产业链上下游、潜力挖掘标的都要收
-7. news 数组只填能直接看到锚点（如 [新闻107](#新闻107)）的，不要编造
-
-【输出要求】
-- 必须返回纯 JSON 对象（不要 markdown 代码块包裹，不要任何说明文字）
-- **未知字段直接省略键名，不要填 null**（重要：可省 token）
-- 不要编造报告中不存在的题材或标的"""
-
-_USER_PROMPT_TEMPLATE = """请抽取以下分析报告中的题材，按系统提示词中的 schema 输出 JSON。
-
-【分析报告全文】
-{report_text}
-
-请直接输出 JSON 对象，不要任何前后文字。"""
+    返回 (system_prompt, user_prompt_template)。
+    PromptLoader 异常会向上抛出，启动 validate_all 会提前发现这个问题。
+    """
+    loader = get_loader()
+    tmpl = loader.get(_PROMPT_CATEGORY, _PROMPT_ID)
+    return tmpl.system_prompt, tmpl.user_prompt_template
 
 
 class ThemeExtractor:
@@ -235,7 +195,14 @@ class ThemeExtractor:
                 base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
             client = OpenAI(api_key=api_key, base_url=base_url, timeout=http_timeout)
 
-        user_prompt = _USER_PROMPT_TEMPLATE.format(report_text=report_text)
+        try:
+            system_prompt, user_template = _load_extractor_prompts()
+        except PromptError as e:
+            raise RuntimeError(
+                f"题材抽取 prompt 加载失败 "
+                f"(prompts/{_PROMPT_CATEGORY}/{_PROMPT_ID}.md): {e}"
+            ) from e
+        user_prompt = user_template.format(report_text=report_text)
 
         # 注意：故意 *不* 加 response_format=json_object。
         # DeepSeek / OpenAI 在 JSON mode 下，服务端会先把完整 JSON 生成完
@@ -245,7 +212,7 @@ class ThemeExtractor:
         create_kwargs = {
             "model": self.model,
             "messages": [
-                {"role": "system", "content": _SYSTEM_PROMPT},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
             "max_tokens": self.max_tokens,

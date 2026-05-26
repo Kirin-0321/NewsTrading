@@ -19,6 +19,41 @@ from services.storage.database import init_database  # noqa: E402
 
 init_database()
 
+from core.prompt_loader import PromptLoader  # noqa: E402
+
+
+def _validate_prompts_on_startup() -> None:
+    """启动校验所有 prompts/ 文件。
+
+    发现错误时打印到 stderr 并写到 .huiye/_prompt_validation.txt 便于排查，
+    但不阻断 GUI 启动——prompt 故障下其它功能（爬虫/清洗）仍可用。
+    """
+    try:
+        loader = PromptLoader()
+        errors = loader.validate_all()
+    except Exception as e:  # noqa: BLE001
+        print(f"[启动校验] PromptLoader 初始化失败: {e}", file=sys.stderr)
+        return
+    if not errors:
+        return
+    print(
+        f"[启动校验] 发现 {len(errors)} 个 prompt 问题（不阻断启动）:",
+        file=sys.stderr,
+    )
+    for e in errors:
+        print(f"  - {e}", file=sys.stderr)
+    try:
+        log_path = os.path.join(_ROOT, ".huiye", "_prompt_validation.txt")
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        with open(log_path, "w", encoding="utf-8") as f:
+            for e in errors:
+                f.write(e + "\n")
+    except Exception:
+        pass
+
+
+_validate_prompts_on_startup()
+
 from PyQt5.QtWidgets import QApplication  # noqa: E402
 from PyQt5.QtGui import QFont, QIcon  # noqa: E402
 from gui.main_window import MainWindow  # noqa: E402

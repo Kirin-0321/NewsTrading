@@ -1,6 +1,13 @@
 """
 AI分析配置管理
 支持多种AI服务商的配置和管理
+
+【Phase M0 改造】：prompt 模板不再存储于 config/ai_config.json，
+改为读取 prompts/{category}/{id}.md 文件。本类对外的 get_prompt_template /
+save_template / delete_template 接口保持不变（依然返回老的 dict 格式），
+内部通过 core.prompt_loader.PromptLoader 提供持久化。
+
+迁移工具: ``tools/migrate_prompts_to_files.py``
 """
 
 import os
@@ -8,8 +15,23 @@ import json
 from typing import Dict, Optional
 
 from core.env_loader import load_dotenv
+from core.prompt_loader import (
+    PromptError,
+    PromptLoader,
+    PromptNotFoundError,
+)
 
 load_dotenv()
+
+# prompt 模板默认放在该 category 下；Phase M0 仅 analysis 一类
+_PROMPT_CATEGORY_ANALYSIS = "analysis"
+
+# 内置（迁移自老 ai_config.json）的 analysis prompt 模板 ID，
+# GUI 编辑/删除时按此清单判断"是否内置"。
+BUILTIN_PROMPT_TEMPLATES = frozenset({
+    "standard", "aggressive", "conservative", "value",
+    "short_term", "comprehensive", "default",
+})
 
 # DeepSeek V4 等大上下文模型：各阶段输出 token 下限（可通过 providers.*.max_tokens 上调）
 DEFAULT_MAX_OUTPUT_TOKENS = 65536
@@ -32,6 +54,10 @@ class AIConfig:
     def __init__(self):
         self.config_file = 'config/ai_config.json'
         self.config = self.load_config()
+        self._prompt_loader: Optional[PromptLoader] = None
+        # 首次运行时若 prompts/ 目录尚未生成（旧用户首次升级），
+        # 把 config 里残留的 prompt_templates 兜底落盘
+        self._bootstrap_prompts_if_needed()
 
     def load_config(self) -> Dict:
         """加载配置文件；若不存在则从 example 复制或生成默认配置"""
@@ -268,46 +294,153 @@ class AIConfig:
         }
         return models.get(provider, [])
 
-    # 提示词模板管理
+    # ========================================================
+    # 提示词模板管理（Phase M0 起改为 PromptLoader 文件存储）
+    # ========================================================
+
+    def _get_prompt_loader(self) -> PromptLoader:
+        """惰性持有 PromptLoader，所有 prompt 操作经此入口。"""
+        if self._prompt_loader is None:
+            self._prompt_loader = PromptLoader()
+        return self._prompt_loader
+
+    def _bootstrap_prompts_if_needed(self) -> None:
+        """旧用户首次升级时，prompts/analysis 可能尚未生成。
+
+        此时把 config 中残留的 prompt_templates（或内置默认）落到磁盘，
+        保证后续 get_prompt_template 一定能读到。
+        """
+        loader = self._get_prompt_loader()
+        try:
+            existing = loader.list_category(_PROMPT_CATEGORY_ANALYSIS)
+        except PromptError:
+            existing = []
+        if existing:
+            return
+
+        # 优先用残留的 prompt_templates（理论上瘦身后应为空，但保险起见）
+        legacy = self.config.get("prompt_templates") or {}
+        if not legacy:
+            legacy = self.get_default_prompt_templates()
+        if not legacy:
+            return
+
+        for prompt_id, tmpl in legacy.items():
+            try:
+                self._save_template_to_loader(
+                    prompt_id,
+                    tmpl.get("name") or prompt_id,
+                    tmpl.get("system_prompt") or "",
+                    tmpl.get("user_prompt_template") or "",
+                )
+            except Exception as e:  # noqa: BLE001
+                print(f"[AIConfig] bootstrap {prompt_id} 失败: {e}")
+        # 落盘后清理掉 config 内的残留，避免反复 bootstrap
+        if "prompt_templates" in self.config:
+            self.config.pop("prompt_templates", None)
+            self.save_config()
+
+    @staticmethod
+    def _quote_yaml(value: str) -> str:
+        s = "" if value is None else str(value)
+        if "\n" in s or "\r" in s or "\t" in s:
+            escaped = (
+                s.replace("\\", "\\\\")
+                .replace('"', '\\"')
+                .replace("\n", "\\n")
+                .replace("\r", "\\r")
+                .replace("\t", "\\t")
+            )
+            return f'"{escaped}"'
+        return "'" + s.replace("'", "''") + "'"
+
+    def _render_prompt_file(
+        self,
+        prompt_id: str,
+        name: str,
+        system_prompt: str,
+        user_prompt_template: str,
+    ) -> str:
+        """构造 prompts/analysis/{id}.md 文件全文。"""
+        from datetime import datetime
+        fm = [
+            "---",
+            f"id: {prompt_id}",
+            f"name: {self._quote_yaml(name)}",
+            f"category: {_PROMPT_CATEGORY_ANALYSIS}",
+            "version: '1.0'",
+            f"updated_at: {self._quote_yaml(datetime.now().strftime('%Y-%m-%d'))}",
+            "---",
+            "",
+        ]
+        body = []
+        if system_prompt and system_prompt.strip():
+            body.append("## SYSTEM")
+            body.append("")
+            body.append(system_prompt.rstrip())
+            body.append("")
+        body.append("## USER")
+        body.append("")
+        body.append((user_prompt_template or "").rstrip())
+        body.append("")
+        return "\n".join(fm + body)
+
+    def _save_template_to_loader(
+        self,
+        template_id: str,
+        name: str,
+        system_prompt: str,
+        user_prompt_template: str,
+    ) -> None:
+        loader = self._get_prompt_loader()
+        raw = self._render_prompt_file(
+            template_id, name, system_prompt, user_prompt_template
+        )
+        loader.save(_PROMPT_CATEGORY_ANALYSIS, template_id, raw)
+
     def get_prompt_templates(self) -> Dict:
-        """获取所有提示词模板"""
-        return self.config.get('prompt_templates', {})
+        """获取所有提示词模板（保持老返回格式 ``{id: {...}}``）。"""
+        loader = self._get_prompt_loader()
+        try:
+            items = loader.list_category(_PROMPT_CATEGORY_ANALYSIS)
+        except PromptError:
+            items = []
+        return {t.id: t.to_dict() for t in items}
 
     def get_template_names(self) -> list:
-        """获取模板名称列表"""
-        templates = self.get_prompt_templates()
-        return [(key, template.get('name', key)) 
-                for key, template in templates.items()]
+        """获取模板名称列表（保持老返回格式 ``[(id, name)]``）。"""
+        return [(t["id"], t.get("name") or t["id"])
+                for t in self.get_prompt_templates().values()]
 
     def get_template(self, template_id: str) -> Optional[Dict]:
-        """获取指定模板"""
-        templates = self.get_prompt_templates()
-        return templates.get(template_id)
+        """获取指定模板，找不到返回 None。"""
+        loader = self._get_prompt_loader()
+        try:
+            return loader.get(_PROMPT_CATEGORY_ANALYSIS, template_id).to_dict()
+        except PromptNotFoundError:
+            return None
+        except PromptError as e:
+            print(f"[AIConfig] 加载模板 {template_id} 失败: {e}")
+            return None
 
-    def save_template(self, template_id: str, name: str, 
-                     system_prompt: str, user_prompt_template: str):
-        """保存模板"""
-        if 'prompt_templates' not in self.config:
-            self.config['prompt_templates'] = {}
-        
-        self.config['prompt_templates'][template_id] = {
-            'name': name,
-            'system_prompt': system_prompt,
-            'user_prompt_template': user_prompt_template
-        }
-        self.save_config()
+    def save_template(
+        self,
+        template_id: str,
+        name: str,
+        system_prompt: str,
+        user_prompt_template: str,
+    ):
+        """新建或更新模板（保持老签名）。"""
+        self._save_template_to_loader(
+            template_id, name, system_prompt, user_prompt_template
+        )
 
     def delete_template(self, template_id: str) -> bool:
-        """删除模板"""
-        if template_id in ['default', 'conservative', 'aggressive']:
-            return False  # 不允许删除内置模板
-        
-        if 'prompt_templates' in self.config:
-            if template_id in self.config['prompt_templates']:
-                del self.config['prompt_templates'][template_id]
-                self.save_config()
-                return True
-        return False
+        """删除模板；内置模板不允许删。"""
+        if template_id in BUILTIN_PROMPT_TEMPLATES:
+            return False
+        loader = self._get_prompt_loader()
+        return loader.delete(_PROMPT_CATEGORY_ANALYSIS, template_id)
 
     def get_current_template(self) -> str:
         """获取当前使用的模板"""
@@ -688,16 +821,21 @@ class AIConfig:
         }
 
     def get_prompt_template(self, template_name: str) -> Dict:
-        """获取指定的提示词模板"""
-        templates = self.get_prompt_templates()
-        return templates.get(template_name, templates.get('standard'))
+        """获取指定模板；找不到时回退 ``standard``；都没有则返回空 dict。"""
+        tmpl = self.get_template(template_name)
+        if tmpl is not None:
+            return tmpl
+        fallback = self.get_template("standard")
+        return fallback or {}
 
     def save_prompt_template(self, template_name: str, template_data: Dict):
-        """保存提示词模板"""
-        if 'prompt_templates' not in self.config:
-            self.config['prompt_templates'] = {}
-        self.config['prompt_templates'][template_name] = template_data
-        self.save_config()
+        """保存模板（兼容 dict 风格调用方）。"""
+        self._save_template_to_loader(
+            template_name,
+            template_data.get("name") or template_name,
+            template_data.get("system_prompt") or "",
+            template_data.get("user_prompt_template") or "",
+        )
 
     def get_current_prompt_template(self) -> str:
         """获取当前使用的提示词模板"""
