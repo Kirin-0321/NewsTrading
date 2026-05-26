@@ -23,7 +23,7 @@
 - **SQLite 主库** — 原始 / 精选 / 剔除 / 题材预测分表存储，按时间范围查询
 - **三段流水线** — `crawl_sync` → `clean_sync` → `analyze`，GUI 与定时任务共用 `services/`
 - **多模型支持** — DeepSeek、OpenAI、通义千问、智谱、火山引擎（OpenAI 兼容接口）
-- **模型分流** — 分析默认 `deepseek-v4-pro`（思考模式）；清洗固定 `deepseek-v4-flash`
+- **模型统一** — 全链路默认 `deepseek-v4-pro`：分析走思考模式，清洗 / 题材抽取 / 盘后兜底走非思考模式
 - **增量爬取** — 按库内最新 `published_ts` 截断，遇重复自动停止
 - **题材预测** — 分析完成后可自动抽取题材、标的、新闻关联并入库
 - **定时调度** — 每日定点或按小时间隔执行爬取 / 清洗 / 分析
@@ -172,7 +172,7 @@ python main.py
 - `prompt_templates` — 标准 / 激进 / 稳健 / 价值 / 短线 五套分析模板
 - `theme_extraction` — 分析后自动抽题材：`enabled`、`auto_run`、`model`、`timeout`（秒，默认 1200，大报告 JSON 较慢时可调高）等
 
-分析使用配置中的 `model`；**清洗**在 provider 为 deepseek 时固定使用 `deepseek-v4-flash`（与配置中的 model 无关）。
+分析使用配置中的 `model`（思考模式）；**清洗 / 题材抽取**在 provider 为 deepseek 时固定使用 `deepseek-v4-pro` 非思考模式（与配置中的 model 无关）。
 
 ### 清洗规则（`config/cleaning_criteria.json`）
 
@@ -275,7 +275,7 @@ python -c "from PyQt5.QtWidgets import QApplication"
 1. 检查 `.env` 或 GUI 中 API Key 是否有效  
 2. 查看控制台 / 日志输出  
 3. 分析任务可尝试切换 `current_provider`  
-4. DeepSeek 旧别名 `deepseek-chat` 将于 2026-07-24 停用，请使用 `deepseek-v4-pro` / `deepseek-v4-flash`
+4. DeepSeek 旧别名 `deepseek-chat` 将于 2026-07-24 停用，统一使用 `deepseek-v4-pro`（默认）或 `deepseek-v4-flash`（成本敏感场景）
 
 ### database is locked
 

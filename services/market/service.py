@@ -25,7 +25,10 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from services.market.ai_enricher import AIEnricher, AIEnrichPatch
+from services.market.cls_enricher import CLSEnricher, CLSEnrichResult
 from services.market.market_db import MarketDB, get_market_db
+from services.market.merger import MarketSummaryMerger
 from services.market.metrics import (
     build_limit_ladder,
     calc_fail_rate,
@@ -36,12 +39,14 @@ from services.market.metrics import (
 )
 from services.market.renderer import MarketSummaryRenderer
 from services.market.trade_date import resolve_trade_date
+from services.market.trader_aliases import TraderAliasMatcher
 from services.market.tushare_client import TushareClient
 from services.market.tushare_fetcher import (
     INDEX_CODES,
     FetchResult,
     TushareMarketFetcher,
 )
+from services.market.validator import MarketSummaryValidator
 
 _log = logging.getLogger(__name__)
 
@@ -111,6 +116,11 @@ class MarketSummaryService:
         client: Optional[TushareClient] = None,
         fetcher: Optional[TushareMarketFetcher] = None,
         renderer: Optional[MarketSummaryRenderer] = None,
+        cls_enricher: Optional[CLSEnricher] = None,
+        ai_enricher: Optional[AIEnricher] = None,
+        merger: Optional[MarketSummaryMerger] = None,
+        validator: Optional[MarketSummaryValidator] = None,
+        trader_matcher: Optional[TraderAliasMatcher] = None,
     ) -> None:
         self.db = db or get_market_db()
         self.db.ensure_schema()
@@ -118,6 +128,11 @@ class MarketSummaryService:
         self._client = client
         self._fetcher = fetcher
         self.renderer = renderer or MarketSummaryRenderer()
+        self._cls_enricher = cls_enricher
+        self._ai_enricher = ai_enricher
+        self.merger = merger or MarketSummaryMerger()
+        self._validator = validator
+        self._trader_matcher = trader_matcher
 
     # ------------------------------------------------------------------
     # 懒属性
@@ -134,6 +149,30 @@ class MarketSummaryService:
         if self._fetcher is None:
             self._fetcher = TushareMarketFetcher(self.client, self.db)
         return self._fetcher
+
+    @property
+    def cls_enricher(self) -> CLSEnricher:
+        if self._cls_enricher is None:
+            self._cls_enricher = CLSEnricher(db=self.db)
+        return self._cls_enricher
+
+    @property
+    def ai_enricher(self) -> AIEnricher:
+        if self._ai_enricher is None:
+            self._ai_enricher = AIEnricher()
+        return self._ai_enricher
+
+    @property
+    def validator(self) -> MarketSummaryValidator:
+        if self._validator is None:
+            self._validator = MarketSummaryValidator()
+        return self._validator
+
+    @property
+    def trader_matcher(self) -> TraderAliasMatcher:
+        if self._trader_matcher is None:
+            self._trader_matcher = TraderAliasMatcher(db=self.db)
+        return self._trader_matcher
 
     # ==================================================================
     # 主入口
@@ -166,19 +205,21 @@ class MarketSummaryService:
         result = MarketSummaryResult(mode=mode)
         t0 = time.time()
 
-        # ---- 1) mode 校验 / 降级 ----
+        # ---- 1) mode 校验 ----
         if mode not in VALID_MODES:
             result.warnings.append(
                 f"未知 mode={mode!r}，降级为 tushare-only"
             )
             mode = "tushare-only"
             result.mode = mode
-        if mode != "tushare-only":
+        # M2 起 hybrid / ai-full 均走 CLS + AI 兜底完整路径
+        if mode == "ai-full":
+            # 当前 M2 阶段 ai-full 与 hybrid 行为一致，
+            # 后续 M3 可拓展为强制 AI 全量重写
             result.warnings.append(
-                f"mode={mode} 暂未在 Phase M1b 实现，降级为 tushare-only"
-                "（M2 阶段会接入 CLS / AI 兜底）"
+                "mode=ai-full 当前等价于 hybrid（M3 阶段会扩展）"
             )
-            mode = "tushare-only"
+            mode = "hybrid"
             result.mode = mode
 
         try:
@@ -230,10 +271,51 @@ class MarketSummaryService:
                 td, ptd, fetch_result, mode=mode, top_sector_n=top_sector_n
             )
 
+            # ---- 5b) hybrid: CLS + AI 兜底 + merger ----
+            ai_patch: Optional[AIEnrichPatch] = None
+            if mode == "hybrid":
+                progress("CLS 数据匹配…")
+                cls_result = self.cls_enricher.enrich(
+                    td, summary.get("sectors_top") or []
+                )
+
+                if _maybe_cancelled(cancel_check, result):
+                    return _finalize(result, t0)
+
+                progress("AI 兜底补全…")
+                ai_patch = self._run_ai_enrichment(
+                    td, summary, cls_result
+                )
+
+                # AI 输出的知名游资别名 → 入 dim_trader_alias
+                self._upsert_ai_traders(ai_patch)
+                # 重读 dragon_tiger，让 AI 新加的 alias 立即生效
+                summary["dragon_tiger"] = self._read_dragon_tiger(td)
+
+                progress("合并 & 校验…")
+                merge_stats = self.merger.merge(
+                    summary, cls_result, ai_patch
+                )
+                summary.setdefault("meta", {})["merge_stats"] = {
+                    "catalysts_from_cls": merge_stats.catalysts_from_cls,
+                    "catalysts_from_ai": merge_stats.catalysts_from_ai,
+                    "catalysts_unfilled": list(
+                        merge_stats.catalysts_unfilled
+                    ),
+                    "market_shock_events": merge_stats.market_shock_events,
+                    "conflicts": merge_stats.conflicts,
+                }
+            else:
+                # tushare-only: 仍把 market_shock / regulation / catalysts
+                # 字段留空（merger 不接入）
+                cls_result = None
+
             # ---- 6) 计算完整度 ----
-            quality = self._calc_quality(summary, gaps, fetch_result)
+            quality = self._calc_quality(
+                summary, gaps, fetch_result, mode=mode
+            )
             summary["quality"] = quality
-            summary["gaps"] = gaps
+            summary["gaps"] = quality.get("gaps") or gaps
             summary["meta"]["api_call_count"] = result.api_call_count
 
             # ---- 7) 渲染 compact MD ----
@@ -246,6 +328,10 @@ class MarketSummaryService:
                 td=td, ptd=ptd, mode=mode, summary=summary,
                 summary_md=md_text, result=result, fetch_result=fetch_result,
             )
+
+            # ---- 8b) AI patch 落 ai_enrich_patches ----
+            if ai_patch is not None:
+                self._persist_ai_patch(td, ai_patch)
 
             result.summary_json = summary
             result.summary_md = md_text
@@ -654,33 +740,207 @@ class MarketSummaryService:
         summary: Dict[str, Any],
         gaps: List[Dict[str, Any]],
         fetch_result: FetchResult,
+        *,
+        mode: str = "tushare-only",
+    ) -> Dict[str, Any]:
+        """完整度评分。
+
+        M2 起优先调用 ``MarketSummaryValidator``（schema-driven）；
+        失败/无 schema 时回退到 M1b 简化公式以保兼容。
+        """
+        # 1) 用新 validator
+        try:
+            report = self.validator.validate(summary)
+            data = report.to_dict()
+        except Exception as exc:  # noqa: BLE001
+            _log.warning("validator 失败，回退 M1b 简化公式: %s", exc)
+            data = self._calc_quality_legacy(summary)
+
+        warnings_extra = list(fetch_result.warnings or [])
+        if fetch_result.hsgt_is_delayed:
+            warnings_extra.append("北向资金为 T-1 日数据（T 日未公布）")
+        # 合并 validator 自身的 warnings
+        merged_warnings = list(data.get("warnings") or [])
+        for w in warnings_extra:
+            if w and w not in merged_warnings:
+                merged_warnings.append(w)
+        data["warnings"] = merged_warnings
+        data.setdefault("mode", mode)
+        return data
+
+    def _calc_quality_legacy(
+        self, summary: Dict[str, Any]
     ) -> Dict[str, Any]:
         l1_filled = sum(
-            1 for path in _REQUIRED_L1_PATHS if _path_filled(summary, path)
+            1 for p in _REQUIRED_L1_PATHS if _path_filled(summary, p)
         )
         l2_filled = sum(
-            1 for path in _REQUIRED_L2_PATHS if _path_filled(summary, path)
+            1 for p in _REQUIRED_L2_PATHS if _path_filled(summary, p)
         )
-        l1_total = len(_REQUIRED_L1_PATHS)
-        l2_total = len(_REQUIRED_L2_PATHS)
-        l1 = l1_filled / l1_total if l1_total else 0.0
-        l2 = l2_filled / l2_total if l2_total else 0.0
-        # L3 M1b 阶段不算（catalysts / famous_traders 留 M2）
-        l3 = 0.0
-        completeness = round(0.6 * l1 + 0.3 * l2 + 0.1 * l3, 4)
-
-        warnings = list(fetch_result.warnings)
-        if fetch_result.hsgt_is_delayed:
-            warnings.append("北向资金为 T-1 日数据（T 日未公布）")
-
+        l1 = l1_filled / max(len(_REQUIRED_L1_PATHS), 1)
+        l2 = l2_filled / max(len(_REQUIRED_L2_PATHS), 1)
+        completeness = round(0.6 * l1 + 0.3 * l2, 4)
         return {
             "completeness_score": completeness,
             "l1_complete": round(l1, 4),
             "l2_complete": round(l2, 4),
-            "l3_complete": l3,
-            "numeric_field_rate": None,  # M2 阶段统计
-            "warnings": warnings,
+            "l3_complete": 0.0,
+            "numeric_field_rate": None,
+            "warnings": [],
         }
+
+    # ==================================================================
+    # AI 兜底辅助
+    # ==================================================================
+
+    def _run_ai_enrichment(
+        self,
+        td: str,
+        summary: Dict[str, Any],
+        cls_result: CLSEnrichResult,
+    ) -> AIEnrichPatch:
+        """根据 cls_result 调 AIEnricher。失败返回空 patch。"""
+        unmatched_sectors = list(cls_result.unmatched_sectors)
+        known_plates = list(cls_result.plate_aggregates.keys())[:80]
+        unmatched_exalters = self._collect_unmatched_exalters(td, limit=30)
+        known_aliases = [
+            t.to_dict() for t in self.trader_matcher.list_famous()
+        ][:20]
+        kpi_text = self._format_market_kpi_for_ai(summary)
+        try:
+            return self.ai_enricher.enrich(
+                trade_date=td,
+                unmatched_sectors=unmatched_sectors,
+                known_cls_plates=known_plates,
+                market_kpi_text=kpi_text,
+                unmatched_exalters=unmatched_exalters,
+                known_aliases=known_aliases,
+            )
+        except Exception as exc:  # noqa: BLE001
+            _log.warning("AIEnricher 异常: %s", exc)
+            patch = AIEnrichPatch(trade_date=td)
+            patch.sectors.error = f"AIEnricher 异常: {exc}"
+            return patch
+
+    def _collect_unmatched_exalters(
+        self, td: str, *, limit: int = 30
+    ) -> List[str]:
+        """从 ``fact_top_inst`` 找出 dim_trader_alias 没匹配上的 exalter。"""
+        with self.db.connect(readonly=True) as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT t.exalter "
+                "FROM fact_top_inst t "
+                "LEFT JOIN dim_trader_alias a ON a.exalter = t.exalter "
+                "WHERE t.trade_date = ? "
+                "  AND t.exalter IS NOT NULL AND t.exalter <> '' "
+                "  AND a.exalter IS NULL "
+                "ORDER BY t.exalter "
+                "LIMIT ?",
+                (td, int(limit)),
+            ).fetchall()
+        return [str(r["exalter"]) for r in rows if r["exalter"]]
+
+    def _format_market_kpi_for_ai(self, summary: Dict[str, Any]) -> str:
+        ind = summary.get("indices") or {}
+        sh = ind.get("sh") or {}
+        sz = ind.get("sz") or {}
+        cyb = ind.get("cyb") or {}
+        breadth = summary.get("breadth") or {}
+        sentiment = summary.get("sentiment") or {}
+        cap = summary.get("capital_flow") or {}
+        turnover = ind.get("total_turnover_yi")
+        lines = [
+            "- 上证: {} / 深成: {} / 创业: {}".format(
+                _fmt_pct(sh.get("pct_chg")),
+                _fmt_pct(sz.get("pct_chg")),
+                _fmt_pct(cyb.get("pct_chg")),
+            ),
+            "- 两市成交: {} 亿".format(
+                _fmt_num(turnover) if turnover is not None else "-"
+            ),
+            "- 涨停 {} / 跌停 {} / 炸板 {} / 封板率 {}".format(
+                breadth.get("limit_up", "-"),
+                breadth.get("limit_down", "-"),
+                breadth.get("failed_limit", "-"),
+                _fmt_rate(sentiment.get("seal_rate")),
+            ),
+            "- 最高板 {} 连 / 北向 {} 亿".format(
+                sentiment.get("max_height", "-"),
+                _fmt_num(cap.get("north_net_yi")),
+            ),
+        ]
+        return "\n".join(lines)
+
+    def _upsert_ai_traders(self, ai_patch: AIEnrichPatch) -> None:
+        """把 AI 返回的 ``is_famous=true`` 的别名写入 ``dim_trader_alias``。"""
+        if ai_patch is None or not ai_patch.traders.patch:
+            return
+        raw = ai_patch.traders.patch.get("traders_aliases") or {}
+        if not isinstance(raw, dict):
+            return
+        count = 0
+        for exalter, val in raw.items():
+            if not isinstance(val, dict):
+                continue
+            if not val.get("is_famous"):
+                continue
+            alias = (val.get("alias") or "").strip()
+            if not alias:
+                continue
+            try:
+                self.trader_matcher.add(
+                    exalter=exalter,
+                    alias=alias,
+                    is_famous=True,
+                    notes=val.get("notes"),
+                )
+                count += 1
+            except Exception as exc:  # noqa: BLE001
+                _log.warning("upsert trader alias %r 失败: %s", exalter, exc)
+        if count:
+            _log.info("AI 新增/更新 %d 个知名游资别名", count)
+
+    def _persist_ai_patch(
+        self, td: str, ai_patch: AIEnrichPatch
+    ) -> None:
+        """把 ai_patch 写入 ``ai_enrich_patches``（按 part 分别落库）。"""
+        rows: List[tuple] = []
+        now = _now_iso()
+        for part_name, part in (
+            ("sectors", ai_patch.sectors),
+            ("traders", ai_patch.traders),
+        ):
+            if not part.patch and not part.error:
+                continue
+            payload = {
+                "part": part_name,
+                "patch": part.patch,
+                "error": part.error,
+                "warnings": part.warnings,
+            }
+            rows.append((
+                td,
+                part.provider,
+                part.model,
+                part.prompt_id,
+                part.prompt_version,
+                json.dumps(payload, ensure_ascii=False),
+                int(part.input_tokens or 0),
+                int(part.output_tokens or 0),
+                int(part.elapsed_ms or 0),
+                now,
+            ))
+        if not rows:
+            return
+        with self.db.connect() as conn:
+            conn.executemany(
+                "INSERT INTO ai_enrich_patches ("
+                " trade_date, provider, model, prompt_id, prompt_version,"
+                " patch_json, input_tokens, output_tokens, elapsed_ms,"
+                " created_at"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                rows,
+            )
 
     def _persist_summary(
         self,
@@ -813,6 +1073,38 @@ def _round(value: Any, digits: int) -> Optional[float]:
     if f is None:
         return None
     return round(f, digits)
+
+
+def _fmt_pct(v: Any) -> str:
+    """格式化 ``+1.23%``；None 返回 ``-``。"""
+    if v is None:
+        return "-"
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return "-"
+    return f"{f:+.2f}%"
+
+
+def _fmt_num(v: Any) -> str:
+    if v is None:
+        return "-"
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return "-"
+    return f"{f:.2f}"
+
+
+def _fmt_rate(v: Any) -> str:
+    """0~1 区间转 ``XX.X%``。"""
+    if v is None:
+        return "-"
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return "-"
+    return f"{f * 100:.1f}%"
 
 
 def _now_iso() -> str:

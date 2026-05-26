@@ -355,10 +355,11 @@ class NewsCleaner:
             client = OpenAI(api_key=api_key, base_url=base_url)
 
         # 场景分流（参见 .huiye/架构方案.md §13）:
-        # 清洗是分类任务，固定使用 deepseek-v4-flash 非思考模式
-        # —— 比 v4-pro 便宜 + 速度快；其他服务商沿用 config 中的 model。
+        # 清洗为分类任务，DeepSeek 系列固定走 v4-pro 非思考模式
+        # —— pro 在 JSON 严格性 + 长上下文上显著好于 flash，成本可接受；
+        # 其他服务商沿用 config 中的 model。
         if provider == "deepseek":
-            model = "deepseek-v4-flash"
+            model = "deepseek-v4-pro"
         else:
             model = provider_config.get("model") or {
                 "openai": "gpt-4",

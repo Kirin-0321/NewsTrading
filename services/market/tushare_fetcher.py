@@ -165,6 +165,8 @@ class TushareMarketFetcher:
             ("拉取北向资金 (moneyflow_hsgt)", self._fetch_hsgt),
             ("拉取龙虎榜个股 (top_list)", self._fetch_top_list),
             ("拉取龙虎榜机构 (top_inst)", self._fetch_top_inst),
+            ("拉取财联社个股异动 (cls_stock_shock)", self._fetch_cls_stock_shock),
+            ("拉取财联社板块异动 (cls_market_shock)", self._fetch_cls_market_shock),
         ]
         for label, func in steps:
             progress(label)
@@ -713,7 +715,122 @@ class TushareMarketFetcher:
             )
         return len(payload)
 
-    # --- 10. dc_daily 5 日累计派生 ---
+    # --- 10. cls_stock_shock（财联社涨停个股催化原因 + 板块映射） ---
+
+    def _fetch_cls_stock_shock(self, result: FetchResult) -> None:
+        rows = self.client.call(
+            "cls_stock_shock",
+            params={"trade_date": result.trade_date},
+        )
+        n = self._ingest_cls_stock_shock(rows, result.trade_date)
+        result.ingested["fact_cls_stock_shock"] = n
+
+    def _ingest_cls_stock_shock(
+        self, rows: Sequence[dict], trade_date: str
+    ) -> int:
+        if not rows:
+            return 0
+        payload: List[tuple] = []
+        seen: set = set()
+        for r in rows:
+            ts_code = r.get("ts_code")
+            shock_time = r.get("time") or ""
+            if not ts_code:
+                continue
+            key = (trade_date, ts_code, shock_time)
+            if key in seen:
+                continue
+            seen.add(key)
+            # plate 是 JSON 字符串，直接整字段透传（已是 str）
+            plate_raw = r.get("plate") or ""
+            payload.append(
+                (
+                    trade_date,
+                    ts_code,
+                    r.get("reason") or None,
+                    str(plate_raw) if plate_raw else None,
+                    shock_time or None,
+                    json.dumps(_strip_internal(r), ensure_ascii=False),
+                )
+            )
+        with self.db.connect() as conn:
+            conn.executemany(
+                "INSERT OR REPLACE INTO fact_cls_stock_shock "
+                "(trade_date, ts_code, reason, plate_json, "
+                " shock_time, raw_json) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                payload,
+            )
+        return len(payload)
+
+    # --- 11. cls_market_shock（财联社板块异动时间线） ---
+
+    def _fetch_cls_market_shock(self, result: FetchResult) -> None:
+        rows = self.client.call(
+            "cls_market_shock",
+            params={"trade_date": result.trade_date},
+        )
+        n = self._ingest_cls_market_shock(rows, result.trade_date)
+        result.ingested["fact_cls_market_shock"] = n
+
+    def _ingest_cls_market_shock(
+        self, rows: Sequence[dict], trade_date: str
+    ) -> int:
+        """同一板块同一 status 可能多次异动，按 (sector, status) 聚合:
+
+        * ``first_shock_time`` = 该 (sector, status) 最早一次 c_time
+        * ``shock_count``      = 该 (sector, status) 的事件数
+        """
+        if not rows:
+            return 0
+        from collections import defaultdict
+
+        agg: Dict[Tuple[str, str], Dict[str, Any]] = defaultdict(
+            lambda: {"first_time": None, "count": 0, "raw_first": None}
+        )
+        for r in rows:
+            name = (r.get("name") or "").strip()
+            status = (r.get("status") or "").strip().lower()
+            c_time = (r.get("c_time") or "").strip()
+            if not name or status not in ("up", "down"):
+                continue
+            entry = agg[(name, status)]
+            if entry["first_time"] is None or c_time < entry["first_time"]:
+                entry["first_time"] = c_time
+                entry["raw_first"] = r
+            entry["count"] += 1
+
+        payload: List[tuple] = []
+        for (name, status), entry in agg.items():
+            first_time = entry["first_time"]
+            # 提取 HH:MM:SS 部分（c_time 是 'YYYY-MM-DD HH:MM:SS'）
+            shock_time = (
+                first_time.split(" ")[-1] if first_time else None
+            )
+            payload.append(
+                (
+                    trade_date,
+                    name,
+                    shock_time,
+                    int(entry["count"]),
+                    status,
+                    json.dumps(
+                        _strip_internal(entry["raw_first"] or {}),
+                        ensure_ascii=False,
+                    ),
+                )
+            )
+        with self.db.connect() as conn:
+            conn.executemany(
+                "INSERT OR REPLACE INTO fact_cls_market_shock "
+                "(trade_date, sector_name, first_shock_time, "
+                " shock_count, status, raw_json) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                payload,
+            )
+        return len(payload)
+
+    # --- 12. dc_daily 5 日累计派生 ---
 
     def _enrich_sector_5d_pct(
         self, result: FetchResult, *, top_n: int

@@ -439,8 +439,8 @@ EvalRunner.run_theme_eval(cases)
 ### 6.6 LLM-as-Judge（`llm_judge.py`）
 
 **输入**: 报告全文 + rubric +（可选）gold 报告  
-**输出**: `{score: 1-10, reasoning: str, issues: []}`  
-**模型**: 默认 `deepseek-v4-flash`（非思考，降低成本）  
+**输出**: `{score: 1-10, reasoning: str, issues: []}`
+**模型**: 默认 `deepseek-v4-pro`（thinking=disabled，JSON 输出稳定）
 **注意**: Judge 结果波动大，仅作辅助指标，不能单独决定 prompt 晋升
 
 ---

@@ -5,7 +5,7 @@ category: theme_extraction
 version: '1.0'
 description: '从 AI 分析报告中抽取结构化题材列表，作为 JSON 输出'
 provider_default: deepseek
-model_default: deepseek-v4-flash
+model_default: deepseek-v4-pro
 temperature_default: 0.2
 ---
 

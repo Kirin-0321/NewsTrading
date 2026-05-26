@@ -480,7 +480,7 @@ class AIAnalysisPage(QWidget):
             "QCheckBox { font-size: 13px; color: #262626; padding-top: 4px; }"
         )
         self.extract_theme_check.setToolTip(
-            "勾选后分析报告生成完会调用另一个 AI（默认 deepseek-v4-flash）"
+            "勾选后分析报告生成完会调用另一个 AI（默认 deepseek-v4-pro）"
             "抽取结构化题材入 SQLite，可在【题材预测】页面查看。"
         )
         theme_row.addWidget(self.extract_theme_check)

@@ -218,9 +218,10 @@ class NewsCleaningPage(QWidget):
             
             # 检查是否配置了API Key
             api_key = config.get_api_key(current_provider)
-            # 清洗任务的实际模型（与 AI 分析模型分流，见 core/news_cleaner._call_provider）
+            # 清洗任务的实际模型（DeepSeek 系列固定走 v4-pro，
+            # 详见 core/news_cleaner._call_provider）
             cleaning_model = (
-                "deepseek-v4-flash"
+                "deepseek-v4-pro"
                 if current_provider == "deepseek"
                 else config.get_model(current_provider)
             )

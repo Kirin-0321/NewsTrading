@@ -1,0 +1,44 @@
+{
+  "version": "1.0",
+  "description": "MarketSummary 字段权重与完整度计算 schema（M2 引入）。layer: L1=硬数据 / L2=派生指标 / L3=语义字段。weight 越高在完整度评分中越重。",
+  "fields": {
+    "indices.sh.pct_chg":            {"layer": "L1", "weight": 3, "required": true},
+    "indices.sz.pct_chg":            {"layer": "L1", "weight": 3, "required": true},
+    "indices.cyb.pct_chg":           {"layer": "L1", "weight": 3, "required": true},
+    "indices.sh.amount_yi":          {"layer": "L1", "weight": 2, "required": true},
+    "indices.sz.amount_yi":          {"layer": "L1", "weight": 2, "required": true},
+
+    "breadth.limit_up":              {"layer": "L1", "weight": 3, "required": true},
+    "breadth.limit_down":            {"layer": "L1", "weight": 2, "required": true},
+    "breadth.failed_limit":          {"layer": "L1", "weight": 2, "required": true},
+
+    "sentiment.seal_rate":           {"layer": "L2", "weight": 3, "required": true},
+    "sentiment.fail_rate":           {"layer": "L2", "weight": 2, "required": false},
+    "sentiment.promotion_rate":      {"layer": "L2", "weight": 2, "required": true},
+    "sentiment.max_height":          {"layer": "L2", "weight": 2, "required": true},
+
+    "capital_flow.north_net_yi":     {"layer": "L1", "weight": 2, "required": false},
+    "capital_flow.south_net_yi":     {"layer": "L1", "weight": 1, "required": false},
+
+    "sectors_top[].pct_chg":         {"layer": "L1", "weight": 3, "required": true, "min_count": 5},
+    "sectors_top[].main_net_yi":     {"layer": "L1", "weight": 2, "required": true, "min_count": 5},
+    "sectors_top[].pct_chg_5d":      {"layer": "L2", "weight": 1, "required": false, "min_count": 5},
+    "sectors_top[].catalysts":       {"layer": "L3", "weight": 1, "required": false, "min_count": 5},
+
+    "limit_ladder.tiers":            {"layer": "L2", "weight": 2, "required": true},
+
+    "dragon_tiger.stocks":           {"layer": "L1", "weight": 1, "required": false},
+    "dragon_tiger.famous_traders":   {"layer": "L3", "weight": 1, "required": false},
+
+    "market_shock":                  {"layer": "L2", "weight": 1, "required": false}
+  },
+  "rules": {
+    "pct_chg_range":   {"min": -22.0, "max": 22.0, "note": "含创业板/科创板 20% + ST 5% 缓冲"},
+    "rate_range":      {"min": 0.0, "max": 1.0, "note": "封板率 / 晋级率 / 跌停率均在 [0,1]"},
+    "max_height_max":  20,
+    "warn_thresholds": {
+      "completeness_warn":  0.60,
+      "completeness_block": 0.30
+    }
+  }
+}

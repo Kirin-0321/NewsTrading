@@ -12,7 +12,7 @@
 
 设计要点:
     - 不复用 ai_news_analyzer._stream_chat：分类抽取不需要思考模式
-    - 默认 deepseek-v4-flash + temperature=0.2，分类任务降低随机性
+    - 默认 deepseek-v4-pro + temperature=0.2，分类任务降低随机性
     - stream=True + response_format=json_object：chunk 实时推 UI，避免 60-90s 假死
     - 4 级 JSON 容错：直接 loads → 正则提 {} → 截断修复 → 字符级救援
     - Phase M0 起 prompt 从 prompts/theme_extraction/extract_themes.md 加载，
@@ -68,7 +68,7 @@ class ThemeExtractor:
         self.config = config or AIConfig()
         ext_cfg = self.config.get_theme_extraction_config()
         self.provider = provider or ext_cfg.get("provider") or "deepseek"
-        self.model = model or ext_cfg.get("model") or "deepseek-v4-flash"
+        self.model = model or ext_cfg.get("model") or "deepseek-v4-pro"
         self.temperature = ext_cfg.get("temperature", temperature)
         self.max_tokens = int(ext_cfg.get("max_tokens", max_tokens))
         try:
