@@ -451,6 +451,9 @@ class MarketSummaryService:
         # dragon_tiger
         dragon_tiger = self._read_dragon_tiger(td)
 
+        # limit_sprint（冲刺涨停，三源融合 ths 独家泳池）
+        limit_sprint = self._read_limit_sprint(td)
+
         summary: Dict[str, Any] = {
             "schema_version": SCHEMA_VERSION,
             "meta": {
@@ -469,6 +472,7 @@ class MarketSummaryService:
             "sectors_top": sectors_top,
             "sectors_bottom": sectors_bottom,
             "limit_ladder": ladder,
+            "limit_sprint": limit_sprint,
             "dragon_tiger": dragon_tiger,
             "market_shock": [],
             "regulation": [],
@@ -564,11 +568,13 @@ class MarketSummaryService:
 
             # 取所有 U 股；不再用 cons_nums IS NOT NULL 过滤
             # SQL alias limit_up_time AS lu_time —— 对齐 build_limit_ladder 字段名
+            # 新增 lu_desc / limit_up_suc_rate / market_type / tag —— 三源融合
             kpl_rows = conn.execute(
                 "SELECT ts_code, "
                 "       json_extract(raw_json, '$.name') AS name, "
                 "       theme, status, cons_nums, "
-                "       limit_up_time AS lu_time, open_times "
+                "       limit_up_time AS lu_time, open_times, "
+                "       lu_desc, limit_up_suc_rate, market_type, tag "
                 "FROM fact_limit_stock "
                 "WHERE trade_date = ? AND limit_type = 'U'",
                 (td,),
@@ -1203,6 +1209,47 @@ class MarketSummaryService:
                 "matched": matched,
                 "total": len(shocks),
             }
+
+    # --- limit_sprint (冲刺涨停，ths 独家泳池) ---
+
+    def _read_limit_sprint(self, td: str) -> List[Dict[str, Any]]:
+        """读 fact_limit_sprint，按 pct_chg DESC 返回。
+
+        Returns:
+            形如 ``[{"code": "688585.SH", "name": "上纬新材",
+            "close": 16.5, "pct_chg": 18.18, "rise_rate": ...,
+            "turnover_rate": ..., "turnover_yi": ..., "free_float_yi": ...,
+            "lu_desc": ..., "market_type": "STAR"}, ...]``。
+            金额字段统一转为「亿元」单位。
+        """
+        with self.db.connect(readonly=True) as conn:
+            rows = conn.execute(
+                "SELECT ts_code, name, close, pct_chg, rise_rate, "
+                "       turnover_rate, turnover, free_float, "
+                "       lu_desc, market_type "
+                "FROM fact_limit_sprint WHERE trade_date = ? "
+                "ORDER BY pct_chg DESC",
+                (td,),
+            ).fetchall()
+        out: List[Dict[str, Any]] = []
+        for r in rows:
+            out.append({
+                "code": r["ts_code"],
+                "name": r["name"] or "",
+                "close": _round(r["close"], 2),
+                "pct_chg": safe_pct_chg(r["pct_chg"]),
+                "rise_rate": _round(r["rise_rate"], 2),
+                "turnover_rate": _round(r["turnover_rate"], 2),
+                "turnover_yi": _round(
+                    (r["turnover"] / 1e8) if r["turnover"] else None, 2
+                ),
+                "free_float_yi": _round(
+                    (r["free_float"] / 1e8) if r["free_float"] else None, 2
+                ),
+                "lu_desc": r["lu_desc"] or "",
+                "market_type": r["market_type"] or "",
+            })
+        return out
 
     # --- dragon tiger ---
 

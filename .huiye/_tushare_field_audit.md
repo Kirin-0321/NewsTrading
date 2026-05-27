@@ -694,5 +694,91 @@ def limit_ladder(kpl_list):
 
 ---
 
+## 10. limit_list_ths 字段块（2026-05-27 18:10 增补）
+
+> 三源融合 v1 实测，参考 [doc/updates/05-27-1810-涨停三源融合上线.md](../doc/updates/05-27-1810-涨停三源融合上线.md)
+
+### 10.1 接口定位
+
+- **同花顺涨跌停榜单接口**，文档：<https://tushare.pro/document/2?doc_id=355>
+- **历史范围**：从 20231101 起
+- **更新时机**：每天 16 点左右（**比 limit_list_d / kpl_list 早 ~12 小时**，是 T 日盘后唯一可见涨停数据的来源）
+- **积分要求**：8000+
+- **限速**：每分钟 500 次
+
+### 10.2 5 个泳池
+
+| limit_type 中文 | 5/26 行数 | 业务对应 |
+|----------------|-----------|---------|
+| 涨停池 | 64 | `fact_limit_stock.limit_type='U'`（主源）|
+| 跌停池 | 34 | `fact_limit_stock.limit_type='D'`（主源）|
+| 炸板池 | 30 | `fact_limit_stock.limit_type='Z'`（主源）|
+| 连扳池 | 28 | 涨停池子集，仅取 tag 字段更新（"7天5板"间断梯队）|
+| 冲刺涨停 | 17 | `fact_limit_sprint`（独立表，不属涨停股）|
+
+### 10.3 涨停池字段实测（5/26，64 行）
+
+| 字段 | 类型 | 命中率 | 业务含义 | 三源对账 |
+|------|------|-------|---------|---------|
+| `ts_code` | str | 100% | 股票代码 | 三源一致 |
+| `name` | str | 100% | 股票名称 | 三源一致 |
+| `price` | float | 100% | 收盘价 | = d.close ✅ |
+| `pct_chg` | float | 100% | 涨跌幅 % | = d.pct_chg ✅ |
+| `limit_amount` | float | 100% | 封单额（元）| = d.fd_amount × 1e8 ✅ |
+| `limit_order` | float | 100% | 封单量（股）| **同花顺独家**（kpl/d 无）|
+| `turnover` | float | 100% | 成交额（元）| = d.amount ✅ |
+| `turnover_rate` | float | 100% | 换手率 % | = d.turnover_ratio ✅ |
+| `free_float` | float | 100% | 实际流通市值（元）| = d.float_mv ✅ |
+| `status` | str | 100% | 涨停形态（"换手板"/"T字板"/"一字板"）| **vs kpl.status="3连板" 不同维度** |
+| `tag` | str | 100% | 高度 tag（"3天3板"/"7天5板"/"首板"）| **同花顺独家** ⭐ |
+| `lu_desc` | str | 100% | 涨停原因（"摘帽+智能安防+智慧停车+低空经济"）| **同花顺独家** ⭐ 文本质量碾压 kpl.theme |
+| `limit_up_suc_rate` | float | 97% | 一年封板率 0~1 | **同花顺独家** ⭐ |
+| `market_type` | str | 100% | HS/GEM/STAR 板块分类 | **同花顺独家** |
+| `open_num` | int | 56% | 炸板次数 | vs d.limit_times（100%）后者更全 |
+
+**默认不返回的字段**（需在 fields 参数指定）：`first_lu_time` / `last_lu_time` / `first_ld_time` / `last_ld_time` / `rise_rate` / `sum_float` / `lu_limit_order`。
+
+### 10.4 关键反一致性发现（重要！）
+
+实测 5/26：
+
+```
+limit_list_d  涨停 = 46 只  ← 长期漏算 18 只（28%）
+kpl_list      涨停 = 64 只
+limit_list_ths 涨停 = 64 只  ← 与 kpl 一致
+
+三方交集 = 46（即 limit_list_d 的 46 是 kpl/ths 的真子集）
+```
+
+→ **东财 `limit_list_d` 系统性漏 18 只**（多为 ST 股、ST 摘帽股、低价股），口径偏窄。三源融合后取 ths∪kpl 并集（实际 = ths 64 只）。
+
+### 10.5 冲刺涨停字段实测（5/26，17 行）
+
+| 字段 | 命中率 | 备注 |
+|------|-------|------|
+| `ts_code` / `name` | 100% | |
+| `price` / `pct_chg` | 100% | 涨幅通常 9.x%~19.x%（含科创/创业 20% 极限）|
+| `turnover_rate` / `turnover` / `free_float` | 100% | |
+| `market_type` | 100% | HS / GEM / STAR |
+| `rise_rate` | **0%** | Tushare 不返回此字段（接口 quirk）|
+| `lu_desc` | **0%** | 接口不返回（因为还没真涨停）|
+| `tag` / `status` | 100% | 但语义为"冲刺涨停"非高度 |
+
+### 10.6 三源融合字段优先级（COALESCE 顺序）
+
+| 字段 | 优先级 | 已落实 |
+|------|--------|--------|
+| `close` | ths > d | `tushare_fetcher._merge_ths_into_limit_stock` |
+| `pct_chg` | ths > d | 同上 |
+| `theme` | kpl 独家 | `_merge_kpl_into_limit_stock` |
+| `lu_desc` | ths 独家 | `_merge_ths_into_limit_stock` |
+| `tag` | ths 独家（连扳池版本最新）| `_merge_ths_lianban_tag` |
+| `cons_nums` | parse(kpl.status) > parse(ths.tag) > 历史递归 | `metrics.parse_cons_nums` |
+| `limit_up_time` | kpl.lu_time（带冒号）> d.first_time | 不变 |
+| `industry` | d 独家 | `_ingest_limit_stock` |
+| `total_mv` | d 独家 | 同上 |
+
+---
+
 *本审计是 [盘后数据自动化-施工方案.md](../doc/design/05-26-2126-盘后数据自动化施工方案.md) 的字段层依据。*  
 *施工时遇到任何字段不一致 → 以本审计为准；本审计未列的字段 → 不要瞎用。*

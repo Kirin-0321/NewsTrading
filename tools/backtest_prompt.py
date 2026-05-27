@@ -73,7 +73,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 _ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_ROOT))
@@ -140,6 +140,7 @@ def backtest_one(
     provider: Optional[str] = None,
     overwrite: bool = False,
     dry_run: bool = False,
+    progress_callback: Optional[Callable[..., None]] = None,
 ) -> BacktestResult:
     """对 ``template_id`` 在 ``trade_date`` 跑一次回测。
 
@@ -155,6 +156,11 @@ def backtest_one(
               文件后重跑（**会真的删数据**）
             * False → 跳过本次回测，error 提示传 --overwrite
         dry_run: 仅重建 snapshot 不调 LLM
+        progress_callback: 可选回调，签名兼容
+            ``callback(message: str, is_streaming: bool = False)``。
+            - 阶段日志：``callback("xxx")``
+            - LLM 流式 chunk：``callback(chunk, is_streaming=True)``
+            None = 不回传任何进度（CLI 默认 / 兼容旧调用）。
 
     防穿越：``news_end_dt`` 不能晚于 ``now``（避免回测"未来"）。
     """
@@ -215,6 +221,14 @@ def backtest_one(
             ),
         )
 
+    if progress_callback:
+        progress_callback(
+            f"重建历史快照 trade_date={trade_date} "
+            f"win=[{eff_start.strftime('%m-%d %H:%M')},"
+            f" {eff_end.strftime('%m-%d %H:%M')}) "
+            f"status={news_status or 'all'}"
+        )
+
     # 3. 重建快照
     try:
         snap = build_snapshot(
@@ -226,6 +240,11 @@ def backtest_one(
         )
     except SnapshotError as exc:
         return _make_result(ok=False, error=f"snapshot 失败: {exc}")
+    if progress_callback:
+        progress_callback(
+            f"快照重建完成：news_count={snap.news_count} "
+            f"market_summary_md_len={len(snap.market_summary_md or '')}"
+        )
 
     # 4. dry-run 提前返回
     if dry_run:
@@ -243,6 +262,10 @@ def backtest_one(
     # 6. 已存在 backtest 记录 → overwrite 则删旧重跑，否则跳过
     if _has_existing_backtest(template_id, trade_date):
         if overwrite:
+            if progress_callback:
+                progress_callback(
+                    "命中已存在 backtest 记录，开始覆盖删除..."
+                )
             stats = _delete_existing_backtest(template_id, trade_date)
             overwrite_stats["overwritten"] = True
             overwrite_stats["deleted_reports"] = stats["ai_reports"]
@@ -254,6 +277,12 @@ def backtest_one(
                 stats["ai_reports"], stats["theme_predictions"],
                 stats["md_files"],
             )
+            if progress_callback:
+                progress_callback(
+                    f"已清理：ai_reports={stats['ai_reports']} "
+                    f"themes={stats['theme_predictions']} "
+                    f"md={stats['md_files']}"
+                )
         else:
             return _make_result(
                 ok=True, snap_news_count=snap.news_count, skipped=True,
@@ -272,6 +301,7 @@ def backtest_one(
             news_end_dt=snap.news_end_dt,
             snap_market_md=snap.market_summary_md,
             provider=provider,
+            progress_callback=progress_callback,
         )
     except Exception as exc:  # noqa: BLE001
         return _make_result(
@@ -298,6 +328,7 @@ def _run_analyze_and_mark_backtest(
     news_end_dt: datetime,
     snap_market_md: Optional[str],
     provider: Optional[str],
+    progress_callback: Optional[Callable[..., None]] = None,
 ) -> tuple[Optional[str], int]:
     """调 AnalysisService 跑一次分析 + 重命名 + 标记 is_backtest=1。
 
@@ -330,9 +361,14 @@ def _run_analyze_and_mark_backtest(
         market_summary=snap_market_md,
         auto_market=False,
         extract_themes=True,
+        progress_callback=progress_callback,
     )
     if not res.ok or not res.report_path:
         raise RuntimeError(res.error or "analyze 返回 ok=False")
+    if progress_callback:
+        progress_callback(
+            f"标记 is_backtest=1：rename → _backtest_{trade_date}"
+        )
 
     old_path_abs = str(res.report_path)
     old_path_rel = _to_relative_posix(old_path_abs)
@@ -569,6 +605,13 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                    help="覆盖已存在的 backtest md")
     p.add_argument("--dry-run", action="store_true",
                    help="仅重建 snapshot 不调 LLM")
+    p.add_argument(
+        "--verbose", action="store_true",
+        help=(
+            "实时打印 LLM 流式输出（每 64 个 chunk 一个点）+ 阶段日志；"
+            "适合人工盯着看；workers>1 时建议关闭，避免输出交错"
+        ),
+    )
     return p.parse_args(argv)
 
 
@@ -625,6 +668,24 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     results: List[BacktestResult] = []
 
+    # --verbose: 阶段日志整行打印；LLM/题材抽取 chunk 每 64 个累计一个点
+    # 串行打印安全，workers>1 时输出会交错（主人自行承担）
+    verbose_cb: Optional[Callable[..., None]] = None
+    if args.verbose:
+        _chunk_state = {"n": 0}
+
+        def verbose_cb(message: str, is_streaming: bool = False):  # noqa: E306
+            if is_streaming:
+                _chunk_state["n"] += 1
+                if _chunk_state["n"] % 64 == 0:
+                    sys.stdout.write(".")
+                    sys.stdout.flush()
+            else:
+                if _chunk_state["n"] > 0:
+                    sys.stdout.write("\n")
+                    _chunk_state["n"] = 0
+                print(f"  [stage] {message}", flush=True)
+
     def _run(t, d) -> BacktestResult:
         return backtest_one(
             t, d,
@@ -634,6 +695,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             provider=args.provider,
             overwrite=args.overwrite,
             dry_run=args.dry_run,
+            progress_callback=verbose_cb,
         )
 
     t_all = time.perf_counter()

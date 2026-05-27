@@ -43,6 +43,7 @@ from pathlib import Path
 from typing import Optional
 
 from PyQt5.QtCore import QDate, QDateTime, Qt
+from PyQt5.QtGui import QTextCursor
 from PyQt5.QtWidgets import (
     QCheckBox, QComboBox, QDateEdit, QDateTimeEdit, QGroupBox,
     QHBoxLayout, QHeaderView, QLabel, QMessageBox, QPushButton,
@@ -244,7 +245,20 @@ class ManualBacktestPage(QWidget):
         return group
 
     def _build_md_group(self) -> QGroupBox:
-        group = QGroupBox("📄 报告 md 预览（最多 8000 字）")
+        """报告 md 预览区，内部垂直切分：
+
+        ┌── toolbar：status_label + 📂 打开 md ───┐
+        ├── QSplitter(Qt.Vertical) ───────────────┤
+        │   上：🤖 AI 流式输出（chunk 实时粘连）   │
+        │   下：📄 完成后报告 md 预览              │
+        └─────────────────────────────────────────┘
+
+        2026-05-27 新增上半流式区：LLM 分析 chunk 与题材抽取 JSON chunk
+        共用同一个 ``stream_browser``，第二阶段开始时插一行
+        ``--- 题材抽取 JSON ---`` 分隔（见 :meth:`_append_progress` 内的
+        启发式判断）。
+        """
+        group = QGroupBox("📄 报告预览 / 🤖 AI 流式输出")
         layout = QVBoxLayout(group)
 
         toolbar = QHBoxLayout()
@@ -259,9 +273,39 @@ class ManualBacktestPage(QWidget):
         toolbar.addWidget(self.open_md_btn)
         layout.addLayout(toolbar)
 
+        inner_split = QSplitter(Qt.Vertical)
+
+        # 上半：AI 流式输出（chunk 粘连写入）
+        stream_box = QWidget()
+        stream_layout = QVBoxLayout(stream_box)
+        stream_layout.setContentsMargins(0, 0, 0, 0)
+        stream_layout.setSpacing(4)
+        stream_layout.addWidget(
+            QLabel("🤖 AI 实时输出（流式，分析 → 题材抽取 共用）：")
+        )
+        self.stream_browser = QTextBrowser()
+        self.stream_browser.setStyleSheet(
+            TEXTBROWSER_STYLE
+            + "QTextBrowser { font-family: 'Consolas','Courier New',"
+            "monospace; font-size: 12px; color: #595959; }"
+        )
+        stream_layout.addWidget(self.stream_browser, 1)
+        inner_split.addWidget(stream_box)
+
+        # 下半：完成后的 md 预览
+        md_box = QWidget()
+        md_layout = QVBoxLayout(md_box)
+        md_layout.setContentsMargins(0, 0, 0, 0)
+        md_layout.setSpacing(4)
+        md_layout.addWidget(QLabel("📄 完成后报告 md 预览（最多 8000 字）："))
         self.md_browser = QTextBrowser()
         self.md_browser.setStyleSheet(TEXTBROWSER_STYLE)
-        layout.addWidget(self.md_browser, 1)
+        md_layout.addWidget(self.md_browser, 1)
+        inner_split.addWidget(md_box)
+
+        inner_split.setStretchFactor(0, 3)
+        inner_split.setStretchFactor(1, 2)
+        layout.addWidget(inner_split, 1)
         return group
 
     def _build_themes_group(self) -> QGroupBox:
@@ -497,6 +541,8 @@ class ManualBacktestPage(QWidget):
             f"<span style='color:#06c'>⏳ {action_text}中...</span>"
         )
         self.md_browser.clear()
+        self.stream_browser.clear()
+        self._theme_section_marked = False
         self.themes_table.setRowCount(0)
         self.open_md_btn.setEnabled(False)
         self._set_buttons_running(True)
@@ -512,6 +558,8 @@ class ManualBacktestPage(QWidget):
             dry_run=dry_run,
         )
         self.worker.stage.connect(self._on_stage)
+        self.worker.progress.connect(self._append_progress)
+        self.worker.streaming.connect(self._append_stream)
         self.worker.finished_result.connect(self._on_finished)
         self.worker.error.connect(self._on_error)
         self.worker.start()
@@ -526,6 +574,38 @@ class ManualBacktestPage(QWidget):
         self.status_label.setText(
             f"<span style='color:#06c'>⏳ {msg}</span>"
         )
+
+    # =====================================================================
+    # 流式输出（AI 分析页 / 题材抽取页同款双信号桥接）
+    # =====================================================================
+
+    # 标记是否已经把"题材抽取"分隔栏插过，防止重复插
+    _theme_section_marked: bool = False
+
+    def _append_progress(self, msg: str):
+        """阶段日志写入流式区上方（带 [HH:MM:SS] 时间戳）。
+
+        启发式：第一次出现 "题材" 关键字时插一行视觉分隔，提示主人
+        现在进入了第二阶段（LLM 分析 → JSON 抽取）的过渡。
+        """
+        ts = datetime.now().strftime("%H:%M:%S")
+        line = f"\n[{ts}] {msg}\n"
+        if (
+            not self._theme_section_marked
+            and "题材" in msg
+            and ("抽取" in msg or "入库" in msg)
+        ):
+            line = (
+                "\n\n────────── 题材抽取阶段 ──────────\n" + line
+            )
+            self._theme_section_marked = True
+        self.stream_browser.insertPlainText(line)
+        self.stream_browser.moveCursor(QTextCursor.End)
+
+    def _append_stream(self, chunk: str):
+        """LLM / 题材抽取流式 chunk 粘连写入，自动滚到末尾。"""
+        self.stream_browser.insertPlainText(chunk)
+        self.stream_browser.moveCursor(QTextCursor.End)
 
     def _on_error(self, msg: str):
         self._set_buttons_running(False)

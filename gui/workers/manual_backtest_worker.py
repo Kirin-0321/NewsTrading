@@ -5,6 +5,8 @@
 * 单一职责：一次跑一个 ``(template_id, trade_date, news_window)`` 回测
 * 异步：QThread 避免阻塞 GUI 主线程（LLM 调用可能 30~60s）
 * 进度信号：让页面显示 "重建快照 → 调 LLM → 抽题材 → 入库"
+* 流式信号（2026-05-27 新增）：把 ``backtest_one`` 内 LLM 与题材抽取的
+  逐 chunk 流式输出实时桥到 GUI，避免主人盯空白等几十秒
 * 防穿越：news_end_dt 在未来时让 backtest_one 自然 ok=False 上抛
 * 取消：当前一期不实现取消（LLM 已发出难以中断；二期再做）
 
@@ -15,9 +17,29 @@
 
 信号
 ----
-* ``stage(str)``：状态描述，如 "重建快照"、"调用 LLM"
+* ``stage(str)``：粗粒度阶段，状态栏专用（兼容旧 page 调用）
+* ``progress(str)``：细粒度阶段日志（与 ``AIAnalysisWorker.progress`` 同语义）
+* ``streaming(str)``：LLM / 题材抽取流式 chunk（与
+  ``AIAnalysisWorker.streaming`` 同语义，GUI 用 ``insertPlainText`` 粘连）
 * ``finished_result(dict)``：完成时返回 ``BacktestResult`` 字段的字典
 * ``error(str)``：异常时携带 traceback 摘要
+
+流式输出桥接（参考 AIAnalysisWorker / ThemeExtractWorker 同款）
+-------------------------------------------------------------
+``run()`` 内构造 ``progress_callback(message, is_streaming=False)``：
+
+* ``is_streaming=True``  → emit ``streaming``  → GUI ``insertPlainText``
+* ``is_streaming=False`` → emit ``progress``   → GUI ``append`` 日志
+
+回调向下贯穿调用链：
+    progress_callback
+      → backtest_one(progress_callback)
+        → _run_analyze_and_mark_backtest(progress_callback)
+          → AnalysisService.analyze(progress_callback)
+            → AINewsAnalyzer._stream_chat(progress_callback)     # 分析 chunk
+            → AnalysisService._maybe_extract_themes(progress_callback)
+              → ThemeExtractor.extract_from_file(progress_callback)
+                → ThemeExtractor._call_llm(progress_callback)    # 题材 chunk
 """
 
 from __future__ import annotations
@@ -33,6 +55,8 @@ class ManualBacktestWorker(QThread):
     """单次手动回测线程。"""
 
     stage = pyqtSignal(str)
+    progress = pyqtSignal(str)
+    streaming = pyqtSignal(str)
     finished_result = pyqtSignal(dict)
     error = pyqtSignal(str)
 
@@ -64,13 +88,22 @@ class ManualBacktestWorker(QThread):
                 f"[{self.news_start_dt.strftime('%m-%d %H:%M') if self.news_start_dt else '默认'},"
                 f" {self.news_end_dt.strftime('%m-%d %H:%M') if self.news_end_dt else '默认'})"
             )
-            self.stage.emit(
+            head_msg = (
                 f"开始：{self.template_id} @ {self.trade_date} "
                 f"win={win_str} status={self.news_status or 'all'} "
                 f"(dry_run={self.dry_run})"
             )
+            self.stage.emit(head_msg)
+            self.progress.emit(head_msg)
+
+            def progress_callback(message, is_streaming=False):
+                """同 AIAnalysisWorker：流式走 streaming，阶段走 progress。"""
+                if is_streaming:
+                    self.streaming.emit(message)
+                else:
+                    self.progress.emit(message)
+
             from tools.backtest_prompt import backtest_one
-            self.stage.emit("重建历史快照...")
             res = backtest_one(
                 self.template_id,
                 self.trade_date,
@@ -80,6 +113,7 @@ class ManualBacktestWorker(QThread):
                 provider=self.provider,
                 overwrite=self.overwrite,
                 dry_run=self.dry_run,
+                progress_callback=progress_callback,
             )
             if res.ok and not res.skipped and not self.dry_run:
                 self.stage.emit("LLM 调用完成 + 题材抽取入库")

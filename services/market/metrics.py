@@ -178,6 +178,10 @@ def build_limit_ladder(
             "cons_nums": cons,
             "lu_time": raw.get("lu_time") or raw.get("first_time") or "",
             "open_times": _to_int(raw.get("open_times")),
+            # ths 三源融合新增字段（缺失时为空字符串/None，渲染端容错）
+            "lu_desc": raw.get("lu_desc") or "",
+            "limit_up_suc_rate": raw.get("limit_up_suc_rate"),
+            "tag": raw.get("tag") or "",
         }
         if cons >= high_bucket_threshold:
             buckets[high_key].append(stock)
@@ -322,13 +326,18 @@ def _to_int(value: Any) -> Optional[int]:
 
 
 def parse_cons_nums(row: Dict[str, Any]) -> int:
-    """从一条 ``kpl_list`` 记录抽取「连板数」整数。
+    """从一条涨停记录抽取「连板数」整数。
 
-    优先级:
+    优先级（覆盖三源融合后的全部数据形态）:
         1. ``row["cons_nums"]`` 整数
-        2. ``row["status"]`` 形如 ``"3连板"`` → 3
-        3. ``status`` 是 ``"首板"`` / ``"首日"`` → 1
-        4. 兜底 1（当首板处理）
+        2. ``row["status"]`` 形如 ``"3连板"`` → 3（kpl_list）
+        3. ``status`` 是 ``"首板"`` / ``"首日"`` → 1（kpl_list）
+        4. ``row["tag"]`` 形如 ``"7天5板"`` → 5（同花顺独家，间断梯队）
+        5. ``tag`` 是 ``"首板"`` → 1（同花顺）
+        6. 兜底 1（当首板处理）
+
+    Returns:
+        连板数（>=1 的整数）。
     """
     n = _to_int(row.get("cons_nums"))
     if n is not None and n > 0:
@@ -338,6 +347,13 @@ def parse_cons_nums(row: Dict[str, Any]) -> int:
     if m:
         return int(m.group(1))
     if status in ("首板", "首日"):
+        return 1
+    # 同花顺 tag 兜底（"7天5板" → 5；"首板" → 1）
+    tag = str(row.get("tag") or "")
+    m = re.match(r"^(\d+)天(\d+)板$", tag)
+    if m:
+        return int(m.group(2))  # 取板数（不是天数）
+    if tag == "首板":
         return 1
     return 1  # 兜底当首板
 

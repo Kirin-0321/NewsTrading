@@ -60,6 +60,10 @@ class MarketSummaryRenderer:
             summary.get("limit_ladder") or {}
         ))
         parts.append("")
+        parts.append(self._render_limit_sprint(
+            summary.get("limit_sprint") or []
+        ))
+        parts.append("")
         parts.append(self._render_dragon_tiger(
             summary.get("dragon_tiger") or {}
         ))
@@ -322,6 +326,51 @@ class MarketSummaryRenderer:
             lines.append(f"- **{k}**（{len(items)}）: {preview}{extra}")
         return "\n".join(lines)
 
+    def _render_limit_sprint(
+        self,
+        sprint: Sequence[Dict[str, Any]],
+    ) -> str:
+        """冲刺涨停池（同花顺独家，盘中接近涨停未封住的股）。
+
+        输出形如::
+
+            ## 五·B、冲刺涨停（盘中接近涨停未封）
+
+            - 上纬新材[688585.SH] STAR +18.18%·换手3.22%·成交27.29亿
+            - 线上线下[300959.SZ] GEM +17.37%·换手23.17%
+            - ...（前 10 只）
+        """
+        lines: List[str] = ["## 五·B、冲刺涨停（盘中接近涨停未封）", ""]
+        if not sprint:
+            lines.append("（无数据）")
+            return "\n".join(lines)
+        for it in sprint[:10]:
+            name = it.get("name") or ""
+            code = it.get("code") or ""
+            mt = it.get("market_type") or ""
+            pct = it.get("pct_chg")
+            tor = it.get("turnover_rate")
+            tov_yi = it.get("turnover_yi")
+            lu_desc = it.get("lu_desc") or ""
+
+            head = f"{name}[{code}]" if code else name
+            extras: List[str] = []
+            if mt:
+                extras.append(str(mt))
+            if isinstance(pct, (int, float)):
+                extras.append(f"+{pct:.2f}%")
+            if isinstance(tor, (int, float)):
+                extras.append(f"换手{tor:.2f}%")
+            if isinstance(tov_yi, (int, float)):
+                extras.append(f"成交{tov_yi:.2f}亿")
+            if lu_desc:
+                extras.append(str(lu_desc))
+            tail = "·".join(extras) if extras else ""
+            lines.append(f"- {head} {tail}".rstrip())
+        if len(sprint) > 10:
+            lines.append(f"- … 等共 {len(sprint)} 只冲刺股")
+        return "\n".join(lines)
+
     def _render_dragon_tiger(self, dt: Dict[str, Any]) -> str:
         lines: List[str] = ["## 六、龙虎榜", ""]
         stocks = dt.get("stocks") or []
@@ -540,9 +589,17 @@ def _format_leader(le: Any) -> str:
 
 
 def _format_ladder_item(item: Any) -> str:
-    """连板梯队单只股票渲染。
+    """连板梯队单只股票渲染（三源融合后版本）。
 
-    输出形如 ``泰坦股份[003036.SZ] 2板·量子科技·炸2次``，缺失字段静默跳过。
+    输出形如::
+
+        泰坦股份[003036.SZ] 2天2板·量子科技·拟收购+SaaS转型·封板率82%·炸2次
+
+    字段优先级：
+      * tag（"2天2板"，含间断梯队信息）> 旧 cons_nums（"2板"）
+      * lu_desc（涨停原因，催化剂）单独成段，不与 theme 重复
+      * limit_up_suc_rate（一年封板率）格式化为百分比
+      * 缺失字段静默跳过（兼容老旧数据）
     """
     if not isinstance(item, dict):
         return str(item)
@@ -551,12 +608,22 @@ def _format_ladder_item(item: Any) -> str:
     theme = item.get("theme") or ""
     cons = item.get("cons_nums")
     open_times = item.get("open_times")
+    tag = item.get("tag") or ""
+    lu_desc = item.get("lu_desc") or ""
+    suc_rate = item.get("limit_up_suc_rate")
 
     extras: List[str] = []
-    if isinstance(cons, int) and cons >= 1:
+    # tag 优先（"2天2板" 比 "2板" 信息更全）
+    if tag:
+        extras.append(str(tag))
+    elif isinstance(cons, int) and cons >= 1:
         extras.append(f"{cons}板")
     if theme:
         extras.append(str(theme))
+    if lu_desc and lu_desc != theme:
+        extras.append(str(lu_desc))
+    if isinstance(suc_rate, (int, float)) and 0 <= suc_rate <= 1:
+        extras.append(f"封板率{suc_rate * 100:.0f}%")
     if isinstance(open_times, int) and open_times > 0:
         extras.append(f"炸{open_times}次")
     suffix = (" " + "·".join(extras)) if extras else ""

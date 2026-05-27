@@ -381,7 +381,8 @@ class AnalysisService:
         try:
             extractor = ThemeExtractor()
             themes, news_id_map, err = extractor.extract_from_file(
-                result.report_path
+                result.report_path,
+                progress_callback=progress_callback,
             )
             if err:
                 result.theme_error = err

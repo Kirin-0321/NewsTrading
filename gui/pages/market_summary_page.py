@@ -27,7 +27,7 @@ import json
 import logging
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QBrush, QColor, QFont
@@ -190,6 +190,8 @@ class MarketSummaryPage(QWidget):
         self.tabs.addTab(self._build_tab_overview(), "📊 总览")
         self.tabs.addTab(self._build_tab_sectors(), "🏢 板块行情")
         self.tabs.addTab(self._build_tab_ladder(), "🚀 涨停 & 连板")
+        self.tabs.addTab(self._build_tab_lianban(), "📈 连扳池")
+        self.tabs.addTab(self._build_tab_sprint(), "🏃 冲刺涨停")
         self.tabs.addTab(self._build_tab_dragon(), "🐉 龙虎榜")
         self.tabs.addTab(self._build_tab_shock(), "⚡ 异动时间线")
         self.tabs.addTab(self._build_tab_md(), "📝 Markdown")
@@ -615,20 +617,83 @@ class MarketSummaryPage(QWidget):
 
         info = QLabel(
             "<span style='color:#8C8C8C'>"
-            "首板按 cons_nums=1（含未识别）；点行可展开/折叠"
+            "首板按 cons_nums=1（含未识别）；三源融合后含「涨停原因 / 一年封板率」"
             "</span>"
         )
         layout.addWidget(info)
 
         self.ladder_tree = QTreeWidget()
         self.ladder_tree.setHeaderLabels([
-            "股票 / 桶", "题材", "涨停时间", "炸板次数",
+            "股票 / 桶", "题材", "涨停原因",
+            "一年封板率", "涨停时间", "炸板次数",
         ])
-        self.ladder_tree.setColumnWidth(0, 260)
-        self.ladder_tree.setColumnWidth(1, 320)
-        self.ladder_tree.setColumnWidth(2, 100)
+        self.ladder_tree.setColumnWidth(0, 240)
+        self.ladder_tree.setColumnWidth(1, 200)
+        self.ladder_tree.setColumnWidth(2, 320)
+        self.ladder_tree.setColumnWidth(3, 90)
+        self.ladder_tree.setColumnWidth(4, 90)
         self.ladder_tree.setAlternatingRowColors(True)
         layout.addWidget(self.ladder_tree, 1)
+        return wrap
+
+    # ------------------------------------------------------------------
+    # Tab 4: 连扳池（涨停股 cons_nums >= 2 子集，按高度倒序）
+    # ------------------------------------------------------------------
+
+    _LIANBAN_COLS = [
+        ("代码", 110),
+        ("名称", 110),
+        ("tag", 90),       # "3天3板" / "7天5板"
+        ("题材", 200),
+        ("涨停原因", 320),
+        ("一年封板率", 90),
+        ("涨停时间", 90),
+    ]
+
+    def _build_tab_lianban(self) -> QWidget:
+        wrap = QWidget()
+        layout = QVBoxLayout(wrap)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(4)
+        info = QLabel(
+            "<span style='color:#8C8C8C'>"
+            "连扳池 = 涨停股中 cons_nums ≥ 2；含同花顺间断梯队 tag"
+            "（如「7天5板」）"
+            "</span>"
+        )
+        layout.addWidget(info)
+        self.lianban_table = self._make_basic_table(self._LIANBAN_COLS)
+        layout.addWidget(self.lianban_table, 1)
+        return wrap
+
+    # ------------------------------------------------------------------
+    # Tab 5: 冲刺涨停（同花顺独家泳池，盘中接近涨停未封）
+    # ------------------------------------------------------------------
+
+    _SPRINT_COLS = [
+        ("代码", 110),
+        ("名称", 110),
+        ("市场", 60),       # HS / GEM / STAR
+        ("涨幅", 80),
+        ("换手率", 80),
+        ("成交额(亿)", 100),
+        ("流通市值(亿)", 100),
+        ("涨停原因", 320),
+    ]
+
+    def _build_tab_sprint(self) -> QWidget:
+        wrap = QWidget()
+        layout = QVBoxLayout(wrap)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(4)
+        info = QLabel(
+            "<span style='color:#8C8C8C'>"
+            "冲刺涨停 = 盘中接近涨停未封住的股（同花顺接口 limit_list_ths）"
+            "</span>"
+        )
+        layout.addWidget(info)
+        self.sprint_table = self._make_basic_table(self._SPRINT_COLS)
+        layout.addWidget(self.sprint_table, 1)
         return wrap
 
     # ------------------------------------------------------------------
@@ -788,6 +853,8 @@ class MarketSummaryPage(QWidget):
         self._populate_overview(self._summary)
         self._populate_sectors(self._summary)
         self._populate_ladder(self._summary)
+        self._populate_lianban(self._summary)
+        self._populate_sprint(self._summary)
         self._populate_dragon_tiger(self._summary)
         self._populate_shock(self._summary)
         self._populate_md(self._summary_md)
@@ -1226,6 +1293,10 @@ class MarketSummaryPage(QWidget):
         return (None, None, None)
 
     def _populate_ladder(self, summary: Dict[str, Any]) -> None:
+        """ladder Tab 6 列填充。
+
+        列：股票/桶 | 题材 | 涨停原因 | 一年封板率 | 涨停时间 | 炸板次数
+        """
         ladder = summary.get("limit_ladder") or {}
         self.ladder_tree.clear()
         if not isinstance(ladder, dict):
@@ -1238,15 +1309,14 @@ class MarketSummaryPage(QWidget):
                 2 if k.startswith("2") else 3
             ),
         )
+        empty_cols = ["", "", "", "", ""]  # 桶节点除了第 1 列其他空
         for bucket_name in order:
             items = ladder.get(bucket_name) or []
             if not isinstance(items, list):
                 continue
             parent = QTreeWidgetItem([
                 f"📈 {bucket_name} ({len(items)})",
-                "",
-                "",
-                "",
+                *empty_cols,
             ])
             font = parent.font(0)
             font.setBold(True)
@@ -1255,11 +1325,20 @@ class MarketSummaryPage(QWidget):
                 name = it.get("name") or ""
                 code = it.get("code") or ""
                 theme = it.get("theme") or ""
+                lu_desc = it.get("lu_desc") or ""
+                suc_rate = it.get("limit_up_suc_rate")
                 lu_time = it.get("lu_time") or ""
                 open_times = it.get("open_times")
+                rate_str = (
+                    f"{suc_rate * 100:.0f}%"
+                    if isinstance(suc_rate, (int, float))
+                    and 0 <= suc_rate <= 1 else ""
+                )
                 child = QTreeWidgetItem([
                     f"{name} ({code})" if code else name,
                     theme,
+                    lu_desc,
+                    rate_str,
                     str(lu_time)[-8:] if lu_time else "",
                     str(open_times) if open_times is not None else "",
                 ])
@@ -1267,6 +1346,80 @@ class MarketSummaryPage(QWidget):
             self.ladder_tree.addTopLevelItem(parent)
             # 首板默认折叠
             parent.setExpanded(not bucket_name.startswith("首板"))
+
+    def _populate_lianban(self, summary: Dict[str, Any]) -> None:
+        """连扳池：从 limit_ladder 提取 cons_nums >= 2 的所有股，按高度倒序。"""
+        ladder = summary.get("limit_ladder") or {}
+        items: List[Dict[str, Any]] = []
+        for bucket_name, lst in (ladder or {}).items():
+            if not isinstance(lst, list):
+                continue
+            for it in lst:
+                cn = it.get("cons_nums")
+                if isinstance(cn, int) and cn >= 2:
+                    items.append(it)
+        items.sort(
+            key=lambda x: (
+                -int(x.get("cons_nums") or 0),
+                x.get("lu_time") or "",
+            )
+        )
+        self.lianban_table.setRowCount(len(items))
+        for row, it in enumerate(items):
+            suc_rate = it.get("limit_up_suc_rate")
+            rate_str = (
+                f"{suc_rate * 100:.0f}%"
+                if isinstance(suc_rate, (int, float))
+                and 0 <= suc_rate <= 1 else ""
+            )
+            lu_time = it.get("lu_time") or ""
+            cells = [
+                str(it.get("code") or ""),
+                str(it.get("name") or ""),
+                str(it.get("tag") or ""),
+                str(it.get("theme") or ""),
+                str(it.get("lu_desc") or ""),
+                rate_str,
+                str(lu_time)[-8:] if lu_time else "",
+            ]
+            for col, val in enumerate(cells):
+                item = QTableWidgetItem(val)
+                # tag 列居中加粗
+                if col == 2 and val:
+                    item.setTextAlignment(Qt.AlignCenter)
+                    f = item.font()
+                    f.setBold(True)
+                    item.setFont(f)
+                self.lianban_table.setItem(row, col, item)
+
+    def _populate_sprint(self, summary: Dict[str, Any]) -> None:
+        """冲刺涨停 Tab：直接读 summary['limit_sprint']，按涨幅倒序。"""
+        sprint = summary.get("limit_sprint") or []
+        self.sprint_table.setRowCount(len(sprint))
+        for row, it in enumerate(sprint):
+            pct = it.get("pct_chg")
+            tor = it.get("turnover_rate")
+            tov = it.get("turnover_yi")
+            ff = it.get("free_float_yi")
+            cells = [
+                str(it.get("code") or ""),
+                str(it.get("name") or ""),
+                str(it.get("market_type") or ""),
+                f"{pct:+.2f}%" if isinstance(pct, (int, float)) else "",
+                f"{tor:.2f}%" if isinstance(tor, (int, float)) else "",
+                f"{tov:.2f}" if isinstance(tov, (int, float)) else "",
+                f"{ff:.2f}" if isinstance(ff, (int, float)) else "",
+                str(it.get("lu_desc") or ""),
+            ]
+            for col, val in enumerate(cells):
+                item = QTableWidgetItem(val)
+                # 涨幅列绿色加粗
+                if col == 3 and isinstance(pct, (int, float)) and pct > 0:
+                    item.setForeground(Qt.red)
+                    f = item.font()
+                    f.setBold(True)
+                    item.setFont(f)
+                self.sprint_table.setItem(row, col, item)
 
     def _populate_dragon_tiger(self, summary: Dict[str, Any]) -> None:
         from gui.utils.market_db_helper import (

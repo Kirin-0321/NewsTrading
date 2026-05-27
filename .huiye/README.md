@@ -5,7 +5,7 @@
 > ③ `_` 前缀的临时草稿 / 调试快照 / 字段审计 ④ 跨多份正式文档的"汇总索引"  
 >  
 > **其余一切正式文档已迁入 `doc/{子目录}/`**（迁移日志见 [doc/updates/05-26-2126-工作目录文档迁移.md](../doc/updates/05-26-2126-工作目录文档迁移.md)）  
-> 最后更新: 2026-05-27 17:10（**评估页单报告删除按钮上线** + 手动回测覆盖语义 + 评估页单报告打分按钮 — 累计 Phase -1/0/1/2/4/5/6.1-6.4 共 **60 个回归用例全绿**（test_scoring_eval 16 含 case_14/15/16 删除回归 / test_snapshot 9 / test_backtest_e2e 8 含 case_07/08 overwrite / test_three_db 10 / test_script_scorer 10 / test_daily_sync 7）+ Phase 1 真实 33005 行端到端验证 + Phase 5 真实 3 场景烟测 + Phase 6 dry-run 烟测 + 评估页 master-detail GUI 烟测；下一步：Phase 6 Step 6.5 批量 LLM 跑批（**待主人授权 + 历史数据补全**）/ Phase 7 AI 评分员 / Phase 8 联调）
+> 最后更新: 2026-05-27 18:10（**涨停数据三源融合 v1 上线**：接入同花顺 `limit_list_ths` 主源 + lu_desc/封板率/连扳池/冲刺涨停四块新字段，5/27 ladder 从全 0 → 61 只，长期漏算 28% 涨停股的隐性 bug 一并修复；7 天回填 5/19~5/27 全绿；累计回归 **70 个用例全绿**（含本轮 test_three_source_merge 10）；下一步：Phase 6 Step 6.5 批量 LLM 跑批（**待主人授权 + 历史数据补全**）/ Phase 7 AI 评分员 / Phase 8 联调）
 
 ---
 
@@ -41,6 +41,8 @@
 | **评估页单报告打分按钮（2026-05-27 16:45）** | scoring_service.rescore_one_report（按 report_id 精准打分）+ tools/score_one_report.py CLI + 下表三态按钮（⚡初次/🔄续打/♻重打）+ get_report_eval LEFT JOIN 全量报告显示；[说明](../doc/features/05-27-1645-评估页单报告打分按钮.md) | 🟢 已交付 + 57/57 全量回归绿 |
 | **手动回测覆盖语义（2026-05-27 16:35）** | `backtest_one(overwrite=True)` 真正删旧重跑（_delete_existing_backtest 删 5 表 + md）；GUI 加默认勾选的「覆盖已存在」开关；[bugfix](../doc/bugfix/05-27-1635-手动回测覆盖语义.md) | 🟢 已交付 + case_07/08 全绿 |
 | **评估页单报告删除按钮（2026-05-27 17:10）** | services/storage/ai_reports_store.delete_report 通用 API（allow_real 防误删 + dry_run + DeleteResult dataclass）+ tools/delete_report.py CLI（--report-id/--allow-real/--dry-run/--list/--yes/--json）+ gui/workers/delete_report_worker.py + 评估页下表「删除」列（backtest 单确认 / real 双重确认输入末 4 位）+ backtest_prompt._delete_existing_backtest 重构为薄包装（60→30 行 DRY）；[说明](../doc/features/05-27-1710-评估页单报告删除按钮.md) | 🟢 已交付 + 60/60 全量回归绿（含 case_14/15/16 CASCADE/protect/dry_run） |
+| **⭐ 涨停数据三源融合 v1（2026-05-27 18:10）** | 接入同花顺 `limit_list_ths` 主源（5 泳池：涨停/连扳/炸板/跌停/冲刺涨停）+ 三源 COALESCE 合并（ths > kpl > d）+ 8 个 Phase 全交付；新增 `fact_limit_sprint` 表 / `fact_limit_stock` 扩 8 列（lu_desc/封板率/market_type/tag/free_float/industry/total_mv/source）/ ladder Tab 6 列 / 新增 2 个 Tab（连扳池+冲刺涨停）/ markdown 章节「五·B 冲刺涨停」；7 天回填 5/19~5/27 全绿；5/27 ladder 全 0 → 61 只 + lu_desc 100% 命中；同时修复东财长期漏算 28% 涨停股的隐性 bug；[内容文档](../doc/design/05-27-1721-涨停数据三源融合设计.md) / [施工方案](../doc/design/05-27-1722-涨停数据三源融合施工方案.md) / [变更日志](../doc/updates/05-27-1810-涨停三源融合上线.md) | 🟢 已交付 + 70/70 全量回归绿（含 test_three_source_merge 10） |
+| **手动回测流式输出（2026-05-27 17:57）** | progress_callback 贯穿四层（worker→backtest_one→analyze→_stream_chat/extract_from_file）+ ManualBacktestPage 新增 stream_browser（LLM/题材双阶段共用）+ CLI --verbose + 顺手修 `_maybe_extract_themes` 漏传 callback 的存量 bug（AI 分析页也受益）；[bugfix](../doc/bugfix/05-27-1757-手动回测流式输出.md) | 🟢 已交付 + dry-run 验证通过 + 静态导入信号齐全（stage/progress/streaming/finished_result/error） |
 | [CLI 评估回测 / Agent 优化初步设计](../doc/design/05-26-2126-CLI评估回测Agent优化初步设计.md) | **候选 #2（重头）** — 把 30 天历史盘后数据用起来跑虚拟回测 | 🟡 设计已完成，**待主人决定是否开工** |
 
 ---

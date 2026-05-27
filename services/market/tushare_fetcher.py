@@ -459,6 +459,10 @@ class TushareMarketFetcher:
     def _ingest_limit_stock(
         self, rows: Sequence[dict], trade_date: str, limit_type: str
     ) -> int:
+        """东财 limit_list_d 入库（首批写入，作为 fact_limit_stock 骨架）。
+
+        新增字段：industry / total_mv 从 d 接口取（独家），source 标记 'd'。
+        """
         if not rows:
             return 0
         payload = []
@@ -480,6 +484,9 @@ class TushareMarketFetcher:
                     _to_float(r.get("pct_chg")),
                     _safe_div(r.get("fd_amount"), 1e8),
                     json.dumps(_strip_internal(r), ensure_ascii=False),
+                    r.get("industry"),
+                    _to_float(r.get("total_mv")),
+                    "d",
                 )
             )
         with self.db.connect() as conn:
@@ -487,8 +494,8 @@ class TushareMarketFetcher:
                 "INSERT OR REPLACE INTO fact_limit_stock "
                 "(trade_date, ts_code, limit_type, status, cons_nums, "
                 " theme, limit_up_time, open_times, close, pct_chg, "
-                " fd_amount_yi, raw_json) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " fd_amount_yi, raw_json, industry, total_mv, source) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 payload,
             )
         return len(payload)
@@ -535,13 +542,37 @@ class TushareMarketFetcher:
                 )
             )
         with self.db.connect() as conn:
+            # 1. 先 INSERT OR IGNORE 给 d 漏掉的 ts_code 建底（kpl 比 d 多 18 只）
+            #    raw_json 至少塞 name，否则 GUI 取 raw_json.name 会失败
+            conn.executemany(
+                "INSERT OR IGNORE INTO fact_limit_stock "
+                "(trade_date, ts_code, limit_type, source, raw_json) "
+                "VALUES (?, ?, 'U', 'kpl', ?)",
+                [
+                    (
+                        trade_date,
+                        r.get("ts_code"),
+                        json.dumps(
+                            {"name": r.get("name") or "", "_source": "kpl-补漏"},
+                            ensure_ascii=False,
+                        ),
+                    )
+                    for r in kpl_rows if r.get("ts_code")
+                ],
+            )
+            # 2. 再 UPDATE 合并 kpl 字段（COALESCE 仅覆盖 NULL）
             conn.executemany(
                 "UPDATE fact_limit_stock SET "
                 "  status = COALESCE(?, status), "
                 "  cons_nums = COALESCE(?, cons_nums), "
                 "  theme = COALESCE(?, theme), "
                 "  limit_up_time = COALESCE(?, limit_up_time), "
-                "  open_times = COALESCE(?, open_times) "
+                "  open_times = COALESCE(?, open_times), "
+                "  source = CASE "
+                "             WHEN source IS NULL THEN 'kpl' "
+                "             WHEN source LIKE '%kpl%' THEN source "
+                "             ELSE source || '+kpl' "
+                "           END "
                 "WHERE trade_date = ? AND ts_code = ? AND limit_type = 'U'",
                 payload,
             )
@@ -552,6 +583,249 @@ class TushareMarketFetcher:
                 (trade_date,),
             ).fetchone()[0]
         return int(updated)
+
+    # --- 5b. limit_list_ths × 4 泳池（涨/炸/跌/连扳）合并入 fact_limit_stock ---
+
+    def _fetch_limit_list_ths(self, result: FetchResult) -> None:
+        """同花顺 limit_list_ths 4 个泳池合并入 fact_limit_stock。
+
+        对每个泳池：
+          1. 涨停池/炸板池/跌停池：INSERT OR IGNORE 补漏（d/kpl 没拉到的）
+             + UPDATE 合并 ths 独家字段
+             （lu_desc/limit_up_suc_rate/market_type/tag/free_float
+             以及 ths 的 close/pct_chg/turnover_rate 兜底）
+          2. 连扳池：仅 UPDATE tag（连扳池 tag 含"7天5板"间断梯队信息更准），
+             + 对账校验（连扳池 ts_code 应是涨停池子集，差异写 warnings）
+        """
+        ts_inserted = 0
+        ts_merged = 0
+        # ---- 涨/炸/跌停池 ----
+        for pool_name, ltype in THS_POOL_TO_LIMIT_TYPE:
+            try:
+                rows = self.client.call(
+                    "limit_list_ths",
+                    params={
+                        "trade_date": result.trade_date,
+                        "limit_type": pool_name,
+                    },
+                )
+            except TushareError as exc:
+                result.warnings.append(
+                    f"limit_list_ths {pool_name}: {exc}"
+                )
+                continue
+            ins, upd = self._merge_ths_into_limit_stock(
+                rows, result.trade_date, ltype
+            )
+            ts_inserted += ins
+            ts_merged += upd
+            result.ingested[f"__ths_{pool_name}_count__"] = len(rows)
+
+        # ---- 连扳池：仅合并 tag + 对账 ----
+        try:
+            lb_rows = self.client.call(
+                "limit_list_ths",
+                params={
+                    "trade_date": result.trade_date,
+                    "limit_type": "连扳池",
+                },
+            )
+        except TushareError as exc:
+            result.warnings.append(f"limit_list_ths 连扳池: {exc}")
+            lb_rows = []
+        if lb_rows:
+            self._merge_ths_lianban_tag(lb_rows, result.trade_date, result)
+            result.ingested["__ths_连扳池_count__"] = len(lb_rows)
+
+        result.ingested["fact_limit_stock_ths_inserted"] = ts_inserted
+        result.ingested["fact_limit_stock_ths_merged"] = ts_merged
+
+    def _merge_ths_into_limit_stock(
+        self,
+        ths_rows: Sequence[dict],
+        trade_date: str,
+        limit_type: str,
+    ) -> Tuple[int, int]:
+        """合并同花顺涨/炸/跌停池数据到 fact_limit_stock。
+
+        Args:
+            ths_rows: limit_list_ths 返回的行（同泳池）
+            trade_date: 交易日
+            limit_type: 'U' / 'Z' / 'D'
+
+        Returns:
+            (inserted_rows, updated_rows)
+        """
+        if not ths_rows:
+            return 0, 0
+        # INSERT OR IGNORE 给 d/kpl 漏掉的补底；raw_json 至少塞 name + 价格摘要
+        ins_payload = [
+            (
+                trade_date,
+                r.get("ts_code"),
+                limit_type,
+                "ths",
+                json.dumps(
+                    {
+                        "name": r.get("name") or "",
+                        "price": r.get("price"),
+                        "pct_chg": r.get("pct_chg"),
+                        "_source": "ths-补漏",
+                    },
+                    ensure_ascii=False,
+                ),
+            )
+            for r in ths_rows if r.get("ts_code")
+        ]
+        # UPDATE 合并 ths 独家字段（COALESCE 仅覆盖 NULL）
+        upd_payload: List[Tuple[Any, ...]] = []
+        for r in ths_rows:
+            ts_code = r.get("ts_code")
+            if not ts_code:
+                continue
+            upd_payload.append(
+                (
+                    r.get("lu_desc"),
+                    _to_float(r.get("limit_up_suc_rate")),
+                    r.get("market_type"),
+                    r.get("tag"),
+                    _to_float(r.get("free_float")),
+                    _to_float(r.get("price")),       # close 兜底
+                    _to_float(r.get("pct_chg")),     # pct_chg 兜底
+                    _to_int(r.get("open_num")),      # open_times 兜底（ths 仅 56% 命中）
+                    trade_date,
+                    ts_code,
+                    limit_type,
+                )
+            )
+        with self.db.connect() as conn:
+            conn.executemany(
+                "INSERT OR IGNORE INTO fact_limit_stock "
+                "(trade_date, ts_code, limit_type, source, raw_json) "
+                "VALUES (?, ?, ?, ?, ?)",
+                ins_payload,
+            )
+            inserted = conn.total_changes  # noqa: F841 -- 不准确，仅供参考
+            conn.executemany(
+                "UPDATE fact_limit_stock SET "
+                "  lu_desc = COALESCE(lu_desc, ?), "
+                "  limit_up_suc_rate = COALESCE(limit_up_suc_rate, ?), "
+                "  market_type = COALESCE(market_type, ?), "
+                "  tag = COALESCE(tag, ?), "
+                "  free_float = COALESCE(free_float, ?), "
+                "  close = COALESCE(close, ?), "
+                "  pct_chg = COALESCE(pct_chg, ?), "
+                "  open_times = COALESCE(open_times, ?), "
+                "  source = CASE "
+                "             WHEN source IS NULL THEN 'ths' "
+                "             WHEN source LIKE '%ths%' THEN source "
+                "             ELSE source || '+ths' "
+                "           END "
+                "WHERE trade_date = ? AND ts_code = ? AND limit_type = ?",
+                upd_payload,
+            )
+            # 重新统计真实 inserted 数（避免 total_changes 跨语句累加干扰）
+            cnt = conn.execute(
+                "SELECT COUNT(*) FROM fact_limit_stock "
+                "WHERE trade_date = ? AND limit_type = ?",
+                (trade_date, limit_type),
+            ).fetchone()[0]
+        return int(cnt), len(upd_payload)
+
+    def _merge_ths_lianban_tag(
+        self,
+        lb_rows: Sequence[dict],
+        trade_date: str,
+        result: FetchResult,
+    ) -> None:
+        """连扳池仅 UPDATE tag（间断梯队"7天5板"等更准），并对账。
+
+        对账规则：连扳池 ts_code 应是涨停池子集；差异写 warnings 让主人审。
+        """
+        if not lb_rows:
+            return
+        upd = [
+            (r.get("tag"), trade_date, r.get("ts_code"))
+            for r in lb_rows if r.get("ts_code")
+        ]
+        with self.db.connect() as conn:
+            # 仅 UPDATE 已存在的涨停池行的 tag（允许已有 tag 被连扳池版本覆盖）
+            conn.executemany(
+                "UPDATE fact_limit_stock SET tag = ? "
+                "WHERE trade_date = ? AND ts_code = ? AND limit_type = 'U'",
+                upd,
+            )
+            # 对账：连扳池 ts_code 不在涨停池里的，写 warnings
+            u_codes = {
+                r[0] for r in conn.execute(
+                    "SELECT ts_code FROM fact_limit_stock "
+                    "WHERE trade_date = ? AND limit_type = 'U'",
+                    (trade_date,),
+                ).fetchall()
+            }
+        lb_codes = {r.get("ts_code") for r in lb_rows if r.get("ts_code")}
+        diff = lb_codes - u_codes
+        if diff:
+            result.warnings.append(
+                f"连扳池有 {len(diff)} 只 ts_code 不在涨停池中（同花顺口径差异）："
+                f"{sorted(diff)[:5]}{'…' if len(diff) > 5 else ''}"
+            )
+
+    # --- 5c. limit_list_ths 冲刺涨停 → fact_limit_sprint ---
+
+    def _fetch_limit_sprint(self, result: FetchResult) -> None:
+        """同花顺冲刺涨停池入 fact_limit_sprint（独立表，不属涨停股）。"""
+        try:
+            rows = self.client.call(
+                "limit_list_ths",
+                params={
+                    "trade_date": result.trade_date,
+                    "limit_type": "冲刺涨停",
+                },
+            )
+        except TushareError as exc:
+            result.warnings.append(f"limit_list_ths 冲刺涨停: {exc}")
+            return
+        n = self._ingest_limit_sprint(rows, result.trade_date)
+        result.ingested["fact_limit_sprint"] = n
+        result.ingested["__ths_冲刺涨停_count__"] = len(rows)
+
+    def _ingest_limit_sprint(
+        self, rows: Sequence[dict], trade_date: str
+    ) -> int:
+        if not rows:
+            return 0
+        payload = []
+        for r in rows:
+            ts_code = r.get("ts_code")
+            if not ts_code:
+                continue
+            payload.append(
+                (
+                    trade_date,
+                    ts_code,
+                    r.get("name"),
+                    _to_float(r.get("price")),
+                    _to_float(r.get("pct_chg")),
+                    _to_float(r.get("rise_rate")),
+                    _to_float(r.get("turnover_rate")),
+                    _to_float(r.get("turnover")),
+                    _to_float(r.get("free_float")),
+                    r.get("lu_desc"),
+                    r.get("market_type"),
+                    json.dumps(_strip_internal(r), ensure_ascii=False),
+                )
+            )
+        with self.db.connect() as conn:
+            conn.executemany(
+                "INSERT OR REPLACE INTO fact_limit_sprint "
+                "(trade_date, ts_code, name, close, pct_chg, rise_rate, "
+                " turnover_rate, turnover, free_float, lu_desc, "
+                " market_type, raw_json) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                payload,
+            )
+        return len(payload)
 
     # --- 6. kpl_list 昨日（仅内存） ---
 

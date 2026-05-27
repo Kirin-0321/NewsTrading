@@ -27,6 +27,8 @@
 
     "limit_ladder.tiers":            {"layer": "L2", "weight": 2, "required": true},
 
+    "limit_sprint":                  {"layer": "L3", "weight": 1, "required": false},
+
     "dragon_tiger.stocks":           {"layer": "L1", "weight": 1, "required": false},
     "dragon_tiger.famous_traders":   {"layer": "L3", "weight": 1, "required": false},
 
