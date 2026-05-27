@@ -1,23 +1,45 @@
 ---
-description: 新增核心接口/服务时同步在 tools/ 下产出 CLI 入口，边写边测
+description: 所有 services/core 公开接口必须 CLI 化，边写边测 + 为前后端分离铺路
 alwaysApply: true
 ---
 
-# 接口 CLI 化（边写边测）
+# 接口 CLI 化（边写边测 / 前后端分离的前置工程）
+
+## 战略动机（必读）
+
+**本规则的终极目标不仅是"边写边测"，更是为未来的 GUI Web 化 / 前后端分离铺设地基。**
+
+项目当前是 PyQt5 桌面单体，但 `core/` 与 `services/` 已经做到**零 UI 依赖**。
+为了让未来无论切到 **QtWebEngine + Vue 混合模式**、还是 **FastAPI 真分离**，都能 0 改造接入，必须坚持以下铁律：
+
+1. **所有 `services/` 公开方法、`core/` 对外函数，必须有一个对应的 `tools/*.py` CLI 入口可独立运行。**
+2. **CLI 入口 = 该接口的"无 UI 调用契约"**：参数即未来 API 的请求体，stdout JSON 即未来 API 的响应体。
+3. **任何只能从 GUI 触发、CLI 跑不通的逻辑视为架构缺陷**，必须在合入前下沉到 services 层并补 CLI。
+4. **新写一个 service 方法时，CLI 入口与方法本体同一轮提交**，禁止拆两次。
+
+> 一句话：CLI 化的覆盖率 = 项目可以无痛迁移到 Web 化的程度。
 
 ## 核心纪律
 
 **每写完一个独立可调用单元，立刻在 `tools/` 下包一个 CLI 入口跑一遍，再继续下一段。**
 禁止"等整个模块写完再统一造测试入口"——那是返工和 bug 堆积的温床。
 
+**全覆盖红线（Phase 0 起强制执行）**：
+
+- ❌ 不允许出现"只能从 GUI 调用、没有 CLI 入口"的 services / core 公开接口
+- ❌ 不允许 CLI 入口里塞业务逻辑（CLI 只做 argparse + 调用 + 打印，逻辑必须在 services / core）
+- ❌ 不允许 CLI 返回的字段与 service 返回的 dataclass / dict 字段不一致（CLI 是 service 的薄壳）
+- ✅ 存量未 CLI 化的接口：每次改动到它时**顺手补 CLI**，逐步偿还历史债
+
 ## 触发场景（任一命中即必须 CLI 化）
 
-- 新增 `services/` 下的服务类或公开方法
-- 新增 `core/` 下供外部调用的函数（含 DB 操作、外部 API 调用、AI 调用）
+- 新增 `services/` 下的服务类或公开方法 **（强制，无例外）**
+- 新增 `core/` 下供外部调用的函数（含 DB 操作、外部 API 调用、AI 调用）**（强制，无例外）**
 - 改动已有接口的输入/输出签名（需验证迁移等价性）
 - 实现一段依赖真实数据的逻辑（如 SQL 查询、tushare 抓取、prompt 推理）
+- **GUI 页面新增一个"按钮 → 触发后端"的交互**：被触发的后端动作必须有对应 CLI，禁止把逻辑写在 `gui/workers/*.py` 里
 
-**不需要 CLI 化**：纯内部辅助函数、UI 事件回调、私有 `_` 前缀方法、一次性数据迁移脚本本身。
+**不需要 CLI 化**：纯内部辅助函数、UI 事件回调、私有 `_` 前缀方法、一次性数据迁移脚本本身、纯 GUI 渲染逻辑（QSS / 表格刷新 / 弹窗）。
 
 ## CLI 模板（参考 `tools/market_fetch.py`）
 
@@ -34,9 +56,11 @@ alwaysApply: true
    if hasattr(sys.stdout, "reconfigure"):
        sys.stdout.reconfigure(encoding="utf-8")
    ```
-4. **argparse**：每个参数写 `help`，关键参数给默认值
+4. **argparse**：每个参数写 `help`，关键参数给默认值；参数命名与 service 方法形参一致（未来直接映射 API 请求体）
 5. **退出码明确**：`0` 成功 / `1` 业务失败 / `2` 参数错误
 6. **结果可读**：成功打印关键字段或 JSON 摘要，失败 `print(err); sys.exit(1)`
+7. **`--json` 选项（推荐）**：复杂返回值的 CLI 应支持 `--json` 输出结构化 JSON 到 stdout，字段与 service 返回的 dataclass `asdict()` 完全一致——这是未来 API 响应体的雏形
+8. **薄壳原则**：CLI 文件内禁止写业务逻辑，只做 `argparse → service.method() → 打印`；逻辑改动只改 service，CLI 跟着拿到的字段走
 
 ## 命名规范
 
@@ -55,3 +79,13 @@ alwaysApply: true
 ## 文档同步
 
 CLI 用法变更必须同步更新脚本顶部 docstring；面向主人长期使用的 CLI，在 `doc/guides/` 下补使用说明（按 `MM-DD-HHmm-简述.md` 命名）。
+
+## 覆盖率审计（季度 / 重大节点）
+
+- 重大节点（如准备启动 GUI Web 化、或主人下令"盘点"）时，辉夜需扫一遍 `services/` 与 `core/` 的公开接口，列出"没有对应 CLI 入口"的清单，输出到 `doc/reports/MM-DD-HHmm-CLI覆盖率审计.md`
+- 审计结论决定 Web 化施工方案能否启动：覆盖率 < 90% 必须先补齐再开工
+
+## 与其他规则的关系
+
+- 双文档流程（`.cursor/rules/doc-workflow.mdc` 条款 B）：大型功能走内容文档 → 施工方案，施工方案里必须列出"新增接口的 CLI 入口清单"作为验收项之一
+- 文档链接同步（条款 A）：CLI 文件改名 / 删除，需同步 `doc/guides/CLI 使用文档.md` 与所有引用方

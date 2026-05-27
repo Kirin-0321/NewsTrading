@@ -58,6 +58,14 @@ INDEX_CODES: List[Tuple[str, str, str]] = [
 
 LIMIT_TYPES = ["U", "Z", "D"]
 
+#: 同花顺 limit_list_ths 泳池中文名 → fact_limit_stock.limit_type 映射
+#: 连扳池单独处理（仅 UPDATE tag，不入库），冲刺涨停去 fact_limit_sprint
+THS_POOL_TO_LIMIT_TYPE: List[Tuple[str, str]] = [
+    ("涨停池", "U"),
+    ("炸板池", "Z"),
+    ("跌停池", "D"),
+]
+
 
 # ---------------------------------------------------------------------------
 # 数据类
@@ -164,6 +172,8 @@ class TushareMarketFetcher:
             ("拉取板块资金流 (moneyflow_ind_dc)", self._fetch_sector_moneyflow),
             ("拉取涨/跌/炸板 (limit_list_d × 3)", self._fetch_limit_list_d),
             ("拉取连板信息 (kpl_list 今日)", self._fetch_kpl_today),
+            ("拉取同花顺涨/跌/炸/连扳池 (limit_list_ths × 4)", self._fetch_limit_list_ths),
+            ("拉取同花顺冲刺涨停 (limit_list_ths)", self._fetch_limit_sprint),
             ("拉取昨日涨停 (kpl_list 昨)", self._fetch_kpl_prev),
             ("拉取北向资金 (moneyflow_hsgt)", self._fetch_hsgt),
             ("拉取龙虎榜个股 (top_list)", self._fetch_top_list),
@@ -214,6 +224,7 @@ class TushareMarketFetcher:
             "fact_index_daily",
             "fact_sector_daily",
             "fact_limit_stock",
+            "fact_limit_sprint",
             "fact_hsgt_daily",
             "fact_top_list",
             "fact_top_inst",

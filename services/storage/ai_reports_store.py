@@ -11,6 +11,24 @@
 * :class:`AIReportsStore` — 数据访问对象
 * :func:`get_ai_reports_store` — 单例
 * :func:`record_report` — 便捷函数（生成报告后回写时调用）
+* :func:`delete_report` — 按 ``ai_reports.id`` 级联删除一份报告（含 md 文件）
+
+删除语义（``delete_report``）
+----------------------------
+注意：``theme_predictions`` 并**未** FK 到 ``ai_reports``（仅靠
+``report_path = ai_reports.file_path`` 软关联），所以删除要走两步：
+::
+
+    1. DELETE FROM theme_predictions WHERE report_path = ?      # 软关联
+           ├── (CASCADE) theme_stocks
+           ├── (CASCADE) theme_news
+           ├── (CASCADE) theme_prediction_scores
+           └── (CASCADE) theme_stock_scores
+    2. DELETE FROM ai_reports        WHERE id = ?
+    3. 物理删 data/AI_analysis/{file_path}.md（可关）
+
+防误删：``allow_real=False`` 时若 ``is_backtest=0`` 直接抛
+:class:`PermissionError`，避免脚本/手抖误删真实日常报告。
 """
 
 from __future__ import annotations
@@ -350,4 +368,176 @@ __all__ = [
     "AIReportsStore",
     "get_ai_reports_store",
     "record_report",
+    "delete_report",
+    "DeleteResult",
 ]
+
+
+# ---------------------------------------------------------------------------
+# 删除（评估页/CLI/回测 overwrite 共享）
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class DeleteResult:
+    """单份报告删除统计。
+
+    Attributes:
+        ok: 操作整体是否成功（包括 dry_run 也算 True）
+        report_id: 入参回显
+        file_path: 报告的相对 posix 路径（删除前查到的）
+        is_backtest: 0/1，删之前的状态
+        prompt_id: 删之前的 prompt_id
+        report_date: 删之前的 report_date（YYYY-MM-DD 或 YYYYMMDD）
+        ai_reports_deleted: 实删 ai_reports 行数（0 或 1）
+        theme_predictions_deleted: 实删 theme_predictions 行数
+        md_file_deleted: 是否实删了 md 文件
+        dry_run: True = 仅预演不动数据
+        error: 失败原因（ok=False 时填）
+    """
+
+    ok: bool
+    report_id: int
+    file_path: str = ""
+    is_backtest: int = 0
+    prompt_id: Optional[str] = None
+    report_date: Optional[str] = None
+    ai_reports_deleted: int = 0
+    theme_predictions_deleted: int = 0
+    md_file_deleted: bool = False
+    dry_run: bool = False
+    error: Optional[str] = None
+
+
+def delete_report(
+    report_id: int,
+    *,
+    allow_real: bool = False,
+    delete_md: bool = True,
+    dry_run: bool = False,
+) -> DeleteResult:
+    """按 ``ai_reports.id`` 级联删除一份报告。
+
+    步骤：
+
+    1. SELECT ai_reports 拿 file_path / is_backtest / prompt_id / report_date
+    2. 防误删：``is_backtest=0`` 且 ``allow_real=False`` → 抛
+       :class:`PermissionError`
+    3. DELETE theme_predictions WHERE report_path = file_path
+       （CASCADE 干掉 theme_stocks / theme_news /
+       theme_prediction_scores / theme_stock_scores）
+    4. DELETE ai_reports WHERE id = ?
+    5. 物理删 ``data/AI_analysis/{file_path}.md``（``delete_md=True``）
+
+    Args:
+        report_id: ai_reports.id（必填，>0）
+        allow_real: True 时允许删 ``is_backtest=0`` 的真实日常报告
+        delete_md: True 时同步删物理 .md 文件（默认）
+        dry_run: True 时只查不删，返回的统计数为"会删的数"
+
+    Returns:
+        :class:`DeleteResult`
+
+    Raises:
+        ValueError: ``report_id`` 不存在或非法
+        PermissionError: 试图删真实日常报告但未传 ``allow_real=True``
+    """
+    if report_id is None or int(report_id) <= 0:
+        raise ValueError(f"report_id 必须为正整数，得到 {report_id!r}")
+    report_id = int(report_id)
+
+    adb = get_ai_inference_db()
+    with adb.connect() as conn:
+        row = conn.execute(
+            "SELECT id, file_path, is_backtest, prompt_id, report_date "
+            "FROM ai_reports WHERE id = ?",
+            (report_id,),
+        ).fetchone()
+
+        if row is None:
+            raise ValueError(f"ai_reports.id={report_id} 不存在")
+
+        file_path = str(row["file_path"] or "")
+        is_bt = int(row["is_backtest"] or 0)
+        prompt_id = row["prompt_id"]
+        report_date = row["report_date"]
+
+        if is_bt == 0 and not allow_real:
+            raise PermissionError(
+                f"report_id={report_id} (prompt={prompt_id}, "
+                f"date={report_date}) 是真实日常报告（is_backtest=0），"
+                f"需显式传 allow_real=True 才能删"
+            )
+
+        # 预统计（dry_run / 实跑都用）
+        tp_count_row = conn.execute(
+            "SELECT COUNT(*) AS n FROM theme_predictions "
+            "WHERE report_path = ?",
+            (file_path,),
+        ).fetchone()
+        tp_count = int(tp_count_row["n"] or 0) if tp_count_row else 0
+
+        md_abs = Path(get_project_root()) / file_path if file_path else None
+        will_md_delete = bool(
+            delete_md and md_abs and md_abs.exists() and md_abs.is_file()
+        )
+
+        if dry_run:
+            return DeleteResult(
+                ok=True,
+                report_id=report_id,
+                file_path=file_path,
+                is_backtest=is_bt,
+                prompt_id=prompt_id,
+                report_date=report_date,
+                ai_reports_deleted=1,
+                theme_predictions_deleted=tp_count,
+                md_file_deleted=will_md_delete,
+                dry_run=True,
+            )
+
+        # 1) 先删 theme_predictions（CASCADE 子表）
+        tp_n = 0
+        if file_path:
+            tp_cur = conn.execute(
+                "DELETE FROM theme_predictions WHERE report_path = ?",
+                (file_path,),
+            )
+            tp_n = tp_cur.rowcount
+
+        # 2) 再删 ai_reports
+        ar_cur = conn.execute(
+            "DELETE FROM ai_reports WHERE id = ?", (report_id,),
+        )
+        ar_n = ar_cur.rowcount
+
+    # 3) 物理删 md 文件（事务外，失败只警告不回滚 db）
+    md_deleted = False
+    if delete_md and file_path:
+        abs_path = Path(get_project_root()) / file_path
+        try:
+            if abs_path.exists() and abs_path.is_file():
+                abs_path.unlink()
+                md_deleted = True
+        except OSError as exc:
+            _log.warning("删 md 文件失败 %s: %s", abs_path, exc)
+
+    _log.info(
+        "delete_report: id=%s prompt=%s date=%s bt=%s "
+        "ai_reports=%d theme_predictions=%d md=%s",
+        report_id, prompt_id, report_date, is_bt,
+        ar_n, tp_n, md_deleted,
+    )
+
+    return DeleteResult(
+        ok=True,
+        report_id=report_id,
+        file_path=file_path,
+        is_backtest=is_bt,
+        prompt_id=prompt_id,
+        report_date=report_date,
+        ai_reports_deleted=ar_n,
+        theme_predictions_deleted=tp_n,
+        md_file_deleted=md_deleted,
+        dry_run=False,
+    )

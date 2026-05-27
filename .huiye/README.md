@@ -5,7 +5,7 @@
 > ③ `_` 前缀的临时草稿 / 调试快照 / 字段审计 ④ 跨多份正式文档的"汇总索引"  
 >  
 > **其余一切正式文档已迁入 `doc/{子目录}/`**（迁移日志见 [doc/updates/05-26-2126-工作目录文档迁移.md](../doc/updates/05-26-2126-工作目录文档迁移.md)）  
-> 最后更新: 2026-05-27 13:45（**Phase -1 三库重构已实施完毕** — 9 步全过 + 10 用例回归 + 53+ v4 用例全绿；下一步：Phase 0 ~ Phase 8 模板回测主体施工）
+> 最后更新: 2026-05-27 17:10（**评估页单报告删除按钮上线** + 手动回测覆盖语义 + 评估页单报告打分按钮 — 累计 Phase -1/0/1/2/4/5/6.1-6.4 共 **60 个回归用例全绿**（test_scoring_eval 16 含 case_14/15/16 删除回归 / test_snapshot 9 / test_backtest_e2e 8 含 case_07/08 overwrite / test_three_db 10 / test_script_scorer 10 / test_daily_sync 7）+ Phase 1 真实 33005 行端到端验证 + Phase 5 真实 3 场景烟测 + Phase 6 dry-run 烟测 + 评估页 master-detail GUI 烟测；下一步：Phase 6 Step 6.5 批量 LLM 跑批（**待主人授权 + 历史数据补全**）/ Phase 7 AI 评分员 / Phase 8 联调）
 
 ---
 
@@ -30,8 +30,17 @@
 | **v4 配套回归 CLI**（边写边测落地）| `tools/test_matcher.py` / `test_theme_normalize.py` / `test_theme_schema_v4.py` / `test_theme_store_v4.py` / `test_scoring_scheduled_stub.py` | 🟢 50+ 用例全绿 |
 | [⭐ 模板回测功能·设计通读版](../doc/design/05-27-1140-模板回测功能设计.md) | **给主人看** — 两种回测形态对比（A 事后打分 / B 事前虚拟）+ 6 个决策点 + 一图流 + Q&A + 一期/二期里程碑 | 🟢 主人已决策 A+B 并行 + AI 评分员一期 |
 | [⭐ 三库表结构详细设计](../doc/design/05-27-1209-三库表结构详细设计.md) | **辉夜+主人共看** — news / market / ai_inference 三库 10 张表逐字段中文化（v3 新增），跨库 JOIN 模式 | 🟢 **Phase -1 已完整实施**，fact_sector_daily 复用现有 schema |
-| [⭐ 施工文档·模板回测功能 v3.1](_construction_backtest_v3_1.md) | **辉夜内部用** — 9 个 Phase 拆解 + 35+ 子任务 + 命名约定 + 风险登记 + 验收 checklist；总工期 5.5-6 天 ⚠️ 文件名用英文（中文名触发 Cursor Write bug） | 🟢 **Phase -1 已完成 9/9**（-1.7 NewsDB 类按"不过度设计"原则取消）；下一步 Phase 0~8 |
+| [⭐ 施工文档·模板回测功能 v3.1](_construction_backtest_v3_1.md) | **辉夜内部用** — 9 个 Phase 拆解 + 35+ 子任务 + 命名约定 + 风险登记 + 验收 checklist；总工期 5.5-6 天 ⚠️ 文件名用英文（中文名触发 Cursor Write bug） | 🟢 **Phase -1/0/1 已完成**（-1.7 NewsDB 类按"不过度设计"原则取消）；下一步 Phase 2 打分核心 |
 | **Phase -1 实装产物（2026-05-27 13:45）** | services/storage/ai_inference_db.py + ai_migrations/001 + cross_db.py + market/migrations/005 + tools/test_three_db.py（10 用例全绿） | 🟢 已交付 |
+| **Phase 0 实装产物（2026-05-27 13:50）** | tools/check_three_db_health.py（三库 schema 巡检，11 项检查全绿）+ main.py 启动卫兵集成 | 🟢 已交付 |
+| **Phase 1 实装产物（2026-05-27 14:00）** | services/market/{stock,sector}_daily_sync.py + trade_date.py 追加 next_trade_date/trade_dates_between + tools/sync_daily_market.py CLI + tools/test_daily_sync.py（7 用例 mock 全绿）+ scheduled_runner 接通两个调度桩 | 🟢 **已交付 + 真实端到端验证**：5/19-26 共 6 个交易日 / 33005 行 fact_stock_daily 已入库；fact_sector_daily 6 天命中幂等跳过 |
+| **Phase 2 实装产物（2026-05-27 14:20）** | services/scoring/script_scorer.py 算法核心（6 指标 + 防穿越 + UPSERT）+ scoring_service.py（run_daily_scoring/rescore_range/get_template_eval/get_theme_score_detail 4 API）+ tools/score_themes.py CLI + tools/test_script_scorer.py（10 用例一次过）+ scheduled_runner 接通 theme_score_daily；**benchmark 源修正**：fact_index_daily 而非过时设计文档说的 fact_stock_daily（daily 接口只返个股） | 🟢 已交付 |
+| **Phase 5 实装产物（2026-05-27 14:25）** | services/scoring/snapshot.py 历史快照重建（cutoff_hour<16 自动回退前一交易日盘后 + 周末自动用 pretrade_date + 防穿越 assert）+ tools/test_snapshot.py（6 用例一次过 + 真实数据 5/26 16:00=268 条新闻+5/26 盘后 / 5/26 10:00=280 条新闻+5/25 盘后 / 5/24 周六=44 条+5/22 盘后）| 🟢 已交付 |
+| **Phase 6 实装产物（2026-05-27 14:30）** | tools/backtest_prompt.py 虚拟 md 生成 CLI（snap → AnalysisService.analyze(market_summary=snap.md, auto_market=False) → rename _backtest_{date} → UPDATE is_backtest=1）；支持 --workers 并发 / --overwrite / --dry-run / --date-range（已 dry-run 烟测 5/26 268 条新闻通过） | 🟢 Step 6.1/6.2/6.3/6.4 已交付（含 GUI 真/回筛选） / **Step 6.5 批量 LLM 待主人授权** |
+| **Phase 4 实装产物（2026-05-27 16:05）** | services/scoring/scoring_service.py 新增 get_report_eval + get_template_eval 加 time_dim 参数；tools/query_eval.py --by report/--time-dim；tools/test_scoring_eval.py（10 用例一次过）；gui/workers/rescore_worker.py（QThread 异步重打分）；gui/pages/prompt_eval_page.py master-detail 双表重写（14 列模板汇总 + 13 列报告明细 + 双击跳题材页 signal + D+N 5 列完整 + 涨/跌染色 + 样本量预警）；gui/main_window.py 接 theme_drilldown_requested signal；[详细说明书](../doc/features/05-27-1605-模板评估页master-detail重构.md) | 🟢 **已交付** + 52/52 全量回归绿 + GUI 烟测 OK |
+| **评估页单报告打分按钮（2026-05-27 16:45）** | scoring_service.rescore_one_report（按 report_id 精准打分）+ tools/score_one_report.py CLI + 下表三态按钮（⚡初次/🔄续打/♻重打）+ get_report_eval LEFT JOIN 全量报告显示；[说明](../doc/features/05-27-1645-评估页单报告打分按钮.md) | 🟢 已交付 + 57/57 全量回归绿 |
+| **手动回测覆盖语义（2026-05-27 16:35）** | `backtest_one(overwrite=True)` 真正删旧重跑（_delete_existing_backtest 删 5 表 + md）；GUI 加默认勾选的「覆盖已存在」开关；[bugfix](../doc/bugfix/05-27-1635-手动回测覆盖语义.md) | 🟢 已交付 + case_07/08 全绿 |
+| **评估页单报告删除按钮（2026-05-27 17:10）** | services/storage/ai_reports_store.delete_report 通用 API（allow_real 防误删 + dry_run + DeleteResult dataclass）+ tools/delete_report.py CLI（--report-id/--allow-real/--dry-run/--list/--yes/--json）+ gui/workers/delete_report_worker.py + 评估页下表「删除」列（backtest 单确认 / real 双重确认输入末 4 位）+ backtest_prompt._delete_existing_backtest 重构为薄包装（60→30 行 DRY）；[说明](../doc/features/05-27-1710-评估页单报告删除按钮.md) | 🟢 已交付 + 60/60 全量回归绿（含 case_14/15/16 CASCADE/protect/dry_run） |
 | [CLI 评估回测 / Agent 优化初步设计](../doc/design/05-26-2126-CLI评估回测Agent优化初步设计.md) | **候选 #2（重头）** — 把 30 天历史盘后数据用起来跑虚拟回测 | 🟡 设计已完成，**待主人决定是否开工** |
 
 ---

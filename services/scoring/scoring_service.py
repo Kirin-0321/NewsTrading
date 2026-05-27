@@ -1,0 +1,773 @@
+"""打分服务入口（Phase 2 Step 2.2 + 2026-05-27 评估页改造扩展）。
+
+把 :mod:`services.scoring.script_scorer` 单题材单日的算法包装成 5 个对外
+API，给 CLI / scheduled_runner / GUI 复用：
+
+| API | 用途 |
+|------|------|
+| :func:`run_daily_scoring` | 调度器每日入口：扫追踪窗口内所有题材跑 D+1~D+5 |
+| :func:`rescore_range` | GUI「重打分（区间）」按钮：指定 ``report_date`` 区间重算 |
+| :func:`rescore_one_report` | 评估页「单报告打分」按钮：按 ``ai_reports.id`` 精准打 |
+| :func:`get_template_eval` | 模板评估页**上表**（按 prompt_id 聚合 D+1~D+5 均值） |
+| :func:`get_report_eval` | 模板评估页**下表**（按 ai_reports.id 聚合，每份报告一行） |
+| :func:`get_theme_score_detail` | 题材详情第 4 个 Tab（单题材 D+1~D+5 明细） |
+
+时间维度
+--------
+* ``get_template_eval`` 和 ``get_report_eval`` 都支持 ``time_dim`` 参数：
+    * ``"score_date"``（默认 / 兼容老 CLI）：最近 N 天**发生过打分**的题材
+    * ``"report_date"``（评估页推荐）：最近 N 天**生成**的报告
+
+数据库：均通过 :mod:`services.storage.ai_inference_db` 访问；不跨库。
+
+防穿越：均委托 :func:`services.scoring.script_scorer.score_theme_on_date`
+内部检查，本层不重复。
+"""
+
+from __future__ import annotations
+
+import logging
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional
+
+from services.market.market_db import get_market_db
+from services.market.trade_date import (
+    TradeDateError,
+    next_trade_date,
+)
+from services.scoring.script_scorer import (
+    DEFAULT_BENCHMARK_TS_CODE,
+    DEFAULT_HIT_THRESHOLD_PCT,
+    ScoringError,
+    score_theme_on_date,
+)
+from services.storage.ai_inference_db import get_ai_inference_db
+
+_log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# 数据结构
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class BatchScoringResult:
+    """批量打分聚合结果。"""
+
+    ok: bool
+    themes_total: int
+    themes_scored: int
+    pairs_attempted: int  # (theme, date) 对总数
+    pairs_succeeded: int
+    days_covered: int
+    elapsed_ms: int
+    errors: List[str] = field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# 1. 每日入口（调度器调）
+# ---------------------------------------------------------------------------
+
+
+def run_daily_scoring(
+    score_date: Optional[str] = None,
+    *,
+    days_back: int = 5,
+    hit_threshold_pct: float = DEFAULT_HIT_THRESHOLD_PCT,
+    benchmark_ts_code: str = DEFAULT_BENCHMARK_TS_CODE,
+) -> BatchScoringResult:
+    """每日打分入口。
+
+    业务语义：
+        在 ``score_date`` 这天，对过去 ``days_back`` 天生成的所有题材打
+        当日分。即 ``report_date ∈ [score_date - days_back, score_date - 1]``
+        范围内每个题材都会落 1 行 ``theme_prediction_scores``。
+
+    Args:
+        score_date: 打分日 ``YYYYMMDD``，默认今天（按本地时间）。
+        days_back: 追踪期长度，默认 5（D+1 ~ D+5）。
+        hit_threshold_pct / benchmark_ts_code: 透传给 script_scorer。
+
+    Returns:
+        :class:`BatchScoringResult`。
+    """
+    t0 = time.perf_counter()
+    sd = (score_date or datetime.now().strftime("%Y%m%d")).strip()
+    if not _is_yyyymmdd(sd):
+        return BatchScoringResult(
+            ok=False, themes_total=0, themes_scored=0,
+            pairs_attempted=0, pairs_succeeded=0, days_covered=0,
+            elapsed_ms=int((time.perf_counter() - t0) * 1000),
+            errors=[f"score_date 必须是 YYYYMMDD，得到 {sd!r}"],
+        )
+
+    # 反推 report_date 上下界：[sd - 2*days_back 自然日, sd - 1 自然日]
+    # 取 2 * days_back 是 buffer，确保覆盖周末/节假日
+    sd_dt = datetime.strptime(sd, "%Y%m%d")
+    start_natural = (
+        sd_dt - timedelta(days=days_back * 2 + 3)
+    ).strftime("%Y%m%d")
+    end_natural = (sd_dt - timedelta(days=1)).strftime("%Y%m%d")
+
+    return _run_scoring_for_range(
+        score_date=sd,
+        report_start=start_natural,
+        report_end=end_natural,
+        days_back=days_back,
+        hit_threshold_pct=hit_threshold_pct,
+        benchmark_ts_code=benchmark_ts_code,
+        t0=t0,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 2. GUI 重打分入口
+# ---------------------------------------------------------------------------
+
+
+def rescore_range(
+    report_date_start: str,
+    report_date_end: str,
+    *,
+    days_back: int = 5,
+    hit_threshold_pct: float = DEFAULT_HIT_THRESHOLD_PCT,
+    benchmark_ts_code: str = DEFAULT_BENCHMARK_TS_CODE,
+    score_date_override: Optional[str] = None,
+) -> BatchScoringResult:
+    """指定 ``report_date`` 区间重算 D+1~D+days_back 全套分数。
+
+    Args:
+        report_date_start / report_date_end: ``YYYYMMDD`` 闭区间。
+        days_back: 每个题材回算几天（默认 5 = D+1~D+5）。
+        score_date_override: 覆盖每个 D+N 的"截止时间"，默认 = 今天。
+            指定可避免给未来日打分（防穿越的兜底）。
+    """
+    t0 = time.perf_counter()
+    _ensure_yyyymmdd(report_date_start)
+    _ensure_yyyymmdd(report_date_end)
+    cutoff = (
+        score_date_override
+        or datetime.now().strftime("%Y%m%d")
+    )
+
+    return _run_scoring_for_range(
+        score_date=cutoff,
+        report_start=report_date_start,
+        report_end=report_date_end,
+        days_back=days_back,
+        hit_threshold_pct=hit_threshold_pct,
+        benchmark_ts_code=benchmark_ts_code,
+        t0=t0,
+        force_full_window=True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 共享：核心调度
+# ---------------------------------------------------------------------------
+
+
+def _run_scoring_for_range(
+    *,
+    score_date: str,
+    report_start: str,
+    report_end: str,
+    days_back: int,
+    hit_threshold_pct: float,
+    benchmark_ts_code: str,
+    t0: float,
+    force_full_window: bool = False,
+) -> BatchScoringResult:
+    """核心调度：扫题材 → 对每个题材跑 D+1~D+N。
+
+    Args:
+        score_date: cutoff，超过这天的 D+N 都跳过（防穿越）。
+        force_full_window: True 时不论今天到 D+N 几天，全部尝试到 D+days_back
+            （重打分场景）；False 时只算 ``score_date`` 当天对应的 D+N。
+    """
+    ai = get_ai_inference_db()
+    ai.ensure_schema()
+
+    with ai.connect() as conn:
+        themes = conn.execute(
+            "SELECT id, report_date FROM theme_predictions "
+            "WHERE report_date BETWEEN ? AND ? "
+            "ORDER BY report_date ASC, id ASC",
+            (report_start, report_end),
+        ).fetchall()
+    themes_total = len(themes)
+
+    pairs_attempted = 0
+    pairs_succeeded = 0
+    days_covered_set: set[str] = set()
+    errors: List[str] = []
+    scored_themes: set[int] = set()
+
+    market_db = get_market_db()
+    market_db.ensure_schema()
+
+    for row in themes:
+        theme_id = int(row["id"])
+        report_date = str(row["report_date"])
+        try:
+            score_dates = _eligible_score_dates(
+                report_date=report_date,
+                score_date_cutoff=score_date,
+                days_back=days_back,
+                force_full_window=force_full_window,
+            )
+        except TradeDateError as exc:
+            errors.append(
+                f"theme={theme_id} 解析交易日窗口失败: {exc}"
+            )
+            continue
+
+        if not score_dates:
+            continue
+
+        for sd in score_dates:
+            pairs_attempted += 1
+            try:
+                score_theme_on_date(
+                    theme_id, sd,
+                    hit_threshold_pct=hit_threshold_pct,
+                    benchmark_ts_code=benchmark_ts_code,
+                    write=True,
+                )
+                pairs_succeeded += 1
+                days_covered_set.add(sd)
+                scored_themes.add(theme_id)
+            except (ScoringError, ValueError) as exc:
+                errors.append(
+                    f"theme={theme_id} score_date={sd}: {exc}"
+                )
+
+    return BatchScoringResult(
+        ok=(len(errors) == 0),
+        themes_total=themes_total,
+        themes_scored=len(scored_themes),
+        pairs_attempted=pairs_attempted,
+        pairs_succeeded=pairs_succeeded,
+        days_covered=len(days_covered_set),
+        elapsed_ms=int((time.perf_counter() - t0) * 1000),
+        errors=errors,
+    )
+
+
+def _eligible_score_dates(
+    *,
+    report_date: str,
+    score_date_cutoff: str,
+    days_back: int,
+    force_full_window: bool,
+) -> List[str]:
+    """计算给定 ``report_date`` 应该打分的 score_date 列表。
+
+    * 调度器场景（force_full_window=False）：
+        只算 cutoff 当天对应的 D+N（如果 cutoff 是 D+3 就只算 D+3）
+    * 重打分场景（force_full_window=True）：
+        全量 D+1 ~ D+days_back，但跳过 cutoff 之后的日期
+    """
+    # 推导出全套 D+1 ~ D+days_back
+    full: List[str] = []
+    for n in range(1, days_back + 1):
+        try:
+            sd = next_trade_date(report_date, n)
+        except TradeDateError:
+            break
+        if sd > score_date_cutoff:
+            break
+        full.append(sd)
+
+    if not full:
+        return []
+
+    if force_full_window:
+        return full
+    # 调度器只算 cutoff 当天
+    return [sd for sd in full if sd == score_date_cutoff]
+
+
+# ---------------------------------------------------------------------------
+# 3. 模板评估页主表
+# ---------------------------------------------------------------------------
+
+
+def get_template_eval(
+    days: int = 30,
+    *,
+    ignore_version: bool = True,
+    is_backtest_filter: Optional[int] = None,
+    time_dim: str = "report_date",
+) -> List[Dict]:
+    """聚合查询：按 prompt_id（或 prompt_id+version）算题材数 / 各日均值。
+
+    Args:
+        days: 取最近 N 个**自然日**内的样本（time_dim 决定按哪个日期字段）。
+        ignore_version: True 时按 prompt_id 聚合，False 按 (prompt_id, version)。
+        is_backtest_filter: None=不限，0=只看真实，1=只看回测。
+        time_dim:
+            * ``"report_date"``（默认，GUI 推荐）：按 ``tp.report_date`` 过滤
+              ——**未打分的模板也会出现**，``d1~d5_avg`` 全 NULL
+            * ``"score_date"``：按 ``tps.score_date`` 过滤——仅最近 N 天发生
+              过打分的模板
+
+    Returns:
+        每行 dict（按 ``themes_total`` DESC 排序）::
+
+            {
+                "prompt_id": "speculator_scalper",
+                "prompt_version": "1.0" or None,
+                "themes_total": 14,              # 该模板下题材总数（含未打）
+                "scored_themes": 0,              # 至少有一行 scores 的题材数
+                "sample_count": 14,              # 兼容老字段 = themes_total
+                "d1_avg": None, ..., "d5_avg": None,
+                "alpha_avg": None,
+                "hit_rate_avg": None,
+                "direction_correct_rate": None,
+                "last_report_date": "2026-05-22",  # YYYY-MM-DD 10 字符
+            }
+
+    设计要点：
+        * 主表 ``theme_predictions``（LEFT JOIN scores），无打分模板也露面
+        * ``themes_total`` 区别于旧版的 ``sample_count``——旧版只数有打分的，
+          新版数所有题材。``sample_count`` 字段保留同值用于 GUI 老代码兼容
+    """
+    _validate_time_dim(time_dim)
+    cutoff_dash = (
+        datetime.now() - timedelta(days=days)
+    ).strftime("%Y-%m-%d")
+    cutoff_compact = (
+        datetime.now() - timedelta(days=days)
+    ).strftime("%Y%m%d")
+
+    group_cols = (
+        "tp.prompt_id"
+        if ignore_version
+        else "tp.prompt_id, tp.prompt_version"
+    )
+    backtest_clause = ""
+    extra_params: List = []
+    if is_backtest_filter is not None:
+        backtest_clause = "AND tp.is_backtest = ?"
+        extra_params.append(int(is_backtest_filter))
+
+    if time_dim == "report_date":
+        time_where = "tp.report_date >= ?"
+        time_params: List = [cutoff_dash]
+    else:  # score_date
+        time_where = (
+            "EXISTS (SELECT 1 FROM theme_prediction_scores tps2 "
+            "        WHERE tps2.theme_id = tp.id "
+            "          AND tps2.score_date >= ?)"
+        )
+        time_params = [cutoff_compact]
+
+    # CTE：先把每个 theme 的 D+N 拍平 + 标记是否打分过
+    sql = f"""
+    WITH per_theme AS (
+        SELECT
+            tp.id AS theme_id,
+            tp.prompt_id,
+            tp.prompt_version,
+            tp.report_date AS theme_report_date,
+            CASE WHEN COUNT(tps.id) > 0 THEN 1 ELSE 0 END AS is_scored,
+            MAX(CASE WHEN tps.days_offset=1
+                     THEN tps.stock_weighted_pct END) AS d1,
+            MAX(CASE WHEN tps.days_offset=2
+                     THEN tps.stock_weighted_pct END) AS d2,
+            MAX(CASE WHEN tps.days_offset=3
+                     THEN tps.stock_weighted_pct END) AS d3,
+            MAX(CASE WHEN tps.days_offset=4
+                     THEN tps.stock_weighted_pct END) AS d4,
+            MAX(CASE WHEN tps.days_offset=5
+                     THEN tps.stock_weighted_pct END) AS d5,
+            AVG(tps.alpha) AS alpha_avg,
+            AVG(tps.hit_rate) AS hit_rate_avg,
+            AVG(CASE WHEN tps.direction_correct IS NOT NULL
+                     THEN CAST(tps.direction_correct AS REAL) END)
+                 AS dir_rate
+        FROM theme_predictions tp
+        LEFT JOIN theme_prediction_scores tps
+               ON tps.theme_id = tp.id
+        WHERE {time_where} {backtest_clause}
+        GROUP BY tp.id, tp.prompt_id, tp.prompt_version,
+                 tp.report_date
+    )
+    SELECT
+        prompt_id,
+        {"NULL AS prompt_version" if ignore_version else "prompt_version"},
+        COUNT(*) AS themes_total,
+        SUM(is_scored) AS scored_themes,
+        AVG(d1) AS d1_avg,
+        AVG(d2) AS d2_avg,
+        AVG(d3) AS d3_avg,
+        AVG(d4) AS d4_avg,
+        AVG(d5) AS d5_avg,
+        AVG(alpha_avg) AS alpha_avg,
+        AVG(hit_rate_avg) AS hit_rate_avg,
+        AVG(dir_rate) AS direction_correct_rate,
+        MAX(theme_report_date) AS last_report_date
+    FROM per_theme
+    GROUP BY {group_cols.replace('tp.', '')}
+    ORDER BY themes_total DESC
+    """
+
+    params: List = time_params + extra_params
+
+    ai = get_ai_inference_db()
+    with ai.connect(readonly=True) as conn:
+        rows = conn.execute(sql, params).fetchall()
+
+    result: List[Dict] = []
+    for r in rows:
+        d = dict(r)
+        # 兼容旧调用方
+        d["sample_count"] = int(d.get("themes_total") or 0)
+        d["scored_themes"] = int(d.get("scored_themes") or 0)
+        result.append(d)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# 4. 报告级评估（评估页下表 master-detail 的 detail）
+# ---------------------------------------------------------------------------
+
+
+def get_report_eval(
+    days: int = 30,
+    *,
+    prompt_id: Optional[str] = None,
+    prompt_version: Optional[str] = None,
+    is_backtest_filter: Optional[int] = None,
+    time_dim: str = "report_date",
+) -> List[Dict]:
+    """聚合查询：按 ``ai_reports.id`` 算每份报告的 D+1~D+5 均值 + 题材数。
+
+    Args:
+        days: 取最近 N 个**自然日**内的样本。
+        prompt_id: 可选过滤（评估页选中某模板后下钻用）。
+        prompt_version: 可选过滤（搭配 prompt_id 用，None=不限版本）。
+        is_backtest_filter: None=不限，0=只看真实，1=只看回测。
+        time_dim:
+            * ``"report_date"``（默认 / 评估页推荐）：按 ``ar.report_date``
+              过滤——**未打分的报告也会出现**，``d1~d5_avg / *_rate``
+              全 NULL，``score_status='none'``
+            * ``"score_date"``：按 ``tps.score_date`` 过滤——仅最近 N 天
+              内**发生过打分**的报告
+
+    Returns:
+        每行 dict（按 ``report_date`` DESC, prompt_id ASC 排序）::
+
+            {
+                "report_id": 123,                # ai_reports.id（按钮回调用）
+                "report_date": "2026-05-22",     # 注意：YYYY-MM-DD 10 字符
+                "file_path": "data/AI_analysis/.../xxx.md",
+                "prompt_id": "custom_6",
+                "prompt_version": "1.0",
+                "is_backtest": 1,
+                "themes_count": 14,              # theme_predictions 实际行数
+                "scored_pairs": 0,               # 已写入 scores 的 (theme,sd)
+                "expected_pairs": 70,            # = themes_count * 5
+                "score_status": "none",          # none / partial / full
+                "d1_avg": None, ..., "d5_avg": None,
+                "alpha_avg": None,
+                "hit_rate_avg": None,
+                "direction_correct_rate": None,
+            }
+
+    设计要点：
+        * 主表 ``ai_reports``，LEFT JOIN theme_predictions LEFT JOIN scores，
+          未抽题材或未打分的报告也会出现
+        * 关联：``ar.file_path = tp.report_path``（两者均相对 posix）
+        * 日期格式：``ar.report_date / tp.report_date / tps.report_date``
+          统一 YYYY-MM-DD（10 字符）；``tps.score_date`` 是 YYYYMMDD（8 字符）
+          —— 本函数 cutoff 按字段格式分别拼参
+        * ``score_status``：``scored_pairs / expected_pairs``
+          - 0   → "none"
+          - 100% → "full"
+          - 其他 → "partial"
+    """
+    _validate_time_dim(time_dim)
+    cutoff_dash = (
+        datetime.now() - timedelta(days=days)
+    ).strftime("%Y-%m-%d")
+    cutoff_compact = (
+        datetime.now() - timedelta(days=days)
+    ).strftime("%Y%m%d")
+
+    where_extra = ""
+    extra_params: List = []
+    if is_backtest_filter is not None:
+        where_extra += " AND ar.is_backtest = ?"
+        extra_params.append(int(is_backtest_filter))
+    if prompt_id:
+        where_extra += " AND ar.prompt_id = ?"
+        extra_params.append(prompt_id)
+    if prompt_version:
+        where_extra += " AND ar.prompt_version = ?"
+        extra_params.append(prompt_version)
+
+    if time_dim == "report_date":
+        # 直接按 ar.report_date 过滤，未打分报告也保留
+        time_where = "ar.report_date >= ?"
+        time_params: List = [cutoff_dash]
+    else:  # score_date：必须有至少一条 scores 行，否则不出现
+        time_where = (
+            "EXISTS (SELECT 1 FROM theme_prediction_scores tps2 "
+            "        JOIN theme_predictions tp2 "
+            "          ON tp2.id = tps2.theme_id "
+            "        WHERE tp2.report_path = ar.file_path "
+            "          AND tps2.score_date >= ?)"
+        )
+        time_params = [cutoff_compact]
+
+    sql = f"""
+    WITH per_theme AS (
+        SELECT
+            tp.id AS theme_id,
+            tp.report_path,
+            MAX(CASE WHEN tps.days_offset=1
+                     THEN tps.stock_weighted_pct END) AS d1,
+            MAX(CASE WHEN tps.days_offset=2
+                     THEN tps.stock_weighted_pct END) AS d2,
+            MAX(CASE WHEN tps.days_offset=3
+                     THEN tps.stock_weighted_pct END) AS d3,
+            MAX(CASE WHEN tps.days_offset=4
+                     THEN tps.stock_weighted_pct END) AS d4,
+            MAX(CASE WHEN tps.days_offset=5
+                     THEN tps.stock_weighted_pct END) AS d5,
+            AVG(tps.alpha) AS alpha_avg,
+            AVG(tps.hit_rate) AS hit_rate_avg,
+            AVG(CASE WHEN tps.direction_correct IS NOT NULL
+                     THEN CAST(tps.direction_correct AS REAL) END)
+                 AS dir_rate,
+            COUNT(tps.id) AS scored_pairs_one
+        FROM theme_predictions tp
+        LEFT JOIN theme_prediction_scores tps
+               ON tps.theme_id = tp.id
+        GROUP BY tp.id, tp.report_path
+    )
+    SELECT
+        ar.id AS report_id,
+        ar.report_date,
+        ar.file_path,
+        ar.prompt_id,
+        ar.prompt_version,
+        ar.is_backtest,
+        COALESCE(SUM(CASE WHEN per_theme.theme_id IS NOT NULL
+                          THEN 1 ELSE 0 END), 0) AS themes_count,
+        COALESCE(SUM(per_theme.scored_pairs_one), 0) AS scored_pairs,
+        AVG(per_theme.d1) AS d1_avg,
+        AVG(per_theme.d2) AS d2_avg,
+        AVG(per_theme.d3) AS d3_avg,
+        AVG(per_theme.d4) AS d4_avg,
+        AVG(per_theme.d5) AS d5_avg,
+        AVG(per_theme.alpha_avg) AS alpha_avg,
+        AVG(per_theme.hit_rate_avg) AS hit_rate_avg,
+        AVG(per_theme.dir_rate) AS direction_correct_rate
+    FROM ai_reports ar
+    LEFT JOIN per_theme
+           ON per_theme.report_path = ar.file_path
+    WHERE {time_where} {where_extra}
+    GROUP BY ar.id
+    ORDER BY ar.report_date DESC, ar.prompt_id ASC, ar.id DESC
+    """
+
+    params: List = time_params + extra_params
+
+    ai = get_ai_inference_db()
+    with ai.connect(readonly=True) as conn:
+        rows = conn.execute(sql, params).fetchall()
+
+    result: List[Dict] = []
+    for r in rows:
+        d = dict(r)
+        themes_n = int(d.get("themes_count") or 0)
+        scored_n = int(d.get("scored_pairs") or 0)
+        expected_n = themes_n * 5
+        d["expected_pairs"] = expected_n
+        if expected_n == 0 or scored_n == 0:
+            d["score_status"] = "none"
+        elif scored_n >= expected_n:
+            d["score_status"] = "full"
+        else:
+            d["score_status"] = "partial"
+        result.append(d)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# 5. 单题材打分明细
+# ---------------------------------------------------------------------------
+
+
+def rescore_one_report(
+    report_id: int,
+    *,
+    days_back: int = 5,
+    hit_threshold_pct: float = DEFAULT_HIT_THRESHOLD_PCT,
+    benchmark_ts_code: str = DEFAULT_BENCHMARK_TS_CODE,
+    score_date_override: Optional[str] = None,
+) -> BatchScoringResult:
+    """按 ``ai_reports.id`` 单报告打分（评估页打分按钮入口）。
+
+    与 :func:`rescore_range` 区别：
+        * rescore_range 按 ``report_date`` 区间扫**所有模板**的题材
+        * rescore_one_report 只动**该 report_id 对应 ai_reports 行**下属
+          theme_predictions（按 ``report_path = ar.file_path`` 关联），
+          其他报告完全不波及
+
+    流程：
+        1. 查 ``ai_reports`` 拿到 ``report_date`` / ``file_path``
+        2. 查所有 ``theme_predictions WHERE report_path = file_path``
+        3. 对每个 theme 跑 D+1~D+days_back（force_full_window=True）
+        4. 返回 :class:`BatchScoringResult`
+
+    Args:
+        report_id: ``ai_reports.id``
+        days_back: 默认 5 = D+1~D+5
+        score_date_override: 覆盖 cutoff，默认 = 今天
+
+    Raises:
+        ValueError: report_id 不存在
+    """
+    t0 = time.perf_counter()
+    cutoff = (
+        score_date_override
+        or datetime.now().strftime("%Y%m%d")
+    )
+
+    ai = get_ai_inference_db()
+    ai.ensure_schema()
+
+    with ai.connect(readonly=True) as conn:
+        ar_row = conn.execute(
+            "SELECT id, report_date, file_path "
+            "FROM ai_reports WHERE id = ?",
+            (report_id,),
+        ).fetchone()
+        if ar_row is None:
+            raise ValueError(f"ai_reports.id={report_id} 不存在")
+        report_date = str(ar_row["report_date"])
+        file_path = str(ar_row["file_path"])
+        themes = conn.execute(
+            "SELECT id, report_date FROM theme_predictions "
+            "WHERE report_path = ? ORDER BY id ASC",
+            (file_path,),
+        ).fetchall()
+
+    themes_total = len(themes)
+    if themes_total == 0:
+        return BatchScoringResult(
+            ok=True, themes_total=0, themes_scored=0,
+            pairs_attempted=0, pairs_succeeded=0, days_covered=0,
+            elapsed_ms=int((time.perf_counter() - t0) * 1000),
+            errors=[
+                f"report_id={report_id} 无题材可打分 "
+                f"(theme_predictions WHERE report_path={file_path} 为空)"
+            ],
+        )
+
+    pairs_attempted = 0
+    pairs_succeeded = 0
+    days_covered_set: set[str] = set()
+    errors: List[str] = []
+    scored_themes: set[int] = set()
+
+    market_db = get_market_db()
+    market_db.ensure_schema()
+
+    for row in themes:
+        theme_id = int(row["id"])
+        theme_report_date = str(row["report_date"])
+        try:
+            score_dates = _eligible_score_dates(
+                report_date=theme_report_date,
+                score_date_cutoff=cutoff,
+                days_back=days_back,
+                force_full_window=True,
+            )
+        except TradeDateError as exc:
+            errors.append(
+                f"theme={theme_id} 解析交易日窗口失败: {exc}"
+            )
+            continue
+
+        if not score_dates:
+            continue
+
+        for sd in score_dates:
+            pairs_attempted += 1
+            try:
+                score_theme_on_date(
+                    theme_id, sd,
+                    hit_threshold_pct=hit_threshold_pct,
+                    benchmark_ts_code=benchmark_ts_code,
+                    write=True,
+                )
+                pairs_succeeded += 1
+                days_covered_set.add(sd)
+                scored_themes.add(theme_id)
+            except (ScoringError, ValueError) as exc:
+                errors.append(
+                    f"theme={theme_id} score_date={sd}: {exc}"
+                )
+
+    _log.info(
+        "rescore_one_report id=%s date=%s themes=%d "
+        "scored=%d pairs=%d/%d days=%d",
+        report_id, report_date, themes_total, len(scored_themes),
+        pairs_succeeded, pairs_attempted, len(days_covered_set),
+    )
+
+    return BatchScoringResult(
+        ok=(len(errors) == 0),
+        themes_total=themes_total,
+        themes_scored=len(scored_themes),
+        pairs_attempted=pairs_attempted,
+        pairs_succeeded=pairs_succeeded,
+        days_covered=len(days_covered_set),
+        elapsed_ms=int((time.perf_counter() - t0) * 1000),
+        errors=errors,
+    )
+
+
+def get_theme_score_detail(theme_id: int) -> List[Dict]:
+    """返回单题材 D+1~D+5 逐日打分行（升序）。"""
+    ai = get_ai_inference_db()
+    with ai.connect(readonly=True) as conn:
+        rows = conn.execute(
+            "SELECT * FROM theme_prediction_scores "
+            "WHERE theme_id = ? "
+            "ORDER BY score_date ASC, days_offset ASC",
+            (theme_id,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# 工具
+# ---------------------------------------------------------------------------
+
+
+_ALLOWED_TIME_DIMS = ("score_date", "report_date")
+
+
+def _validate_time_dim(time_dim: str) -> None:
+    if time_dim not in _ALLOWED_TIME_DIMS:
+        raise ValueError(
+            f"time_dim 必须是 {_ALLOWED_TIME_DIMS}，得到 {time_dim!r}"
+        )
+
+
+def _is_yyyymmdd(s: str) -> bool:
+    return isinstance(s, str) and len(s) == 8 and s.isdigit()
+
+
+def _ensure_yyyymmdd(s: str) -> None:
+    if not _is_yyyymmdd(s):
+        raise ValueError(f"日期格式应为 YYYYMMDD，得到 {s!r}")

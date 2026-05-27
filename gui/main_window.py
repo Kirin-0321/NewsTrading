@@ -18,6 +18,7 @@ from gui.pages.export_page import ExportPage
 from gui.pages.ai_analysis_page import AIAnalysisPage
 from gui.pages.theme_prediction_page import ThemePredictionPage
 from gui.pages.prompt_eval_page import PromptEvalPage
+from gui.pages.manual_backtest_page import ManualBacktestPage
 from gui.pages.schedule_page import SchedulePage
 from gui.pages.news_cleaning_page import NewsCleaningPage
 from gui.pages.prompt_manager_page import PromptManagerPage
@@ -89,6 +90,7 @@ class MainWindow(QMainWindow):
             'ai_analysis': AIAnalysisPage(),
             'theme_prediction': ThemePredictionPage(),
             'prompt_eval': PromptEvalPage(),
+            'manual_backtest': ManualBacktestPage(),
             'cleaning': NewsCleaningPage(),
             'schedule': SchedulePage(scheduler_service=self.scheduler_service),
             'prompt_manager': PromptManagerPage(),
@@ -101,6 +103,15 @@ class MainWindow(QMainWindow):
         prompt_mgr = self.pages.get('prompt_manager')
         if prompt_mgr is not None:
             prompt_mgr.prompts_changed.connect(self._on_prompts_changed)
+
+        # 连接「模板评估页 -> 跳转题材页」signal
+        eval_page = self.pages.get('prompt_eval')
+        if eval_page is not None and hasattr(
+            eval_page, 'theme_drilldown_requested'
+        ):
+            eval_page.theme_drilldown_requested.connect(
+                self._on_eval_drilldown
+            )
 
         # 默认显示爬虫页面
         self.show_page('crawler')
@@ -134,6 +145,7 @@ class MainWindow(QMainWindow):
             ('ai_analysis', '🤖 AI分析'),
             ('theme_prediction', '🎯 预测题材'),
             ('prompt_eval', '📊 模板评估'),
+            ('manual_backtest', '🎛️ 手动回测'),
             ('schedule', '⏰ 定时任务'),
             ('prompt_manager', '📝 提示词管理'),
         ]
@@ -169,6 +181,32 @@ class MainWindow(QMainWindow):
             # 如果页面有refresh方法，调用它
             if hasattr(page, 'refresh'):
                 page.refresh()
+
+    def _on_eval_drilldown(self, report_date: str, prompt_id: str) -> None:
+        """评估页双击报告行 → 切到题材预测页 + 预选 (date, prompt_id)。
+
+        Args:
+            report_date: ai_reports.report_date（与 theme_predictions
+                的同字段格式一致，可直接 itemData 等值匹配）
+            prompt_id: 该报告的 prompt_id，用于预选模板下拉
+        """
+        theme_page = self.pages.get('theme_prediction')
+        if theme_page is None:
+            return
+        self.show_page('theme_prediction')
+        # 预选 date_combo
+        try:
+            theme_page._reload_dates(prefer_date=report_date)
+        except Exception as e:  # noqa: BLE001
+            print(f"[MainWindow] 跳题材页预选 date 失败: {e}")
+            return
+        # 预选 prompt_combo
+        if prompt_id and hasattr(theme_page, 'prompt_combo'):
+            combo = theme_page.prompt_combo
+            for i in range(combo.count()):
+                if combo.itemData(i) == prompt_id:
+                    combo.setCurrentIndex(i)
+                    break
 
     def _on_prompts_changed(self, category: str) -> None:
         """提示词管理页保存/删除后，刷新依赖该 category 的页面。"""

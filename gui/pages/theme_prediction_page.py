@@ -703,14 +703,19 @@ class ThemePredictionPage(QWidget):
 
     @staticmethod
     def _fetch_news_meta(news_ids: list) -> dict:
-        """通过 news_id 从 raw_news 反查 title/source/published_at/content。"""
+        """通过 news_id 从 raw_news 反查 title/source/published_at/content。
+
+        注意：raw_news 表在 ``news.db``，不在 ``ai_inference.db``。
+        Phase -1 三库重构曾把这里误改成 ai_inference 连接，导致 GUI
+        新闻反查全部走空（2026-05-27 bug 修复）。
+        """
         ids = [i for i in news_ids if i]
         if not ids:
             return {}
         try:
-            from services.storage.ai_inference_db import get_ai_inference_db
+            from services.storage.database import get_connection
             placeholders = ",".join("?" for _ in ids)
-            with get_ai_inference_db().connect() as conn:
+            with get_connection() as conn:
                 rows = conn.execute(
                     f"""
                     SELECT id, title, content, source, published_at

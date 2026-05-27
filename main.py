@@ -65,6 +65,32 @@ def _init_ai_inference_db_on_startup() -> None:
 _init_market_db_on_startup()
 _init_ai_inference_db_on_startup()
 
+
+def _check_three_db_health_on_startup() -> None:
+    """Phase 0 卫兵：三库 schema 健康检查（不阻断启动）。
+
+    各库的 ensure_schema() 跑完后再做一次"骨架表 + 跨库 ATTACH + PRAGMA"
+    巡检；任何 FAIL 项写到 stderr 提示主人，但 GUI 仍正常启动。
+    """
+    try:
+        from tools.check_three_db_health import run_all_checks
+        report = run_all_checks()
+        if report.fail_count == 0:
+            return
+        print(
+            f"[启动] 三库健康检查发现 {report.fail_count} 项 FAIL（"
+            f"不阻断 GUI 启动，建议跑 python tools/check_three_db_health.py 排查）:",
+            file=sys.stderr,
+        )
+        for item in report.items:
+            if item.status == "FAIL":
+                print(f"  - [{item.name}] {item.detail}", file=sys.stderr)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[启动] 三库健康检查异常: {exc}", file=sys.stderr)
+
+
+_check_three_db_health_on_startup()
+
 from core.prompt_loader import PromptLoader  # noqa: E402
 
 

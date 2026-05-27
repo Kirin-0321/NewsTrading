@@ -148,28 +148,86 @@ def run_task_sync(task: Dict) -> Dict:
         # plan M3 / M4 完成后再填充。
         # ==================================================================
         if task_type == "stock_daily_sync":
-            # plan M3.1：拉全 A 股个股当日涨跌幅 -> fact_stock_daily
-            return _stub_response(
-                task_type,
-                "plan M3.1 个股日行情同步未实施"
-                "（待 services/market/stock_daily_sync.py 上线）",
+            # Phase 1 已实施：拉全 A 股个股当日涨跌幅 -> fact_stock_daily
+            from services.market.stock_daily_sync import sync_stock_daily
+            from services.market.trade_date import resolve_trade_date
+            from services.market.tushare_client import TushareClient
+            cli = TushareClient()
+            td, _ = resolve_trade_date(cli, params.get("trade_date"))
+            stock_result = sync_stock_daily(
+                td,
+                client=cli,
+                force=params.get("force", False),
             )
+            return {
+                "ok": stock_result.ok,
+                "type": task_type,
+                "result": {
+                    "trade_date": td,
+                    "rows_written": stock_result.rows_written,
+                    "api_calls": stock_result.api_calls,
+                    "elapsed_ms": stock_result.elapsed_ms,
+                    "skipped": stock_result.skipped,
+                },
+                "error": stock_result.error,
+            }
 
         if task_type == "sector_daily_sync":
-            # plan M3.1：拉全板块当日涨跌幅 -> fact_sector_daily
-            return _stub_response(
-                task_type,
-                "plan M3.1 板块日行情同步未实施"
-                "（待 services/market/sector_daily_sync.py 上线）",
+            # Phase 1 已实施：拉全板块当日涨跌幅 -> fact_sector_daily
+            from services.market.sector_daily_sync import sync_sector_daily
+            from services.market.trade_date import resolve_trade_date
+            from services.market.tushare_client import TushareClient
+            cli = TushareClient()
+            td, _ = resolve_trade_date(cli, params.get("trade_date"))
+            sector_result = sync_sector_daily(
+                td,
+                client=cli,
+                force=params.get("force", False),
             )
+            return {
+                "ok": sector_result.ok,
+                "type": task_type,
+                "result": {
+                    "trade_date": td,
+                    "rows_written": sector_result.rows_written,
+                    "api_calls": sector_result.api_calls,
+                    "elapsed_ms": sector_result.elapsed_ms,
+                    "skipped": sector_result.skipped,
+                },
+                "error": sector_result.error,
+            }
 
         if task_type == "theme_score_daily":
-            # plan M3.2：给追踪期内题材跑脚本打分 -> theme_prediction_scores
-            return _stub_response(
-                task_type,
-                "plan M3.2 题材每日打分未实施"
-                "（待 services/scoring/script_scorer.py 上线）",
+            # Phase 2 已实施：扫追踪期内题材跑脚本打分
+            from services.scoring.scoring_service import (
+                run_daily_scoring,
             )
+            score_result = run_daily_scoring(
+                score_date=params.get("score_date"),
+                days_back=int(params.get("days_back", 5)),
+                hit_threshold_pct=float(
+                    params.get("hit_threshold_pct", 3.0)
+                ),
+                benchmark_ts_code=params.get(
+                    "benchmark_ts_code", "000001.SH"
+                ),
+            )
+            return {
+                "ok": score_result.ok,
+                "type": task_type,
+                "result": {
+                    "themes_total": score_result.themes_total,
+                    "themes_scored": score_result.themes_scored,
+                    "pairs_succeeded": score_result.pairs_succeeded,
+                    "pairs_attempted": score_result.pairs_attempted,
+                    "days_covered": score_result.days_covered,
+                    "elapsed_ms": score_result.elapsed_ms,
+                },
+                "error": (
+                    None if score_result.ok
+                    else "; ".join(score_result.errors[:5])
+                ),
+            }
 
         if task_type == "theme_ai_review":
             # plan M3.3：扫今日 D+5 题材交 AI 复审 -> ai_review 字段
