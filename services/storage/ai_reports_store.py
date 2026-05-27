@@ -98,7 +98,20 @@ class AIReportsStore:
 
         若 ``record.file_path`` 是绝对路径，会自动转换为相对仓库根的
         POSIX 风格路径再入库，便于跨平台、迁移时不破坏索引。
+
+        协议（2026-05-27 18:30 强校验）：
+            ``record.report_date`` 必须是 8 位 YYYYMMDD（与 schema 注释一致）。
+            违反协议立即抛 ``ValueError``，避免历史"YYYY-MM-DD 入库"重演。
         """
+        if not (
+            isinstance(record.report_date, str)
+            and len(record.report_date) == 8
+            and record.report_date.isdigit()
+        ):
+            raise ValueError(
+                f"ai_reports.report_date 应为 YYYYMMDD 8 位数字，"
+                f"得到 {record.report_date!r}"
+            )
         rel_path = _to_relative_posix(record.file_path)
         size, md5_hex = _stat_and_hash(rel_path)
         created_at = record.created_at or _now_iso()

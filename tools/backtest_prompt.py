@@ -1,13 +1,14 @@
-"""模板虚拟回测 CLI（Phase 6 Step 6.2 + 2026-05-27 时间窗语义重构）。
+"""模板虚拟回测 CLI（Phase 6 Step 6.2 + 2026-05-27 18:30 命名重构）。
 
 业务定位
 --------
 "时光机"工具：模拟在 ``trade_date`` 的 ``[news_start_dt, news_end_dt)``
 新闻窗口下，用指定 ``template_id`` 跑一次 AI 分析，产物：
 
-* ``data/AI_analysis/...`` 多一份 ``_backtest_{trade_date}.md`` 文件   
+* ``data/AI_analysis/{月}月{日}日/{月}月{日}日_0时00分_盘后总结分析报告_backtest.md``
+  ——文件名前缀直接用模拟交易日，时分填 ``0时00分``，后缀 ``_backtest`` 标识
 * ``ai_inference.db`` 的 ``ai_reports`` / ``theme_predictions`` 多
-  ``is_backtest=1`` 的行
+  ``is_backtest=1`` 的行，``report_date`` = ``trade_date``（YYYYMMDD）
 * 接到 Phase 2 打分链路里，可直接被 :mod:`services.scoring.scoring_service`
   消费
 
@@ -18,22 +19,22 @@
 * **右边界硬上限 = next_trade_date(trade_date) 09:00**
 * 详见 :func:`services.scoring.snapshot.build_snapshot`
 
-实现链路
---------
+实现链路（2026-05-27 18:30 简化版）
+----------------------------------
 ::
 
     build_snapshot(trade_date, news_start_dt, news_end_dt, news_status)
         ↓
     AnalysisService.analyze(start=news_start_dt, end=news_end_dt,
-                            market_summary=snap.market_summary_md)
+                            market_summary=snap.market_summary_md,
+                            simulated_trade_date=trade_date)  # ← 一切由此驱动
         ↓ 自动调
-        AINewsAnalyzer → 写 md → _record_ai_report → _maybe_extract_themes
+        AINewsAnalyzer.save_report(naming_dt=trade_date 00:00,
+                                   backtest_suffix=True)  # 文件名正确
+        → _record_ai_report(simulated_trade_date=...)     # is_backtest=1
+        → _maybe_extract_themes(simulated_trade_date=...) # theme is_backtest=1
         ↓
-    重命名 md 文件加 _backtest_{trade_date} 后缀，并：
-        UPDATE ai_reports        SET is_backtest=1, file_path=new_path,
-                                      report_date=trade_date
-        UPDATE theme_predictions SET is_backtest=1, report_path=new_path,
-                                      report_date=trade_date
+    完事。**不再有事后 rename + UPDATE report_date** 这种二次修正逻辑。
 
 防穿越铁律：
     * news_end_dt 不能晚于 ``now``（不允许回测"未来"）
@@ -330,25 +331,24 @@ def _run_analyze_and_mark_backtest(
     provider: Optional[str],
     progress_callback: Optional[Callable[..., None]] = None,
 ) -> tuple[Optional[str], int]:
-    """调 AnalysisService 跑一次分析 + 重命名 + 标记 is_backtest=1。
+    """调 AnalysisService 跑一次虚拟回测分析。
 
-    用 ``news_start_dt / news_end_dt`` 直接喂 ``AnalysisService.analyze``，
-    避免重复算 start/end，保持与 snapshot 完全一致。
+    2026-05-27 18:30 第二轮重构（彻底治理"假冒生成时间"）
+    -----------------------------------------------
+    新链路下，``AnalysisService.analyze(simulated_trade_date=trade_date)``
+    已在生成阶段就完成所有正确动作：
 
-    Bug 修复（2026-05-27 15:20）：
-        见 doc/design/05-27-1515-回测时间边界说明书.md §6.1
-        - bug 1：路径不匹配 → 改用 ``res.report_id`` 做主键 UPDATE
-        - bug 2：``report_date`` 未透传 → 显式覆盖为
-          ``trade_date`` 转 ``YYYY-MM-DD``
-        - bug 3：``file_path`` 改为相对 posix（对齐 db 存储格式）
-        - bug 4：theme_predictions 也同步改 report_date / report_path
+    * 报告文件名用 ``{trade_date} 00:00`` 命名 + 追加 ``_backtest`` 后缀
+    * ``ai_reports.is_backtest = 1`` + ``report_date = trade_date``（YYYYMMDD）
+    * ``theme_predictions.is_backtest = 1`` + ``report_date = trade_date``
+
+    因此本函数退化为薄壳，**不再需要事后 rename / UPDATE report_date**。
 
     Returns:
-        ``(新 md 文件相对 posix 路径, theme_count)``；
+        ``(报告文件相对 posix 路径, theme_count)``；
         report_path 为 ``None`` 表示 analyze 失败
     """
     from services.analysis_service import AnalysisService
-    from services.storage.ai_inference_db import get_ai_inference_db
     from services.storage.ai_reports_store import _to_relative_posix
 
     svc = AnalysisService()
@@ -362,72 +362,18 @@ def _run_analyze_and_mark_backtest(
         auto_market=False,
         extract_themes=True,
         progress_callback=progress_callback,
+        simulated_trade_date=trade_date,
     )
     if not res.ok or not res.report_path:
         raise RuntimeError(res.error or "analyze 返回 ok=False")
-    if progress_callback:
-        progress_callback(
-            f"标记 is_backtest=1：rename → _backtest_{trade_date}"
-        )
 
-    old_path_abs = str(res.report_path)
-    old_path_rel = _to_relative_posix(old_path_abs)
-    new_path_abs = _rename_to_backtest(old_path_abs, trade_date)
-    new_path_rel = _to_relative_posix(new_path_abs)
-    new_basename = Path(new_path_rel).name
-
-    target_report_date = (
-        f"{trade_date[:4]}-{trade_date[4:6]}-{trade_date[6:8]}"
-    )
-
-    # 标记 is_backtest=1 + report_date 改 + file_path 改
-    adb = get_ai_inference_db()
-    with adb.connect() as conn:
-        # ai_reports: 用 report_id 主键避开路径匹配脆弱性
-        ar_rows = 0
-        if res.report_id:
-            cur = conn.execute(
-                "UPDATE ai_reports SET "
-                "  is_backtest = 1, "
-                "  report_date = ?, "
-                "  file_path = ? "
-                "WHERE id = ?",
-                (target_report_date, new_path_rel, res.report_id),
-            )
-            ar_rows = cur.rowcount
-        else:
-            cur = conn.execute(
-                "UPDATE ai_reports SET "
-                "  is_backtest = 1, "
-                "  report_date = ?, "
-                "  file_path = ? "
-                "WHERE file_path = ?",
-                (target_report_date, new_path_rel, old_path_rel),
-            )
-            ar_rows = cur.rowcount
-
-        tp_cur = conn.execute(
-            "UPDATE theme_predictions SET "
-            "  is_backtest = 1, "
-            "  report_date = ?, "
-            "  report_path = ?, "
-            "  report_id = ? "
-            "WHERE report_path = ?",
-            (
-                target_report_date, new_path_rel,
-                new_basename, old_path_rel,
-            ),
-        )
-        tp_rows = tp_cur.rowcount
-
+    rel_path = _to_relative_posix(str(res.report_path))
     _log.info(
-        "backtest mark: ai_reports updated=%d "
-        "theme_predictions updated=%d "
-        "(report_id=%s old_rel=%s new_rel=%s)",
-        ar_rows, tp_rows, res.report_id, old_path_rel, new_path_rel,
+        "backtest analyze ok: template=%s trade_date=%s "
+        "report_path=%s themes=%d",
+        template_id, trade_date, rel_path, int(res.theme_count or 0),
     )
-
-    return new_path_rel, int(res.theme_count or 0)
+    return rel_path, int(res.theme_count or 0)
 
 
 def _has_existing_backtest(
@@ -435,13 +381,10 @@ def _has_existing_backtest(
 ) -> bool:
     """检查是否已有同 (template, date) 的 backtest 记录。
 
-    注意：``ai_reports.report_date`` 以 ``YYYY-MM-DD`` 格式存储，
-    本函数接受 ``YYYYMMDD`` 入参，内部转换。
+    ``ai_reports.report_date`` 自 2026-05-27 18:30 起统一 YYYYMMDD（schema 协议），
+    本函数直接用入参 ``trade_date`` 等值匹配。
     """
     from services.storage.ai_inference_db import get_ai_inference_db
-    target_report_date = (
-        f"{trade_date[:4]}-{trade_date[4:6]}-{trade_date[6:8]}"
-    )
     adb = get_ai_inference_db()
     with adb.connect(readonly=True) as conn:
         row = conn.execute(
@@ -450,7 +393,7 @@ def _has_existing_backtest(
             "  AND prompt_id = ? "
             "  AND report_date = ? "
             "LIMIT 1",
-            (template_id, target_report_date),
+            (template_id, trade_date),
         ).fetchone()
     return row is not None
 
@@ -475,9 +418,6 @@ def _delete_existing_backtest(
     from services.storage.ai_inference_db import get_ai_inference_db
     from services.storage.ai_reports_store import delete_report
 
-    target_report_date = (
-        f"{trade_date[:4]}-{trade_date[4:6]}-{trade_date[6:8]}"
-    )
     adb = get_ai_inference_db()
 
     with adb.connect(readonly=True) as conn:
@@ -485,7 +425,7 @@ def _delete_existing_backtest(
             "SELECT id, file_path FROM ai_reports "
             "WHERE is_backtest = 1 "
             "  AND prompt_id = ? AND report_date = ?",
-            (template_id, target_report_date),
+            (template_id, trade_date),
         ).fetchall()
         candidates: List[tuple[int, str]] = [
             (int(r["id"]), str(r["file_path"] or "")) for r in rows
@@ -528,25 +468,6 @@ def _delete_existing_backtest(
         "md_files": md_n,
         "paths": paths,
     }
-
-
-def _rename_to_backtest(old_path: str, trade_date: str) -> str:
-    """物理重命名 md 文件，名字加 ``_backtest_{trade_date}`` 后缀。
-
-    若 old_path 已经包含后缀则原样返回（幂等）。
-    """
-    p = Path(old_path)
-    if not p.exists():
-        return old_path
-    suffix = f"_backtest_{trade_date}"
-    if suffix in p.stem:
-        return old_path
-    new_name = f"{p.stem}{suffix}{p.suffix}"
-    new_path = p.with_name(new_name)
-    if new_path.exists():
-        new_path.unlink()
-    os.rename(p, new_path)
-    return str(new_path)
 
 
 # ---------------------------------------------------------------------------

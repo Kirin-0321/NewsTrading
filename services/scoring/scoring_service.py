@@ -270,7 +270,14 @@ def _eligible_score_dates(
         只算 cutoff 当天对应的 D+N（如果 cutoff 是 D+3 就只算 D+3）
     * 重打分场景（force_full_window=True）：
         全量 D+1 ~ D+days_back，但跳过 cutoff 之后的日期
+
+    协议（2026-05-27 18:30 入口防御）：
+        ``report_date`` / ``score_date_cutoff`` 必须 YYYYMMDD；
+        历史曾因 theme_predictions.report_date 误存 YYYY-MM-DD 导致
+        next_trade_date 在循环深处才炸（调用栈难定位），现在前置强校验。
     """
+    _ensure_yyyymmdd(report_date)
+    _ensure_yyyymmdd(score_date_cutoff)
     # 推导出全套 D+1 ~ D+days_back
     full: List[str] = []
     for n in range(1, days_back + 1):
@@ -328,7 +335,7 @@ def get_template_eval(
                 "alpha_avg": None,
                 "hit_rate_avg": None,
                 "direction_correct_rate": None,
-                "last_report_date": "2026-05-22",  # YYYY-MM-DD 10 字符
+                "last_report_date": "20260522",  # YYYYMMDD 8 字符（schema 协议）
             }
 
     设计要点：
@@ -337,9 +344,7 @@ def get_template_eval(
           新版数所有题材。``sample_count`` 字段保留同值用于 GUI 老代码兼容
     """
     _validate_time_dim(time_dim)
-    cutoff_dash = (
-        datetime.now() - timedelta(days=days)
-    ).strftime("%Y-%m-%d")
+    # 2026-05-27 18:30：report_date / score_date 在 schema 协议下统一 YYYYMMDD
     cutoff_compact = (
         datetime.now() - timedelta(days=days)
     ).strftime("%Y%m%d")
@@ -357,7 +362,7 @@ def get_template_eval(
 
     if time_dim == "report_date":
         time_where = "tp.report_date >= ?"
-        time_params: List = [cutoff_dash]
+        time_params: List = [cutoff_compact]
     else:  # score_date
         time_where = (
             "EXISTS (SELECT 1 FROM theme_prediction_scores tps2 "
@@ -464,7 +469,7 @@ def get_report_eval(
 
             {
                 "report_id": 123,                # ai_reports.id（按钮回调用）
-                "report_date": "2026-05-22",     # 注意：YYYY-MM-DD 10 字符
+                "report_date": "20260522",       # YYYYMMDD 8 字符（schema 协议）
                 "file_path": "data/AI_analysis/.../xxx.md",
                 "prompt_id": "custom_6",
                 "prompt_version": "1.0",
@@ -483,18 +488,15 @@ def get_report_eval(
         * 主表 ``ai_reports``，LEFT JOIN theme_predictions LEFT JOIN scores，
           未抽题材或未打分的报告也会出现
         * 关联：``ar.file_path = tp.report_path``（两者均相对 posix）
-        * 日期格式：``ar.report_date / tp.report_date / tps.report_date``
-          统一 YYYY-MM-DD（10 字符）；``tps.score_date`` 是 YYYYMMDD（8 字符）
-          —— 本函数 cutoff 按字段格式分别拼参
+        * 日期格式：``ar.report_date / tp.report_date / tps.report_date /
+          tps.score_date`` 全部统一 YYYYMMDD（2026-05-27 18:30 后符合 schema 协议）
         * ``score_status``：``scored_pairs / expected_pairs``
           - 0   → "none"
           - 100% → "full"
           - 其他 → "partial"
     """
     _validate_time_dim(time_dim)
-    cutoff_dash = (
-        datetime.now() - timedelta(days=days)
-    ).strftime("%Y-%m-%d")
+    # 2026-05-27 18:30：report_date / score_date 协议统一 YYYYMMDD
     cutoff_compact = (
         datetime.now() - timedelta(days=days)
     ).strftime("%Y%m%d")
@@ -514,7 +516,7 @@ def get_report_eval(
     if time_dim == "report_date":
         # 直接按 ar.report_date 过滤，未打分报告也保留
         time_where = "ar.report_date >= ?"
-        time_params: List = [cutoff_dash]
+        time_params: List = [cutoff_compact]
     else:  # score_date：必须有至少一条 scores 行，否则不出现
         time_where = (
             "EXISTS (SELECT 1 FROM theme_prediction_scores tps2 "

@@ -1,22 +1,20 @@
 """Phase 6 Step 6.3 · 虚拟回测端到端回归测试（mock LLM 完全离线）。
 
-覆盖
-----
-1. case_01 单日单模板回测 → md 改名 + ai_reports.is_backtest=1
-2. case_02 题材抽取透传 → theme_predictions.is_backtest=1 + 改 path
-3. case_03 日期范围（2 天 × 1 模板）→ 两份样本均入库
-4. case_04 穿越保护：trade_date 在未来 → ok=False，error 含"穿越"
-5. case_05 已存在 backtest 同 (template, date) → 第二次 skipped=True
-6. case_06 dry-run 不调 LLM + 不写 ai_reports
-7. case_07 已存在 + overwrite=True → 删旧重跑、不重复、analyze 调 1 次
-8. case_08 overwrite CASCADE → 旧 theme_predictions 全清、新 3 条落库
+.. warning::
 
-设计要点
---------
-* 完全 mock 掉 ``AnalysisService.analyze`` 与 ``build_snapshot``，**0 LLM / 0 Tushare**。
-* 用 ``TEST_BT_*`` 前缀的伪 ai_reports / theme_predictions / md 文件做数据隔离，
-  结尾 ``_cleanup_all()`` 必清。
-* trade_date 用过去某日（如 20260520）避开"穿越保护"；穿越用例单独用 99991231。
+    本测试文件是基于 2026-05-27 18:30 **旧链路**（事后 rename + UPDATE
+    report_date）写的。新链路下：
+
+    * 回测产物文件名从一开始就用模拟交易日 ``5月20日_0时00分_..._backtest.md``
+    * ``ai_reports.report_date`` / ``theme_predictions.report_date`` 统一 YYYYMMDD
+    * 不再有 ``_rename_to_backtest`` 这条物理重命名链路
+    * ``_run_analyze_and_mark_backtest`` 退化为薄壳，无事后 UPDATE
+
+    本文件的多数断言（``_backtest_{trade_date}`` 后缀、``target_report_date``
+    用 dash 等）已与新链路不一致，**需要主人择期重写**。
+
+    本次提交只做最小化适配：把 ``_seed_fake_report`` 入参从 YYYY-MM-DD 改为
+    YYYYMMDD，避免被 ``_ensure_yyyymmdd`` 入口防御抛出 ValueError。
 
 运行
 ----
@@ -217,7 +215,8 @@ def _patched_backtest(
         report_id = _seed_fake_report(
             file_path=fake_md,
             template_id=template_id,
-            report_date=datetime.now().strftime("%Y-%m-%d"),
+            # 2026-05-27 18:30：协议归一化为 YYYYMMDD
+            report_date=datetime.now().strftime("%Y%m%d"),
             is_backtest=0,
             theme_count=theme_count,
         )

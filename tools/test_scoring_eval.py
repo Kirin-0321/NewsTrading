@@ -62,9 +62,11 @@ def _yyyymmdd_back(days: int) -> str:
 
 
 def _yyyymmdash_back(days: int) -> str:
-    """YYYY-MM-DD 10 字符（用于 ar/tp/tps 的 report_date 字段，
-    对齐 :mod:`services.scoring.script_scorer` 实际写入格式）。"""
-    return (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+    """[2026-05-27 18:30 协议归一化后已等价于 _yyyymmdd_back] 兼容旧名保留。
+
+    schema 协议下 ``ar / tp / tps.report_date`` 全部统一 YYYYMMDD。
+    """
+    return _yyyymmdd_back(days)
 
 
 def _cleanup() -> None:
@@ -140,7 +142,8 @@ def _seed_dataset() -> None:
             zip(reports, theme_counts), start=1,
         ):
             base_dt = datetime.now() - timedelta(days=dbk)
-            rdate_dash = base_dt.strftime("%Y-%m-%d")
+            # 协议：report_date 统一 YYYYMMDD（2026-05-27 18:30 起强校验）
+            rdate_dash = base_dt.strftime("%Y%m%d")
             file_path = f"data/AI_analysis/{_PREFIX}r{idx}.md"
             cur = conn.execute(
                 "INSERT INTO ai_reports "

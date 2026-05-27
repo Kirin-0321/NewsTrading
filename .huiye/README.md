@@ -5,7 +5,7 @@
 > ③ `_` 前缀的临时草稿 / 调试快照 / 字段审计 ④ 跨多份正式文档的"汇总索引"  
 >  
 > **其余一切正式文档已迁入 `doc/{子目录}/`**（迁移日志见 [doc/updates/05-26-2126-工作目录文档迁移.md](../doc/updates/05-26-2126-工作目录文档迁移.md)）  
-> 最后更新: 2026-05-27 18:10（**涨停数据三源融合 v1 上线**：接入同花顺 `limit_list_ths` 主源 + lu_desc/封板率/连扳池/冲刺涨停四块新字段，5/27 ladder 从全 0 → 61 只，长期漏算 28% 涨停股的隐性 bug 一并修复；7 天回填 5/19~5/27 全绿；累计回归 **70 个用例全绿**（含本轮 test_three_source_merge 10）；下一步：Phase 6 Step 6.5 批量 LLM 跑批（**待主人授权 + 历史数据补全**）/ Phase 7 AI 评分员 / Phase 8 联调）
+> 最后更新: 2026-05-27 18:30（**报告日期协议错位 + 回测命名重构 bugfix 上线** schema 协议 YYYYMMDD 与实际入库 YYYY-MM-DD 错位 8 个月之久；同时治理回测产物"假冒生成时间"文件名；存量 16 行 dash 数据 + 1 份错命名 md 一次性迁移完成，幂等校验 OK；连带顺手治 rescore_range 隐藏 P1（区间重打分一直静默跑空 bug）；下一步：Phase 6 Step 6.5 批量 LLM 跑批（**待主人授权**）/ Phase 7 AI 评分员 / Phase 8 联调）
 
 ---
 
@@ -43,6 +43,8 @@
 | **评估页单报告删除按钮（2026-05-27 17:10）** | services/storage/ai_reports_store.delete_report 通用 API（allow_real 防误删 + dry_run + DeleteResult dataclass）+ tools/delete_report.py CLI（--report-id/--allow-real/--dry-run/--list/--yes/--json）+ gui/workers/delete_report_worker.py + 评估页下表「删除」列（backtest 单确认 / real 双重确认输入末 4 位）+ backtest_prompt._delete_existing_backtest 重构为薄包装（60→30 行 DRY）；[说明](../doc/features/05-27-1710-评估页单报告删除按钮.md) | 🟢 已交付 + 60/60 全量回归绿（含 case_14/15/16 CASCADE/protect/dry_run） |
 | **⭐ 涨停数据三源融合 v1（2026-05-27 18:10）** | 接入同花顺 `limit_list_ths` 主源（5 泳池：涨停/连扳/炸板/跌停/冲刺涨停）+ 三源 COALESCE 合并（ths > kpl > d）+ 8 个 Phase 全交付；新增 `fact_limit_sprint` 表 / `fact_limit_stock` 扩 8 列（lu_desc/封板率/market_type/tag/free_float/industry/total_mv/source）/ ladder Tab 6 列 / 新增 2 个 Tab（连扳池+冲刺涨停）/ markdown 章节「五·B 冲刺涨停」；7 天回填 5/19~5/27 全绿；5/27 ladder 全 0 → 61 只 + lu_desc 100% 命中；同时修复东财长期漏算 28% 涨停股的隐性 bug；[内容文档](../doc/design/05-27-1721-涨停数据三源融合设计.md) / [施工方案](../doc/design/05-27-1722-涨停数据三源融合施工方案.md) / [变更日志](../doc/updates/05-27-1810-涨停三源融合上线.md) | 🟢 已交付 + 70/70 全量回归绿（含 test_three_source_merge 10） |
 | **手动回测流式输出（2026-05-27 17:57）** | progress_callback 贯穿四层（worker→backtest_one→analyze→_stream_chat/extract_from_file）+ ManualBacktestPage 新增 stream_browser（LLM/题材双阶段共用）+ CLI --verbose + 顺手修 `_maybe_extract_themes` 漏传 callback 的存量 bug（AI 分析页也受益）；[bugfix](../doc/bugfix/05-27-1757-手动回测流式输出.md) | 🟢 已交付 + dry-run 验证通过 + 静态导入信号齐全（stage/progress/streaming/finished_result/error） |
+| **盘后页·全部个股 + 全部板块 Tab（2026-05-27 18:10）** | gui/utils/market_db_helper 加 `query_all_stocks/query_all_sectors`；market_summary_page 板块 tab 改 ComboBox 切换（Top20/Bottom10/全部 486 个）+ 搜索框；新增「全部个股」tab（5504 只 7 列 + _SortableNumItem 数值排序 + 涨停/跌停/炸板染色 + 模糊搜索）；CLI `tools/query_all_{stocks,sectors}.py` + 5 用例回归；[说明](../doc/features/05-27-1810-盘后页全部个股全部板块Tab.md) | 🟢 已交付 + 75/75 全量回归绿 + 5504 行填表 180ms 实测 |
+| **⭐ 报告日期协议错位 + 回测命名重构（2026-05-27 18:30）** | schema 协议 YYYYMMDD vs 实际入库 YYYY-MM-DD 长期错位 → GUI「单报告打分」按钮 ValueError；同时治理回测产物"假冒生成时间"问题（`5月27日_18时12分_..._backtest_20260522.md` → `5月22日_0时00分_..._backtest.md`）。改造点：①`AINewsAnalyzer.analyze` 加 naming_dt/backtest_suffix ②`AnalysisService.analyze` 加 simulated_trade_date 透传驱动文件名/入库 ③`parse_report_meta` 优先文件名前缀解析 → YYYYMMDD ④删 `backtest_prompt._rename_to_backtest`，`_run_analyze_and_mark_backtest` 80→30 行 ⑤`theme_store/ai_reports_store/_eligible_score_dates` 入口加 `_ensure_yyyymmdd` 防御 ⑥GUI 新建 `gui/utils/date_format.py` helper + 显示层适配 ⑦一次性迁移 CLI `tools/migrate_report_date_yyyymmdd.py`（已 apply：16 行 db 字段 + 1 份 md，幂等 OK）⑧顺手治 rescore_range 隐藏 P1（区间重打分静默跑空）；[bugfix](../doc/bugfix/05-27-1830-报告日期与回测命名重构.md) | 🟢 已交付 + 单元验证全过 + GUI 手测交主人 |
 | [CLI 评估回测 / Agent 优化初步设计](../doc/design/05-26-2126-CLI评估回测Agent优化初步设计.md) | **候选 #2（重头）** — 把 30 天历史盘后数据用起来跑虚拟回测 | 🟡 设计已完成，**待主人决定是否开工** |
 
 ---

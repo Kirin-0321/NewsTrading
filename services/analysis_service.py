@@ -84,9 +84,18 @@ class AnalysisService:
         enable_deep_thinking: bool = True,
         cancel_check: Optional[Callable[[], bool]] = None,
         progress_callback: Optional[Callable] = None,
+        simulated_trade_date: Optional[str] = None,
     ) -> AnalysisResult:
         """
         从数据库加载新闻并执行 AI 分析。
+
+        Args:
+            simulated_trade_date: 虚拟回测专用。YYYYMMDD 格式。
+                - None（默认）：真实生成，文件名/入库 report_date 都用当前时间
+                - 给定（如 ``"20260522"``）：
+                    * 报告文件名用 ``{月}月{日}日_0时00分_..._backtest.md`` 命名
+                    * ``ai_reports.is_backtest = 1``、``report_date = 该日期``
+                    * 题材入库（theme_predictions）的 report_date 同步
 
         Returns:
             AnalysisResult
@@ -125,6 +134,24 @@ class AnalysisService:
                 "end": max(times) if times else "",
             }
 
+            # 回测命名时间：模拟交易日 00:00（前缀显示该日期，便于人辨识）
+            naming_dt: Optional[datetime] = None
+            backtest_suffix = False
+            if simulated_trade_date:
+                if not (
+                    len(simulated_trade_date) == 8
+                    and simulated_trade_date.isdigit()
+                ):
+                    out.error = (
+                        f"simulated_trade_date 应为 YYYYMMDD，得到 "
+                        f"{simulated_trade_date!r}"
+                    )
+                    return out
+                naming_dt = datetime.strptime(
+                    simulated_trade_date + "0000", "%Y%m%d%H%M"
+                )
+                backtest_suffix = True
+
             temp_path = self._write_temp_json(news_list, source)
             try:
                 from core.ai_news_analyzer import AINewsAnalyzer
@@ -140,6 +167,8 @@ class AnalysisService:
                     progress_callback=progress_callback,
                     enable_deep_thinking=enable_deep_thinking,
                     cancel_check=cancel_check,
+                    naming_dt=naming_dt,
+                    backtest_suffix=backtest_suffix,
                 )
             finally:
                 try:
@@ -166,12 +195,14 @@ class AnalysisService:
                     auto_market_used=bool(
                         market_summary and market_summary.strip()
                     ),
+                    simulated_trade_date=simulated_trade_date,
                 )
                 self._maybe_extract_themes(
                     out,
                     progress_callback,
                     force=extract_themes,
                     cancel_check=cancel_check,
+                    simulated_trade_date=simulated_trade_date,
                 )
                 # 题材抽取若成功，回写 theme_extracted=1
                 if out.theme_count and out.report_path:
@@ -204,8 +235,14 @@ class AnalysisService:
         template_id: Optional[str],
         market_trade_date: Optional[str],
         auto_market_used: bool,
+        simulated_trade_date: Optional[str] = None,
     ) -> None:
         """把刚生成的 AI 报告索引化到 ``ai_reports`` 表（M4.4/M4.5）。
+
+        Args:
+            simulated_trade_date: YYYYMMDD；给定时表示这是虚拟回测产物，
+                ``ai_reports.report_date = 该值`` + ``is_backtest = 1``。
+                为 None 时按 ``datetime.now()`` 的 YYYYMMDD 入库 + ``is_backtest = 0``。
 
         失败仅写 logger.warning，不影响主分析流程。
         """
@@ -241,8 +278,10 @@ class AnalysisService:
             except Exception:
                 pass
 
-        # report_date 从 report_path 文件名 / 当前时间推
-        report_date = datetime.now().strftime("%Y-%m-%d")
+        # report_date：回测产物用模拟交易日；真实生成用当前日期
+        # 协议：统一 YYYYMMDD（与 schema 一致）
+        report_date = simulated_trade_date or datetime.now().strftime("%Y%m%d")
+        is_backtest = bool(simulated_trade_date)
 
         # 时间范围
         tr = out.time_range or {}
@@ -269,6 +308,7 @@ class AnalysisService:
                 news_count=out.news_count or None,
                 used_market_date=used_market_date,
                 theme_extracted=False,
+                is_backtest=is_backtest,
             )
             if rid:
                 out.report_id = rid
@@ -337,6 +377,7 @@ class AnalysisService:
         progress_callback: Optional[Callable] = None,
         force: Optional[bool] = None,
         cancel_check: Optional[Callable[[], bool]] = None,
+        simulated_trade_date: Optional[str] = None,
     ) -> None:
         """分析完成后自动抽取题材入库。
 
@@ -345,6 +386,9 @@ class AnalysisService:
                    None → 走 config 的 enabled/auto_run；
                    True → 强制跑（仍需 enabled=True 且 API Key 存在）；
                    False → 强制跳过。
+            simulated_trade_date: 虚拟回测专用，YYYYMMDD。给定时覆盖
+                ``parse_report_meta`` 推断的 ``report_date``，并把
+                ``is_backtest`` 置为 True 入库到 ``theme_predictions``。
 
         失败不抛异常，仅记录 result.theme_error，避免影响主流程报告产出。
         """
@@ -392,6 +436,10 @@ class AnalysisService:
                 return
 
             meta = parse_report_meta(result.report_path)
+            if simulated_trade_date:
+                # 回测产物：用模拟交易日覆盖（最权威），并打回测标
+                meta["report_date"] = simulated_trade_date
+                meta["is_backtest"] = True
             saved = get_theme_store().save_themes(
                 meta, themes, news_id_map=news_id_map
             )

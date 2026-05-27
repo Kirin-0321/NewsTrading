@@ -329,6 +329,8 @@ class AINewsAnalyzer:
         progress_callback: Optional[Callable] = None,
         enable_deep_thinking: bool = True,
         cancel_check: Optional[Callable[[], bool]] = None,
+        naming_dt: Optional[datetime] = None,
+        backtest_suffix: bool = False,
     ) -> Dict:
         """
         分析新闻文件
@@ -338,6 +340,12 @@ class AINewsAnalyzer:
             'report_file': '报告文件路径',
             'error': '错误信息'
         }
+
+        Args:
+            naming_dt: 报告文件命名用的时间戳。
+                - None（默认）：真实生成，用 ``datetime.now()`` 命名
+                - 给定 datetime：用该值命名（典型场景：回测产物用模拟交易日 00:00）
+            backtest_suffix: True 时文件名追加 ``_backtest`` 后缀，标识虚拟回测产物。
         """
         try:
             _raise_if_cancelled(cancel_check)
@@ -402,7 +410,9 @@ class AINewsAnalyzer:
                 result_text,
                 file_path,
                 data['time_range'],
-                news_list
+                news_list,
+                naming_dt=naming_dt,
+                backtest_suffix=backtest_suffix,
             )
 
             if progress_callback:
@@ -440,25 +450,30 @@ class AINewsAnalyzer:
         content: str,
         source_file: str,
         time_range: Dict,
-        news_list: Optional[list] = None
+        news_list: Optional[list] = None,
+        naming_dt: Optional[datetime] = None,
+        backtest_suffix: bool = False,
     ) -> str:
-        """保存分析报告"""
-        # 获取源文件名（用于报告头部）
+        """保存分析报告。
+
+        Args:
+            naming_dt: 文件命名用的时间戳；None=用 ``datetime.now()``（真实生成），
+                给定值=用该时间命名（典型：回测产物用模拟交易日 00:00）
+            backtest_suffix: True 时文件名追加 ``_backtest`` 后缀
+        """
         basename = os.path.basename(source_file)
 
-        # 生成报告文件名 - 格式: 月日_时_盘后总结分析报告.md
-        now = datetime.now()
+        # 命名时间：真实生成 = now；回测 = 模拟交易日 00:00
+        naming = naming_dt or datetime.now()
 
-        # 获取月日（去掉前导零）
-        month_day = f"{now.month}月{now.day}日"
+        month_day = f"{naming.month}月{naming.day}日"
+        time_str = f"{naming.hour}时{naming.strftime('%M')}分"
 
-        # 获取时分（时不带前导零，分钟带前导零）
-        hour = now.hour
-        minute = now.strftime('%M')
-        time_str = f"{hour}时{minute}分"
-
-        # 生成文件名
-        report_filename = f"{month_day}_{time_str}_盘后总结分析报告.md"
+        # 文件名（回测追加 _backtest 后缀，便于人/程序一眼识别）
+        suffix = "_backtest" if backtest_suffix else ""
+        report_filename = (
+            f"{month_day}_{time_str}_盘后总结分析报告{suffix}.md"
+        )
 
         # 生成保存路径: data/AI_analysis/月日/
         from services.storage.database import get_project_root

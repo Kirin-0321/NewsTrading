@@ -32,6 +32,18 @@ _VALID_DURATION = {"短期", "中期", "长期"}
 _VALID_GAP = {"高", "中高", "中", "中低", "低"}
 
 
+def _ensure_yyyymmdd(s: str, field: str = "report_date") -> None:
+    """协议校验：``report_date`` 必须是 8 位 YYYYMMDD（schema 强制）。
+
+    2026-05-27 18:30 加入：历史上存在 ``YYYY-MM-DD`` 入库违反协议的债
+    （已修），此处入口防御让以后再违反立刻炸而不是隐性下游报错。
+    """
+    if not (isinstance(s, str) and len(s) == 8 and s.isdigit()):
+        raise ValueError(
+            f"{field} 应为 YYYYMMDD 8 位数字，得到 {s!r}"
+        )
+
+
 def _normalize_theme(theme: Dict) -> Dict:
     """字段补全 + 等级/分数自洽校正（v4 适配带符号 score）。
 
@@ -118,7 +130,7 @@ class ThemeStore:
         Args:
             report_meta: {
                 'report_id': str（文件名 string），
-                'report_date': 'YYYY-MM-DD',
+                'report_date': 'YYYYMMDD'（schema 协议；入口 _ensure_yyyymmdd 强校验），
                 'report_time': 'HH:MM',
                 'report_path': str（建议已是相对 posix；本函数会再规范化一次），
                 'is_backtest': bool（可选，默认 False；True=虚拟回测产物）
@@ -142,6 +154,7 @@ class ThemeStore:
             raise ValueError(
                 "report_meta 必须包含 report_id / report_date / report_path"
             )
+        _ensure_yyyymmdd(report_date)
 
         # P1: 双保险路径规范化（即使上游传了绝对路径也能修正）
         try:

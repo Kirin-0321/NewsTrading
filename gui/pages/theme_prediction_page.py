@@ -386,11 +386,13 @@ class ThemePredictionPage(QWidget):
             self.stats_label.setText(f"查询失败: {e}")
             return
 
+        from gui.utils.date_format import format_yyyymmdd_to_dash
         self.date_combo.blockSignals(True)
         self.date_combo.clear()
         for r in rows:
+            rd = r["report_date"]
             self.date_combo.addItem(
-                f"{r['report_date']} ({r['cnt']} 条)", r["report_date"]
+                f"{format_yyyymmdd_to_dash(rd)} ({r['cnt']} 条)", rd
             )
 
         # 模板筛选下拉重载（友好名显示，data 仍是 prompt_id）

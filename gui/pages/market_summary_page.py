@@ -43,12 +43,14 @@ from PyQt5.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QLineEdit,
     QListWidget,
     QListWidgetItem,
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
     QSplitter,
+    QStackedWidget,
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
@@ -153,6 +155,39 @@ def _safe_get(d: Optional[Dict[str, Any]], *keys, default=None):
     return cur
 
 
+class _SortableNumItem(QTableWidgetItem):
+    """支持按 Qt.UserRole 存的数值排序的表格单元。
+
+    用途
+    ----
+    QTableWidget 默认按 ``text()`` 字典序排序，对 ``"+5.23%"`` / ``"1,234.56"``
+    会得到错乱的顺序。本子类在 ``__lt__`` 里读 ``Qt.UserRole`` 的浮点数比较，
+    None 视为最小（沉到底）。
+
+    用法::
+
+        item = _SortableNumItem(_fmt_pct(5.23))
+        item.setData(Qt.UserRole, 5.23)
+    """
+
+    def __lt__(self, other):  # type: ignore[override]
+        a = self.data(Qt.UserRole)
+        b = (
+            other.data(Qt.UserRole)
+            if isinstance(other, QTableWidgetItem) else None
+        )
+        if a is None and b is None:
+            return False
+        if a is None:
+            return True
+        if b is None:
+            return False
+        try:
+            return float(a) < float(b)
+        except (TypeError, ValueError):
+            return super().__lt__(other)
+
+
 # ---------------------------------------------------------------------------
 # MarketSummaryPage
 # ---------------------------------------------------------------------------
@@ -188,7 +223,8 @@ class MarketSummaryPage(QWidget):
 
         self.tabs = QTabWidget()
         self.tabs.addTab(self._build_tab_overview(), "📊 总览")
-        self.tabs.addTab(self._build_tab_sectors(), "🏢 板块行情")
+        self.tabs.addTab(self._build_tab_sectors(), "🏢 全部板块")
+        self.tabs.addTab(self._build_tab_all_stocks(), "📋 全部个股")
         self.tabs.addTab(self._build_tab_ladder(), "🚀 涨停 & 连板")
         self.tabs.addTab(self._build_tab_lianban(), "📈 连扳池")
         self.tabs.addTab(self._build_tab_sprint(), "🏃 冲刺涨停")
@@ -532,7 +568,7 @@ class MarketSummaryPage(QWidget):
         return group
 
     # ------------------------------------------------------------------
-    # Tab 2: 板块
+    # Tab 2: 全部板块（支持 Top20 / Bottom10 / 全部 三种视图）
     # ------------------------------------------------------------------
 
     _SECTOR_COLS = [
@@ -545,6 +581,11 @@ class MarketSummaryPage(QWidget):
         ("龙头股 Top3", 320),
         ("催化（cls/ai）", 320),
     ]
+    # 板块视图模式：(显示文案, mode key)
+    _SECTOR_MODES = [
+        ("📈 涨幅 Top 20 + 📉 跌幅 Top 10", "split"),
+        ("📋 全部 ~480 个", "all"),
+    ]
     # high_risk 行背景色（pct_chg_5d 阈值由 GUI 自算 — 后端 high_risk 当前永远 None）
     _RISK_HIGH_BG = QColor("#FFEBEE")    # 浅红：5 日累涨 > 15%
     _RISK_MID_BG = QColor("#FFF8E1")     # 浅黄：5 日累涨 > 8%
@@ -555,39 +596,82 @@ class MarketSummaryPage(QWidget):
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(6)
 
-        legend = QHBoxLayout()
-        legend.setSpacing(12)
-        legend.addWidget(QLabel("催化来源:"))
-        legend.addWidget(self._color_legend(_COLOR_CLS, "CLS"))
-        legend.addWidget(self._color_legend(_COLOR_AI, "AI 兜底"))
-        legend.addWidget(self._color_legend(_COLOR_NONE, "未命中"))
-        legend.addStretch()
-        legend.addWidget(QLabel(
+        # 顶部工具条：视图切换 + 搜索 + 计数 + 催化色块图例
+        toolbar = QHBoxLayout()
+        toolbar.setSpacing(8)
+        toolbar.addWidget(QLabel("视图:"))
+        self.sector_mode_combo = QComboBox()
+        for label, mode in self._SECTOR_MODES:
+            self.sector_mode_combo.addItem(label, mode)
+        self.sector_mode_combo.setStyleSheet(COMBOBOX_STYLE)
+        self.sector_mode_combo.currentIndexChanged.connect(
+            self._on_sector_mode_changed
+        )
+        toolbar.addWidget(self.sector_mode_combo)
+
+        toolbar.addWidget(QLabel("搜索:"))
+        self.sector_search = QLineEdit()
+        self.sector_search.setPlaceholderText("板块名…")
+        self.sector_search.setMaximumWidth(180)
+        self.sector_search.textChanged.connect(
+            self._on_sector_search_changed
+        )
+        toolbar.addWidget(self.sector_search)
+
+        self.sector_count_label = QLabel("共 — 个")
+        self.sector_count_label.setStyleSheet("color:#8C8C8C;")
+        toolbar.addWidget(self.sector_count_label)
+
+        toolbar.addStretch()
+
+        toolbar.addWidget(QLabel("催化:"))
+        toolbar.addWidget(self._color_legend(_COLOR_CLS, "CLS"))
+        toolbar.addWidget(self._color_legend(_COLOR_AI, "AI"))
+        toolbar.addWidget(self._color_legend(_COLOR_NONE, "无"))
+
+        layout.addLayout(toolbar)
+
+        info = QLabel(
             "<span style='color:#8C8C8C;font-size:12px'>"
-            "（Top 11+/Bottom 板块 5 日列与催化均为空 — 后端只对 Top 10 注入）"
+            "Top 11+/Bottom/全部模式下 5 日列基本为空 — 后端只对 Top 10 注入；"
+            "全部模式下 Top 10 的催化会按 ts_code 自动注入"
             "</span>"
-        ))
-        layout.addLayout(legend)
+        )
+        layout.addWidget(info)
 
-        split = QSplitter(Qt.Vertical)
+        # QStackedWidget 在两种视图间切换：
+        #   idx=0 → split 视图（QSplitter 上下：Top 20 + Bottom 10）
+        #   idx=1 → all   视图（单表，~480 行）
+        self.sector_view_stack = QStackedWidget()
 
-        # 上：涨幅 Top 20（前 10 含 cls/ai catalysts，11~20 由 GUI 直查补足）
+        # ---- View 0: split ----
+        split_wrap = QWidget()
+        split_layout = QVBoxLayout(split_wrap)
+        split_layout.setContentsMargins(0, 0, 0, 0)
+        splitter = QSplitter(Qt.Vertical)
+
         top_group = QGroupBox("📈 涨幅 Top 20")
         tg = QVBoxLayout(top_group)
         self.sector_table = self._make_basic_table(self._SECTOR_COLS)
         tg.addWidget(self.sector_table)
-        split.addWidget(top_group)
+        splitter.addWidget(top_group)
 
-        # 下：跌幅 Top 10（GUI 直查 fact_sector_daily）
         bot_group = QGroupBox("📉 跌幅 Top 10")
         bg = QVBoxLayout(bot_group)
         self.sector_table_bottom = self._make_basic_table(self._SECTOR_COLS)
         bg.addWidget(self.sector_table_bottom)
-        split.addWidget(bot_group)
+        splitter.addWidget(bot_group)
 
-        split.setStretchFactor(0, 2)
-        split.setStretchFactor(1, 1)
-        layout.addWidget(split, 1)
+        splitter.setStretchFactor(0, 2)
+        splitter.setStretchFactor(1, 1)
+        split_layout.addWidget(splitter)
+        self.sector_view_stack.addWidget(split_wrap)  # idx=0
+
+        # ---- View 1: all ----
+        self.sector_table_all = self._make_basic_table(self._SECTOR_COLS)
+        self.sector_view_stack.addWidget(self.sector_table_all)  # idx=1
+
+        layout.addWidget(self.sector_view_stack, 1)
         return wrap
 
     def _color_legend(self, color: QColor, text: str) -> QWidget:
@@ -606,7 +690,68 @@ class MarketSummaryPage(QWidget):
         return wrap
 
     # ------------------------------------------------------------------
-    # Tab 3: 涨停 & 连板
+    # Tab 3: 全部个股（默认涨跌幅倒序，顶部搜索，列头点击排序）
+    # ------------------------------------------------------------------
+
+    _ALL_STOCKS_COLS = [
+        ("代码", 100),
+        ("名称", 100),
+        ("行业", 100),
+        ("涨跌幅", 80),
+        ("收盘价", 80),
+        ("成交额(亿)", 100),
+        ("标", 50),       # U/Z/D 标记
+    ]
+    # 涨停标行底色（与「涨停 & 连板」Tab 保持视觉对齐）
+    _STOCK_LIMIT_BG = {
+        "U": QColor("#FFEBEE"),   # 浅红
+        "D": QColor("#E8F5E9"),   # 浅绿
+        "Z": QColor("#FFF8E1"),   # 浅黄（炸板）
+    }
+    # 涨停标排序权重（让 U > Z > D > 普通，列头排序时直观）
+    _STOCK_LIMIT_RANK = {"U": 3, "Z": 2, "D": 1}
+
+    def _build_tab_all_stocks(self) -> QWidget:
+        wrap = QWidget()
+        layout = QVBoxLayout(wrap)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
+
+        toolbar = QHBoxLayout()
+        toolbar.setSpacing(8)
+        toolbar.addWidget(QLabel("搜索:"))
+        self.stock_search = QLineEdit()
+        self.stock_search.setPlaceholderText("代码或名称…")
+        self.stock_search.setMaximumWidth(220)
+        self.stock_search.textChanged.connect(
+            self._on_stock_search_changed
+        )
+        toolbar.addWidget(self.stock_search)
+
+        self.stock_count_label = QLabel("共 — 只")
+        self.stock_count_label.setStyleSheet("color:#8C8C8C;")
+        toolbar.addWidget(self.stock_count_label)
+
+        toolbar.addStretch()
+
+        info = QLabel(
+            "<span style='color:#8C8C8C;font-size:12px'>"
+            "默认按涨跌幅倒序；点击列头切换排序；"
+            "<span style='background:#FFEBEE;'>红=涨停</span> · "
+            "<span style='background:#E8F5E9;'>绿=跌停</span> · "
+            "<span style='background:#FFF8E1;'>黄=炸板</span>"
+            "</span>"
+        )
+        toolbar.addWidget(info)
+
+        layout.addLayout(toolbar)
+
+        self.all_stocks_table = self._make_basic_table(self._ALL_STOCKS_COLS)
+        layout.addWidget(self.all_stocks_table, 1)
+        return wrap
+
+    # ------------------------------------------------------------------
+    # Tab 4: 涨停 & 连板
     # ------------------------------------------------------------------
 
     def _build_tab_ladder(self) -> QWidget:
@@ -852,6 +997,7 @@ class MarketSummaryPage(QWidget):
             return
         self._populate_overview(self._summary)
         self._populate_sectors(self._summary)
+        self._populate_all_stocks(self._summary)
         self._populate_ladder(self._summary)
         self._populate_lianban(self._summary)
         self._populate_sprint(self._summary)
@@ -1084,8 +1230,18 @@ class MarketSummaryPage(QWidget):
             self.meta_conflicts_label.setStyleSheet("color:#52C41A;")
 
     def _populate_sectors(self, summary: Dict[str, Any]) -> None:
-        """填充板块 Tab 上下两块：Top 20（含后端 Top 10 + helper 补 11~20）/ Bottom 10。"""
-        from gui.utils.market_db_helper import query_sectors_extended
+        """按当前视图模式（split / all）填充板块表。
+
+        两种模式::
+
+            split → QStackedWidget idx=0：上 Top 20（合后端 catalysts）+ 下 Bottom 10
+            all   → QStackedWidget idx=1：单表 ~480 行；后端 Top 10 的催化按
+                    ts_code 自动注入到 all 列表里对应行（保证视觉一致）
+        """
+        from gui.utils.market_db_helper import (
+            query_all_sectors,
+            query_sectors_extended,
+        )
 
         backend_top = summary.get("sectors_top") or []  # 后端 Top 10，含 cls/ai
         td = (
@@ -1093,30 +1249,108 @@ class MarketSummaryPage(QWidget):
             or self._current_trade_date
             or ""
         )
-
-        # 取扩展榜单：Top 20 + Bottom 10（直查 fact_sector_daily）
-        ext = (
-            query_sectors_extended(td, top_n=20, bottom_n=10)
-            if td else {"top": [], "bottom": []}
+        mode = (
+            self.sector_mode_combo.currentData()
+            if hasattr(self, "sector_mode_combo") else "split"
         )
-        # 合并 Top 20：后端 Top 10（保留 cls/ai catalysts）+ helper 补的 11~20
-        existing_codes = {
-            s.get("ts_code") for s in backend_top if s.get("ts_code")
-        }
-        extras_top = [
-            s for s in ext["top"]
-            if s.get("ts_code") and s.get("ts_code") not in existing_codes
-        ]
-        top_20 = (list(backend_top) + extras_top)[:20]
-        for i, s in enumerate(top_20, 1):
-            s["rank"] = i
 
-        bottom_10 = ext["bottom"]
-        for i, s in enumerate(bottom_10, 1):
-            s["rank"] = i
+        if mode == "split":
+            self.sector_view_stack.setCurrentIndex(0)
 
-        self._fill_sector_table(self.sector_table, top_20, td)
-        self._fill_sector_table(self.sector_table_bottom, bottom_10, td)
+            ext = (
+                query_sectors_extended(td, top_n=20, bottom_n=10)
+                if td else {"top": [], "bottom": []}
+            )
+            # Top 20 = 后端 sectors_top（含 cls/ai catalysts）+ helper 补 11~20
+            existing = {
+                s.get("ts_code") for s in backend_top if s.get("ts_code")
+            }
+            extras = [
+                s for s in ext["top"]
+                if s.get("ts_code") and s.get("ts_code") not in existing
+            ]
+            top20 = (list(backend_top) + extras)[:20]
+            for i, s in enumerate(top20, 1):
+                s["rank"] = i
+
+            bottom10 = list(ext["bottom"])
+            for i, s in enumerate(bottom10, 1):
+                s["rank"] = i
+
+            self._fill_sector_table(self.sector_table, top20, td)
+            self._fill_sector_table(self.sector_table_bottom, bottom10, td)
+
+            if hasattr(self, "sector_count_label"):
+                self.sector_count_label.setText(
+                    f"Top {len(top20)} + Bottom {len(bottom10)}"
+                )
+        else:  # all
+            self.sector_view_stack.setCurrentIndex(1)
+
+            rows = query_all_sectors(td) if td else []
+            # 把后端 Top 10 的 catalysts/catalysts_source 按 ts_code 注入对应行，
+            # 修复主人发现的"全部模式催化全空"问题
+            cat_map = {
+                s.get("ts_code"): s
+                for s in backend_top
+                if s.get("ts_code")
+            }
+            for r in rows:
+                src_row = cat_map.get(r.get("ts_code"))
+                if src_row and src_row.get("catalysts"):
+                    r["catalysts"] = src_row.get("catalysts") or []
+                    r["catalysts_source"] = (
+                        src_row.get("catalysts_source") or "none"
+                    )
+                    r["catalysts_match"] = src_row.get("catalysts_match") or ""
+
+            for i, s in enumerate(rows, 1):
+                s["rank"] = i
+
+            self._fill_sector_table(self.sector_table_all, rows, td)
+
+            if hasattr(self, "sector_count_label"):
+                self.sector_count_label.setText(f"共 {len(rows)} 个")
+
+        self._apply_sector_search_filter()
+
+    def _on_sector_mode_changed(self, _idx: int) -> None:
+        """视图 ComboBox 切换 → 重渲染当前 summary。"""
+        if self._summary:
+            self._populate_sectors(self._summary)
+
+    def _on_sector_search_changed(self, _text: str) -> None:
+        """搜索框输入 → 实时过滤可见行。"""
+        self._apply_sector_search_filter()
+
+    def _apply_sector_search_filter(self) -> None:
+        """按 sector_search 文本隐藏不匹配行（板块名 col=1）。
+
+        视图感知::
+
+            split 模式 → 同时过滤 sector_table（Top 20）+ sector_table_bottom
+            all   模式 → 只过滤 sector_table_all
+        """
+        if not hasattr(self, "sector_search"):
+            return
+        kw = self.sector_search.text().strip().lower()
+        mode = (
+            self.sector_mode_combo.currentData()
+            if hasattr(self, "sector_mode_combo") else "split"
+        )
+        if mode == "split":
+            tables = [self.sector_table, self.sector_table_bottom]
+        else:
+            tables = [self.sector_table_all]
+
+        for table in tables:
+            for row in range(table.rowCount()):
+                if not kw:
+                    table.setRowHidden(row, False)
+                    continue
+                item = table.item(row, 1)
+                text = item.text().lower() if item else ""
+                table.setRowHidden(row, kw not in text)
 
     def _fill_sector_table(
         self,
@@ -1211,6 +1445,145 @@ class MarketSummaryPage(QWidget):
                         item.setForeground(_COLOR_MUTED)
                         item.setToolTip("未命中：raw_news 中也找不到证据")
                 table.setItem(row, col, item)
+
+    # ------------------------------------------------------------------
+    # 全部个股：填充 / 搜索
+    # ------------------------------------------------------------------
+
+    def _populate_all_stocks(self, summary: Dict[str, Any]) -> None:
+        """直查 fact_stock_daily 填充全部个股表（~5400 行，默认涨跌幅倒序）。
+
+        输入:
+            summary  当前 _summary（用 meta.trade_date；空则走 _current_trade_date）
+        输出:
+            原地填充 self.all_stocks_table；每列用 _SortableNumItem 存数值副本
+            支持按列头点击切换排序，搜索由 _apply_stock_search_filter 隐藏不匹配行。
+        """
+        from gui.utils.market_db_helper import query_all_stocks
+
+        td = (
+            (summary.get("meta") or {}).get("trade_date")
+            or self._current_trade_date
+            or ""
+        )
+        rows = query_all_stocks(td) if td else []
+
+        table = self.all_stocks_table
+        # 填充期关闭排序 + 关闭刷新，5500 行可控制在 ~500ms 内
+        table.setSortingEnabled(False)
+        table.setUpdatesEnabled(False)
+        try:
+            table.setRowCount(len(rows))
+            for row_idx, s in enumerate(rows):
+                self._fill_all_stocks_row(table, row_idx, s)
+        finally:
+            table.setUpdatesEnabled(True)
+
+        # 默认按涨跌幅倒序（col=3）；后续主人点击列头会自动切换
+        table.setSortingEnabled(True)
+        table.sortItems(3, Qt.DescendingOrder)
+
+        if hasattr(self, "stock_count_label"):
+            self.stock_count_label.setText(f"共 {len(rows)} 只")
+        self._apply_stock_search_filter()
+
+    def _fill_all_stocks_row(
+        self,
+        table: QTableWidget,
+        row_idx: int,
+        s: Dict[str, Any],
+    ) -> None:
+        """填充单行（拆出来便于测试/复用）。
+
+        列对齐 _ALL_STOCKS_COLS：代码 / 名称 / 行业 / 涨跌幅 / 收盘价 /
+        成交额(亿) / 标(U/Z/D)。
+        """
+        ts_code = s.get("ts_code") or ""
+        name = s.get("name") or ""
+        industry = s.get("industry") or ""
+        pct = s.get("pct_chg")
+        close = s.get("close")
+        amount_yi = s.get("amount_yi")
+        limit_type = s.get("limit_type")
+
+        row_bg = self._STOCK_LIMIT_BG.get(limit_type) if limit_type else None
+        pct_color = _pct_color(pct)
+
+        # (显示文本, 排序键 / None=纯文本排序)
+        cells = [
+            (ts_code, ts_code),
+            (name, name),
+            (industry, industry),
+            (_fmt_pct(pct), pct),
+            (_fmt_num(close, 2), close),
+            (_fmt_num(amount_yi, 2), amount_yi),
+            (limit_type or "", self._STOCK_LIMIT_RANK.get(limit_type, 0)),
+        ]
+
+        for col, (txt, key) in enumerate(cells):
+            if isinstance(key, (int, float)) or key is None:
+                item = _SortableNumItem(txt)
+                if key is not None:
+                    try:
+                        item.setData(Qt.UserRole, float(key))
+                    except (TypeError, ValueError):
+                        pass
+            else:
+                item = QTableWidgetItem(txt)
+
+            if row_bg is not None:
+                item.setBackground(QBrush(row_bg))
+
+            if col == 3 and pct_color is not None:
+                item.setForeground(pct_color)
+                f = QFont()
+                f.setBold(True)
+                item.setFont(f)
+            elif col == 6 and limit_type:
+                fg = (
+                    _COLOR_RED if limit_type == "U" else
+                    _COLOR_GREEN if limit_type == "D" else
+                    QColor("#FA8C16")  # 炸板：橙色
+                )
+                item.setForeground(fg)
+                f = QFont()
+                f.setBold(True)
+                item.setFont(f)
+
+            table.setItem(row_idx, col, item)
+
+    def _on_stock_search_changed(self, _text: str) -> None:
+        self._apply_stock_search_filter()
+
+    def _apply_stock_search_filter(self) -> None:
+        """按 stock_search 文本过滤可见行（代码 col=0 / 名称 col=1）。"""
+        if not hasattr(self, "stock_search"):
+            return
+        kw = self.stock_search.text().strip().lower()
+        table = self.all_stocks_table
+        total = table.rowCount()
+        visible = 0
+        for row in range(total):
+            if not kw:
+                table.setRowHidden(row, False)
+                visible += 1
+                continue
+            code_item = table.item(row, 0)
+            name_item = table.item(row, 1)
+            code = code_item.text().lower() if code_item else ""
+            name = name_item.text().lower() if name_item else ""
+            hit = (kw in code) or (kw in name)
+            table.setRowHidden(row, not hit)
+            if hit:
+                visible += 1
+
+        if hasattr(self, "stock_count_label"):
+            if kw:
+                self.stock_count_label.setText(
+                    f"显示 {visible} / 共 {total} 只"
+                )
+            else:
+                self.stock_count_label.setText(f"共 {total} 只")
 
     def _format_sector_leaders(
         self,

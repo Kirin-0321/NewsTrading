@@ -257,6 +257,138 @@ def _derive_sector_leaders(
         return (None, [])
 
 
+def query_all_stocks(trade_date: str) -> List[Dict[str, Any]]:
+    """直查 fact_stock_daily 取某交易日全 A 股行情（GUI 全部个股 Tab 用）。
+
+    数据合并::
+
+        fact_stock_daily   ← 主表（ts_code/pct_chg/close/amount）
+          LEFT JOIN dim_stock        on ts_code → name / industry / market
+          LEFT JOIN fact_limit_stock on (ts_code,trade_date) → limit_type 涨停标
+
+    输入:
+        trade_date  YYYYMMDD（必传，空串/None → 返回 []）
+
+    输出:
+        list of dict —— 每条字段::
+
+            ts_code     str   600172.SH
+            name        str   股票名（dim_stock 缺失时为 ""）
+            industry    str   申万行业（缺失为 ""）
+            market      str   主板/创业板/科创板/北证（缺失为 ""）
+            pct_chg     Optional[float]   涨跌幅 %
+            close       Optional[float]   收盘价 元
+            amount_yi   Optional[float]   成交额 亿元（amount/100000，amount 单位千元）
+            limit_type  Optional[str]     U=涨停 / Z=炸板 / D=跌停 / None=普通
+
+        默认按 pct_chg DESC NULLS LAST 排序（GUI 默认倒序展示）。
+    """
+    if not trade_date:
+        return []
+
+    db = get_market_db()
+    try:
+        with db.connect(readonly=True) as conn:
+            rows = conn.execute(
+                "SELECT s.ts_code, "
+                "       COALESCE(d.name, '') AS name, "
+                "       COALESCE(d.industry, '') AS industry, "
+                "       COALESCE(d.market, '') AS market, "
+                "       s.pct_chg, s.close, s.amount, "
+                "       l.limit_type "
+                "FROM fact_stock_daily s "
+                "LEFT JOIN dim_stock d ON d.ts_code = s.ts_code "
+                "LEFT JOIN fact_limit_stock l "
+                "  ON l.ts_code = s.ts_code "
+                "  AND l.trade_date = s.trade_date "
+                "WHERE s.trade_date = ? "
+                "ORDER BY s.pct_chg DESC NULLS LAST",
+                (trade_date,),
+            ).fetchall()
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("query_all_stocks 失败 td=%s: %s", trade_date, exc)
+        return []
+
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        amount = r["amount"]
+        amount_yi = (
+            float(amount) / 100000.0 if amount is not None else None
+        )
+        out.append({
+            "ts_code": str(r["ts_code"] or ""),
+            "name": str(r["name"] or ""),
+            "industry": str(r["industry"] or ""),
+            "market": str(r["market"] or ""),
+            "pct_chg": r["pct_chg"],
+            "close": r["close"],
+            "amount_yi": amount_yi,
+            "limit_type": (str(r["limit_type"]) if r["limit_type"] else None),
+        })
+    return out
+
+
+def query_all_sectors(trade_date: str) -> List[Dict[str, Any]]:
+    """直查 fact_sector_daily 取某交易日全部板块行情（GUI 全部板块 Tab 用）。
+
+    与 :func:`query_sectors_extended` 同口径，但取**全部**约 480 个板块，
+    一次 SQL 完成；leaders/limit_up_count 仍走 :func:`_derive_sector_leaders`
+    LIKE 查询，~480 次 LIKE 在 SSD 上约 1~2s（已与主人对齐接受）。
+
+    输入:
+        trade_date  YYYYMMDD（必传，空串/None → []）
+
+    输出:
+        list of dict —— 字段对齐 sectors_top[]::
+
+            rank ts_code name pct_chg pct_chg_5d limit_up_count
+            main_net_yi main_elg_yi main_lg_yi leaders
+            catalysts(=[]) catalysts_source(="none") high_risk(=None)
+
+        按 pct_chg DESC NULLS LAST 排序，rank 从 1 计。
+    """
+    if not trade_date:
+        return []
+
+    db = get_market_db()
+    try:
+        with db.connect(readonly=True) as conn:
+            rows = conn.execute(
+                "SELECT s.ts_code, s.pct_chg, s.main_net_yi, "
+                "       s.main_elg_yi, s.main_lg_yi, s.pct_chg_5d, "
+                "       s.rank_today, d.name "
+                "FROM fact_sector_daily s "
+                "LEFT JOIN dim_sector d ON d.ts_code = s.ts_code "
+                "WHERE s.trade_date = ? "
+                "ORDER BY s.pct_chg DESC NULLS LAST",
+                (trade_date,),
+            ).fetchall()
+
+            out: List[Dict[str, Any]] = []
+            for i, r in enumerate(rows, 1):
+                name = str(r["name"] or "")
+                lu, leaders = _derive_sector_leaders(conn, trade_date, name)
+                out.append({
+                    "rank": i,
+                    "ts_code": str(r["ts_code"] or ""),
+                    "name": name,
+                    "pct_chg": r["pct_chg"],
+                    "pct_chg_5d": r["pct_chg_5d"],
+                    "limit_up_count": lu,
+                    "main_net_yi": r["main_net_yi"],
+                    "main_elg_yi": r["main_elg_yi"],
+                    "main_lg_yi": r["main_lg_yi"],
+                    "leaders": leaders,
+                    "catalysts": [],
+                    "catalysts_source": "none",
+                    "high_risk": None,
+                })
+            return out
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("query_all_sectors 失败 td=%s: %s", trade_date, exc)
+        return []
+
+
 def query_stock_names(ts_codes: List[str]) -> Dict[str, str]:
     """批量查 ts_code → name 映射。
 
@@ -363,6 +495,8 @@ __all__ = [
     "query_other_traders",
     "query_sector_leaders",
     "query_sectors_extended",
+    "query_all_stocks",
+    "query_all_sectors",
     "query_stock_names",
     "last_settled_trade_date",
     "get_cached_summary_md",

@@ -726,37 +726,55 @@ def parse_news_id_map(report_path: str) -> Dict[str, str]:
 def parse_report_meta(report_path: str) -> Dict:
     """从报告路径推导 meta 信息。
 
-    示例输入: data/AI_analysis/5月22日/5月22日_18时25分_盘后总结分析报告.md
+    示例输入: data/AI_analysis/5月22日/5月22日_0时00分_盘后总结分析报告_backtest.md
     输出: {
-        'report_id': '5月22日_18时25分_盘后总结分析报告',  # 文件名（非 ai_reports.id）
-        'report_date': '2026-05-22',  # 优先用文件 mtime
-        'report_time': '18:25',
-        'report_path': 'data/AI_analysis/5月22日/...'  # 相对 posix（P1 修复）
+        'report_id': '5月22日_0时00分_盘后总结分析报告_backtest',
+        'report_date': '20260522',   # YYYYMMDD（schema 协议）
+        'report_time': '00:00',
+        'report_path': 'data/AI_analysis/5月22日/...'  # 相对 posix
     }
 
+    解析顺序（2026-05-27 重构）：
+        1. 优先从文件名前缀 ``{M}月{D}日_{H}时{MM}分_`` 拿月/日/时/分；
+           年份从文件 mtime（失败兜底 datetime.now()）。
+        2. 文件名前缀不匹配时，完全回退到 mtime（再失败用当前时间）。
+
+    历史背景：
+        - 真实生成产物：``5月27日_18时12分_盘后总结分析报告.md``
+        - 回测产物（重构后）：``5月22日_0时00分_盘后总结分析报告_backtest.md``
+        两者都能被同一个正则匹配，回测产物从文件名前缀解析出来的日期天然是
+        模拟交易日，再无需事后 UPDATE 覆盖。
+
     P1 修复（2026-05-27 review）：
-        历史上 report_path 存 os.path.abspath() 绝对 Windows 路径，与
-        ai_reports.file_path（相对 posix）不一致，导致下游反查 prompt_id 永远 NULL。
         统一改用 _to_relative_posix() 规范化为相对 posix 路径。
     """
     abspath = os.path.abspath(report_path)
     basename = os.path.basename(report_path)
     report_id = os.path.splitext(basename)[0]
 
-    report_time: Optional[str] = None
-    m = re.search(r"(\d{1,2})时(\d{2})分", basename)
-    if m:
-        report_time = f"{int(m.group(1)):02d}:{m.group(2)}"
-
+    # 用 mtime 拿年份（兜底当前年）；失败再退 datetime.now()
     if os.path.exists(abspath):
-        mtime = datetime.fromtimestamp(os.path.getmtime(abspath))
-        report_date = mtime.strftime("%Y-%m-%d")
-        if not report_time:
-            report_time = mtime.strftime("%H:%M")
+        try:
+            mtime = datetime.fromtimestamp(os.path.getmtime(abspath))
+        except OSError:
+            mtime = datetime.now()
     else:
-        report_date = datetime.now().strftime("%Y-%m-%d")
-        if not report_time:
-            report_time = datetime.now().strftime("%H:%M")
+        mtime = datetime.now()
+
+    report_date: str
+    report_time: Optional[str]
+
+    m = re.match(r"^(\d{1,2})月(\d{1,2})日_(\d{1,2})时(\d{2})分_", basename)
+    if m:
+        month = int(m.group(1))
+        day = int(m.group(2))
+        hour = int(m.group(3))
+        minute = m.group(4)
+        report_date = f"{mtime.year:04d}{month:02d}{day:02d}"
+        report_time = f"{hour:02d}:{minute}"
+    else:
+        report_date = mtime.strftime("%Y%m%d")
+        report_time = mtime.strftime("%H:%M")
 
     try:
         from services.storage.ai_reports_store import _to_relative_posix

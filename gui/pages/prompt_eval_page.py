@@ -54,6 +54,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from gui.utils.date_format import format_yyyymmdd_to_dash
+
 from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtGui import QColor
 from PyQt5.QtWidgets import (
@@ -461,7 +463,7 @@ class PromptEvalPage(QWidget):
                 _fmt_rate(data.get("hit_rate_avg")),
                 _fmt_rate(data.get("direction_correct_rate")),
                 "—",  # AI 高质量占比（Phase 7 待实现）
-                str(data.get("last_report_date") or "—"),
+                format_yyyymmdd_to_dash(data.get("last_report_date") or "—"),
             ]
             low_sample = themes_total < _LOW_SAMPLE_THRESHOLD
             unscored = themes_total > 0 and scored_themes == 0
@@ -505,7 +507,7 @@ class PromptEvalPage(QWidget):
             expected_n = int(data.get("expected_pairs") or 0)
             status = data.get("score_status") or "none"
             cells = [
-                str(data.get("report_date") or "—"),
+                format_yyyymmdd_to_dash(data.get("report_date") or "—"),
                 "回测" if bt == 1 else "真实",
                 str(data.get("prompt_id") or "—"),
                 str(data.get("prompt_version") or "—"),
@@ -701,7 +703,9 @@ class PromptEvalPage(QWidget):
             return
 
         prompt_id = data.get("prompt_id") or "—"
-        report_date = data.get("report_date") or "—"
+        report_date = format_yyyymmdd_to_dash(
+            data.get("report_date") or "—"
+        )
         fp = data.get("file_path") or ""
         fname = Path(fp).name if fp else "-"
         themes_n = int(data.get("themes_count") or 0)
@@ -955,7 +959,9 @@ class PromptEvalPage(QWidget):
                         r.get("hit_rate_avg"),
                         r.get("direction_correct_rate"),
                         "",  # AI 高质量
-                        r.get("last_report_date") or "",
+                        format_yyyymmdd_to_dash(
+                            r.get("last_report_date") or ""
+                        ),
                     ])
                 # 空行
                 writer.writerow([])
@@ -966,7 +972,7 @@ class PromptEvalPage(QWidget):
                     scored = r.get("scored_pairs") or 0
                     expected = r.get("expected_pairs") or 0
                     writer.writerow([
-                        r.get("report_date") or "",
+                        format_yyyymmdd_to_dash(r.get("report_date") or ""),
                         "回测" if int(r.get("is_backtest") or 0) else "真实",
                         r.get("prompt_id") or "",
                         r.get("prompt_version") or "",
