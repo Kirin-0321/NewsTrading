@@ -5,7 +5,7 @@
 > ③ `_` 前缀的临时草稿 / 调试快照 / 字段审计 ④ 跨多份正式文档的"汇总索引"  
 >  
 > **其余一切正式文档已迁入 `doc/{子目录}/`**（迁移日志见 [doc/updates/05-26-2126-工作目录文档迁移.md](../doc/updates/05-26-2126-工作目录文档迁移.md)）  
-> 最后更新: 2026-05-27 00:50（短线投机 prompt 双模板：scalper 实战派 + data_driven 数据派；DeepSeek V4 实跑对比 + 辉夜自评）
+> 最后更新: 2026-05-27 10:43（第二轮 review 深入代码层验证：找到 2 严重 + 4 中等 + 4 轻微共 10 项新遗漏；其中 N1「report_id 概念冲突」和 N2「调度系统已存在需新增 4 类型」是硬伤）
 
 ---
 
@@ -22,6 +22,11 @@
 | [AI 数据完整度 4 批次升级](../doc/updates/05-26-2355-AI数据完整度4批次升级.md) | summary 覆盖度 85% → 98%：Batch 1 纯渲染（Top 20/连板元信息/上榜原因/gaps bug）/ Batch 2 后端补字段（seal_rate_prev/main_net_yi/promotion_detail/sectors_bottom）/ Batch 3 板块异动加涨跌幅+龙虎榜其他席位 / Batch 4 advance/decline 全市场涨跌家数（新表 fact_market_breadth + Tushare daily 接口） | 🟢 7 天全量回填完成，所有新字段历史已覆盖 |
 | [AI 分析页面盘后总结自动填入](../doc/features/05-27-0020-AI分析页面盘后总结自动填入.md) | showEvent 触发 → `last_settled_trade_date(now)` 算「下午 4 点分界 + 周末跳到周五」→ 读 market_summaries 自动 setPlainText；仅在为空时填，状态标志防覆盖 | 🟢 已上线，9 个时间边界 case 全部验证通过 |
 | [短线投机 Prompt 双模板自评](../doc/reports/05-27-0050-短线投机Prompt双模板对比自评.md) | 新增 `speculator_scalper`（实战派，4225 字）+ `speculator_data_driven`（数据派，13056 字）两个模板；DeepSeek V4 deep_thinking 实跑对比 + `tools/compare_speculator_prompts.py` 一次性对比脚本 | 🟢 已上线，辉夜偏向 scalper 实战派（明牌六字段完整、风险点给具体盘中观察锚点） |
+| [题材强度评分带符号化（v3）](../doc/updates/05-27-0949-题材强度评分带符号化.md) | strength_score 改为 -100~100 有符号；删除冗余 sentiment 字段；新增 利空/中性/利多 9 级映射 | 🟡 设计完稿，**已并入下方 v4 一并施工** |
+| [题材抽取保存与 GUI 补全设计（v3+v4 合并）](../doc/design/05-27-1003-题材抽取保存与GUI补全设计.md) | 技术细节版 — 抽取层 / 保存层 / 题材显示 GUI / 打分显示 GUI 全链路设计；含 12 个决策点表 + **§10 review 阶段 11 项遗漏补全清单** | 🟡 设计完稿，**待主人审阅后按施工文档开工** |
+| [⭐ 题材抽取打分完整流程·主人通读版](../doc/design/05-27-1025-题材抽取打分完整流程.md) | **给主人看** — 中文化无英文术语，7 阶段流程图 + 中英对照表 + Q&A + 数据库表全清单 + 施工里程碑；P1 已采纳"统一规范化" | 🟢 现行版，**等主人通读后给开工指示** |
+| [_施工_抽取保存 GUI 补全](_施工_抽取保存GUI补全.md) | 给辉夜看 — 12 个 Step 行号级 diff + §2.X review 补丁（P1~P11） + 测试用例 / 回滚 / 风险 | 🟡 现行版（合并了 _施工_题材强度带符号化.md，完工后两份一起删） |
+| [tools/test_ai_sector_code_accuracy.py](../tools/test_ai_sector_code_accuracy.py) | AI 板块代码准确率回归测试（验证 A2 决策） — 首测 DeepSeek V4 Pro = 7.4%，未来模型升级时重跑 | 🟢 已上线，留作回归 |
 | [CLI 评估回测 / Agent 优化初步设计](../doc/design/05-26-2126-CLI评估回测Agent优化初步设计.md) | **候选 #2（重头）** — 把 30 天历史盘后数据用起来跑虚拟回测 | 🟡 设计已完成，**待主人决定是否开工** |
 
 ---
