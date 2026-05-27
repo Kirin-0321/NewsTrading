@@ -1,0 +1,57 @@
+---
+description: 新增核心接口/服务时同步在 tools/ 下产出 CLI 入口，边写边测
+alwaysApply: true
+---
+
+# 接口 CLI 化（边写边测）
+
+## 核心纪律
+
+**每写完一个独立可调用单元，立刻在 `tools/` 下包一个 CLI 入口跑一遍，再继续下一段。**
+禁止"等整个模块写完再统一造测试入口"——那是返工和 bug 堆积的温床。
+
+## 触发场景（任一命中即必须 CLI 化）
+
+- 新增 `services/` 下的服务类或公开方法
+- 新增 `core/` 下供外部调用的函数（含 DB 操作、外部 API 调用、AI 调用）
+- 改动已有接口的输入/输出签名（需验证迁移等价性）
+- 实现一段依赖真实数据的逻辑（如 SQL 查询、tushare 抓取、prompt 推理）
+
+**不需要 CLI 化**：纯内部辅助函数、UI 事件回调、私有 `_` 前缀方法、一次性数据迁移脚本本身。
+
+## CLI 模板（参考 `tools/market_fetch.py`）
+
+每个 CLI 脚本必须满足：
+
+1. **模块 docstring**：写明用途、用法示例、退出码说明
+2. **项目根注入**：
+   ```python
+   _ROOT = Path(__file__).resolve().parents[1]
+   sys.path.insert(0, str(_ROOT))
+   ```
+3. **Windows 控制台 UTF-8**：
+   ```python
+   if hasattr(sys.stdout, "reconfigure"):
+       sys.stdout.reconfigure(encoding="utf-8")
+   ```
+4. **argparse**：每个参数写 `help`，关键参数给默认值
+5. **退出码明确**：`0` 成功 / `1` 业务失败 / `2` 参数错误
+6. **结果可读**：成功打印关键字段或 JSON 摘要，失败 `print(err); sys.exit(1)`
+
+## 命名规范
+
+- 功能入口：`tools/{动词}_{对象}.py`（如 `market_fetch.py`、`dim_stock_sync.py`）
+- 回归测试：`tools/test_{功能}.py`（长期保留，写明何时重跑）
+- 临时调试：`tools/_debug_{功能}.py`（`_` 前缀，**用后即删**）
+
+## 工作流
+
+```
+写核心逻辑 → 立刻包 CLI 入口 → 跑小样本 → 检查输出 → 写下一段
+```
+
+复用同一脚本的多功能用 argparse 子命令，不要每个小功能都开新文件。
+
+## 文档同步
+
+CLI 用法变更必须同步更新脚本顶部 docstring；面向主人长期使用的 CLI，在 `doc/guides/` 下补使用说明（按 `MM-DD-HHmm-简述.md` 命名）。

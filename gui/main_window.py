@@ -17,6 +17,7 @@ from gui.pages.data_page import DataPage
 from gui.pages.export_page import ExportPage
 from gui.pages.ai_analysis_page import AIAnalysisPage
 from gui.pages.theme_prediction_page import ThemePredictionPage
+from gui.pages.prompt_eval_page import PromptEvalPage
 from gui.pages.schedule_page import SchedulePage
 from gui.pages.news_cleaning_page import NewsCleaningPage
 from gui.pages.prompt_manager_page import PromptManagerPage
@@ -87,6 +88,7 @@ class MainWindow(QMainWindow):
             'market_summary': MarketSummaryPage(),
             'ai_analysis': AIAnalysisPage(),
             'theme_prediction': ThemePredictionPage(),
+            'prompt_eval': PromptEvalPage(),
             'cleaning': NewsCleaningPage(),
             'schedule': SchedulePage(scheduler_service=self.scheduler_service),
             'prompt_manager': PromptManagerPage(),
@@ -131,6 +133,7 @@ class MainWindow(QMainWindow):
             ('market_summary', '📊 盘后数据'),
             ('ai_analysis', '🤖 AI分析'),
             ('theme_prediction', '🎯 预测题材'),
+            ('prompt_eval', '📊 模板评估'),
             ('schedule', '⏰ 定时任务'),
             ('prompt_manager', '📝 提示词管理'),
         ]

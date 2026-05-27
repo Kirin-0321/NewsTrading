@@ -9,6 +9,17 @@ from typing import Callable, Dict, Optional
 logger = logging.getLogger(__name__)
 
 
+def _stub_response(task_type: str, hint: str) -> Dict:
+    """打分系统 plan M3 桩响应：可执行 / 不报错 / 给出未实施提示。"""
+    logger.info("[stub] %s: %s", task_type, hint)
+    return {
+        "ok": False,
+        "type": task_type,
+        "result": {"stub": True, "hint": hint},
+        "error": hint,
+    }
+
+
 def normalize_task(task: Dict) -> Dict:
     """兼容旧版 schedule_tasks.json（无 type 字段）。"""
     if task.get("type"):
@@ -129,7 +140,48 @@ def run_task_sync(task: Dict) -> Dict:
                 "error": ms.error,
             }
 
-        return {"ok": False, "type": task_type, "error": f"未知任务类型: {task_type}"}
+        # ==================================================================
+        # 打分系统任务类型（plan M3 桩）
+        # ------------------------------------------------------------------
+        # 一期：4 个新任务类型都返回 "not_implemented"，让定时任务可被
+        # 主人在 GUI 创建 / 启用 / 查看上次执行结果，但实际打分逻辑等
+        # plan M3 / M4 完成后再填充。
+        # ==================================================================
+        if task_type == "stock_daily_sync":
+            # plan M3.1：拉全 A 股个股当日涨跌幅 -> fact_stock_daily
+            return _stub_response(
+                task_type,
+                "plan M3.1 个股日行情同步未实施"
+                "（待 services/market/stock_daily_sync.py 上线）",
+            )
+
+        if task_type == "sector_daily_sync":
+            # plan M3.1：拉全板块当日涨跌幅 -> fact_sector_daily
+            return _stub_response(
+                task_type,
+                "plan M3.1 板块日行情同步未实施"
+                "（待 services/market/sector_daily_sync.py 上线）",
+            )
+
+        if task_type == "theme_score_daily":
+            # plan M3.2：给追踪期内题材跑脚本打分 -> theme_prediction_scores
+            return _stub_response(
+                task_type,
+                "plan M3.2 题材每日打分未实施"
+                "（待 services/scoring/script_scorer.py 上线）",
+            )
+
+        if task_type == "theme_ai_review":
+            # plan M3.3：扫今日 D+5 题材交 AI 复审 -> ai_review 字段
+            return _stub_response(
+                task_type,
+                "plan M3.3 AI 评分员未实施"
+                "（待 services/scoring/ai_scorer.py + "
+                "prompts/theme_review/theme_d5_review.md 上线）",
+            )
+
+        return {"ok": False, "type": task_type,
+                "error": f"未知任务类型: {task_type}"}
 
     except Exception as e:
         logger.exception("定时任务执行失败")

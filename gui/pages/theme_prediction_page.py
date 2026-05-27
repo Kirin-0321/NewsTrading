@@ -35,33 +35,45 @@ from gui.workers.theme_extract_worker import ThemeExtractWorker
 
 _THEME_TABLE_COLS = [
     ("时间", 56),
-    ("题材", 200),
-    ("等级", 60),
+    ("题材", 180),
+    ("等级", 90),
     ("分数", 60),
-    ("情绪", 60),
+    ("板块代码", 90),
+    ("模板", 150),
     ("冷处理", 60),
     ("持续性", 70),
     ("预期差", 70),
     ("排名", 50),
-    ("核心逻辑（含催化）", 280),
+    ("核心逻辑（含催化）", 240),
 ]
 
 # 可点击排序的列索引 -> 数据字段
 _SORTABLE_COLS = {
     2: "strength_level",
     3: "strength_score",
-    7: "expectation_gap",
-    8: "priority_rank",
+    8: "expectation_gap",
+    9: "priority_rank",
 }
 
-# 等级序（高 → 低）；未知等级排最后
-_LEVEL_ORDER = {"极强": 4, "强": 3, "中": 2, "弱": 1, "利空": 0}
+# 9 档等级排序（高利多 → 中性 → 高利空，绝对值越大数值越大）
+_LEVEL_ORDER = {
+    "重大利多": 9,
+    "较强利多": 8,
+    "弱利多": 7,
+    "中性偏多": 6,
+    "中性": 5,
+    "中性偏空": 4,
+    "弱利空": 3,
+    "较强利空": 2,
+    "重大利空": 1,
+}
 # 预期差序（高 → 低）
 _GAP_ORDER = {"高": 5, "中高": 4, "中": 3, "中低": 2, "低": 1}
 
 _STOCK_TABLE_COLS = [
     ("标的", 140),
-    ("代码", 110),
+    ("代码（原始）", 110),
+    ("代码（标准化）", 130),
     ("角色", 70),
     ("理由", 380),
 ]
@@ -231,7 +243,7 @@ class ThemePredictionPage(QWidget):
         group = QGroupBox("📊 已入库题材")
         layout = QVBoxLayout()
 
-        # 控制行：日期选择 + 刷新
+        # 控制行：日期选择 + 模板筛选 + 刷新
         ctrl = QHBoxLayout()
         ctrl.addWidget(QLabel("报告日期:"))
         self.date_combo = QComboBox()
@@ -239,6 +251,14 @@ class ThemePredictionPage(QWidget):
         self.date_combo.setMinimumWidth(160)
         self.date_combo.currentIndexChanged.connect(self._on_date_changed)
         ctrl.addWidget(self.date_combo)
+
+        ctrl.addSpacing(12)
+        ctrl.addWidget(QLabel("模板:"))
+        self.prompt_combo = QComboBox()
+        self.prompt_combo.setStyleSheet(COMBOBOX_STYLE)
+        self.prompt_combo.setMinimumWidth(200)
+        self.prompt_combo.currentIndexChanged.connect(self._on_prompt_changed)
+        ctrl.addWidget(self.prompt_combo)
 
         ctrl.addSpacing(20)
         self.stats_label = QLabel("")
@@ -312,9 +332,23 @@ class ThemePredictionPage(QWidget):
         # 等大比例，布局完成后左右约各占一半
         self.news_splitter.setSizes([10000, 10000])
 
+        # 打分明细 Tab（一期占位，等 plan M3 打分系统上线后填充）
+        self.score_detail_browser = QTextBrowser()
+        self.score_detail_browser.setStyleSheet(TEXTBROWSER_STYLE)
+        self.score_detail_browser.setHtml(
+            '<div style="padding:20px;color:#8c8c8c;">'
+            '📊 <b>打分明细</b>（plan M3 打分系统未上线）<br><br>'
+            '上线后此处将展示该题材 5 天追踪期的逐日表现：<br>'
+            '• 板块涨幅 vs 标的平均涨幅 vs 大盘涨幅 三线对比<br>'
+            '• D+1~D+5 脚本分 + 命中率 + Alpha<br>'
+            '• D+5 AI 评分员定性评语<br>'
+            '</div>'
+        )
+
         self.detail_tab.addTab(self.reason_browser, "📝 逻辑/原因")
         self.detail_tab.addTab(self.stock_table, "💼 关联标的")
         self.detail_tab.addTab(self.news_splitter, "📰 关联新闻")
+        self.detail_tab.addTab(self.score_detail_browser, "📊 打分明细")
         layout.addWidget(self.detail_tab, 2)
 
         group.setLayout(layout)
@@ -333,13 +367,13 @@ class ThemePredictionPage(QWidget):
     def _reload_dates(self, prefer_date: Optional[str] = None):
         try:
             from services.storage import get_theme_store
-            from services.storage.database import get_connection
+            from services.storage.ai_inference_db import get_ai_inference_db
         except Exception as e:
             self.stats_label.setText(f"数据库不可用: {e}")
             return
 
         try:
-            with get_connection() as conn:
+            with get_ai_inference_db().connect() as conn:
                 rows = conn.execute(
                     """
                     SELECT report_date, COUNT(*) AS cnt
@@ -359,8 +393,23 @@ class ThemePredictionPage(QWidget):
                 f"{r['report_date']} ({r['cnt']} 条)", r["report_date"]
             )
 
+        # 模板筛选下拉重载（友好名显示，data 仍是 prompt_id）
+        self.prompt_combo.blockSignals(True)
+        self.prompt_combo.clear()
+        self.prompt_combo.addItem("全部模板", None)
+        try:
+            from gui.utils.prompt_name_helper import friendly_prompt_name
+            prompts = get_theme_store().list_distinct_prompts()
+            for pid in prompts:
+                self.prompt_combo.addItem(friendly_prompt_name(pid), pid)
+        except Exception as e:
+            self._log_debug(f"加载模板列表失败: {e}")
+        self.prompt_combo.blockSignals(False)
+
         total = get_theme_store().count()
-        self.stats_label.setText(f"全库共 {total} 条题材，{len(rows)} 个报告日期")
+        self.stats_label.setText(
+            f"全库共 {total} 条题材，{len(rows)} 个报告日期"
+        )
 
         if prefer_date:
             for i in range(self.date_combo.count()):
@@ -382,13 +431,27 @@ class ThemePredictionPage(QWidget):
         if date:
             self._reload_themes_for_date(date)
 
+    def _on_prompt_changed(self, _idx: int):
+        date = self.date_combo.currentData()
+        if date:
+            self._reload_themes_for_date(date)
+
     def _reload_themes_for_date(self, report_date: str):
         from services.storage import get_theme_store
-        themes = get_theme_store().get_by_date(report_date)
+        prompt_id = self.prompt_combo.currentData()
+        themes = get_theme_store().get_by_date(
+            report_date, prompt_id=prompt_id
+        )
         self._reset_theme_sort()
         self._current_themes = themes
         self._render_theme_table(themes)
         self._clear_detail()
+
+    @staticmethod
+    def _log_debug(msg: str) -> None:
+        """调试日志（避免污染主日志区）。"""
+        import logging
+        logging.getLogger(__name__).debug(msg)
 
     def _reset_theme_sort(self):
         """切换日期或刷新时恢复数据库默认顺序。"""
@@ -437,14 +500,24 @@ class ThemePredictionPage(QWidget):
         self._render_theme_table(self._current_themes)
 
     def _render_theme_table(self, themes: list):
+        from gui.utils.prompt_name_helper import friendly_prompt_name
         self.theme_table.setRowCount(len(themes))
         for row, t in enumerate(themes):
+            score = t.get("strength_score")
+            sector_code = t.get("sector_ts_code") or ""
+            sector_conf = t.get("sector_match_conf")
+            sector_text = (
+                f"{sector_code} ({sector_conf:.2f})"
+                if sector_code and sector_conf is not None
+                else sector_code
+            )
             cells = [
                 t.get("report_time") or "",
                 t.get("theme_name") or "",
                 t.get("strength_level") or "",
-                str(t.get("strength_score") or ""),
-                t.get("sentiment") or "",
+                self._format_score(score),
+                sector_text,
+                friendly_prompt_name(t.get("prompt_id"), fallback="—"),
                 "❄️" if t.get("is_cold") else "",
                 t.get("duration") or "",
                 t.get("expectation_gap") or "",
@@ -454,22 +527,66 @@ class ThemePredictionPage(QWidget):
             for col, text in enumerate(cells):
                 item = QTableWidgetItem(text)
                 item.setToolTip(text)
-                if col == 2:
+                if col == 2:  # 等级
                     item.setForeground(self._level_color(text))
-                if col == 4 and text == "利空":
-                    item.setForeground(self._level_color("利空"))
+                elif col == 3:  # 分数（按正负染色）
+                    item.setForeground(self._score_color(score))
+                elif col == 4 and sector_code and sector_conf is not None \
+                        and sector_conf < 0.7:
+                    # 板块匹配置信度低 → 标橙提示需人工确认
+                    item.setForeground(QColor("#fa8c16"))
                 self.theme_table.setItem(row, col, item)
 
     @staticmethod
+    def _format_score(score) -> str:
+        """带符号显示：+75 / -50 / 0；None 显示空串。"""
+        if score is None:
+            return ""
+        if isinstance(score, int):
+            return f"{score:+d}" if score != 0 else "0"
+        try:
+            n = int(score)
+            return f"{n:+d}" if n != 0 else "0"
+        except (TypeError, ValueError):
+            return str(score)
+
+    @staticmethod
     def _level_color(text: str):
-        from PyQt5.QtGui import QColor
+        """9 档等级色（利多红橙暖，利空蓝绿冷，中性灰）。"""
         return {
-            "极强": QColor("#cf1322"),
-            "强": QColor("#fa8c16"),
-            "中": QColor("#faad14"),
-            "弱": QColor("#52c41a"),
-            "利空": QColor("#cf1322"),
+            "重大利多": QColor("#cf1322"),
+            "较强利多": QColor("#fa541c"),
+            "弱利多": QColor("#fa8c16"),
+            "中性偏多": QColor("#faad14"),
+            "中性": QColor("#8c8c8c"),
+            "中性偏空": QColor("#13c2c2"),
+            "弱利空": QColor("#1890ff"),
+            "较强利空": QColor("#2f54eb"),
+            "重大利空": QColor("#722ed1"),
         }.get(text, QColor("#262626"))
+
+    @staticmethod
+    def _score_color(score):
+        """分数染色：正数红、负数蓝、零灰；强度越大颜色越深。"""
+        if score is None:
+            return QColor("#262626")
+        try:
+            s = int(score)
+        except (TypeError, ValueError):
+            return QColor("#262626")
+        if s == 0:
+            return QColor("#8c8c8c")
+        if s >= 80:
+            return QColor("#cf1322")
+        if s >= 40:
+            return QColor("#fa8c16")
+        if s >= 1:
+            return QColor("#faad14")
+        if s >= -39:
+            return QColor("#13c2c2")
+        if s >= -79:
+            return QColor("#1890ff")
+        return QColor("#722ed1")
 
     def _on_theme_selected(self):
         rows = self.theme_table.selectionModel().selectedRows()
@@ -493,15 +610,20 @@ class ThemePredictionPage(QWidget):
         stocks = theme.get("stocks") or []
         self.stock_table.setRowCount(len(stocks))
         for r, s in enumerate(stocks):
+            raw_code = s.get("stock_code") or ""
+            norm = s.get("normalized_code") or ""
             cells = [
                 s.get("stock_name") or "",
-                s.get("stock_code") or "",
+                raw_code,
+                norm or ("⚠️未匹配" if raw_code else ""),
                 s.get("role") or "",
                 s.get("reason") or "",
             ]
             for c, text in enumerate(cells):
                 item = QTableWidgetItem(text)
                 item.setToolTip(text)
+                if c == 2 and not norm and raw_code:
+                    item.setForeground(QColor("#fa8c16"))
                 self.stock_table.setItem(r, c, item)
 
         news = theme.get("news") or []
@@ -586,9 +708,9 @@ class ThemePredictionPage(QWidget):
         if not ids:
             return {}
         try:
-            from services.storage.database import get_connection
+            from services.storage.ai_inference_db import get_ai_inference_db
             placeholders = ",".join("?" for _ in ids)
-            with get_connection() as conn:
+            with get_ai_inference_db().connect() as conn:
                 rows = conn.execute(
                     f"""
                     SELECT id, title, content, source, published_at

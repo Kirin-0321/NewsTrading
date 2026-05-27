@@ -24,11 +24,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
 
-from services.storage.database import (
-    get_connection,
-    get_project_root,
-    init_database,
-)
+from services.storage.ai_inference_db import get_ai_inference_db
+from services.storage.database import get_project_root
 
 _log = logging.getLogger(__name__)
 
@@ -40,7 +37,7 @@ _log = logging.getLogger(__name__)
 
 @dataclass
 class AIReportRecord:
-    """``ai_reports`` 表的强类型表示。"""
+    """``ai_reports`` 表的强类型表示（v5: 加 is_backtest）。"""
 
     id: Optional[int] = None
     report_date: str = ""
@@ -55,6 +52,7 @@ class AIReportRecord:
     news_count: Optional[int] = None
     used_market_date: Optional[str] = None
     theme_extracted: int = 0
+    is_backtest: int = 0  # v5: 0=真实日常生成, 1=虚拟回测 CLI 产物
     file_size: Optional[int] = None
     md5: Optional[str] = None
     created_at: str = ""
@@ -70,10 +68,10 @@ class AIReportRecord:
 
 
 class AIReportsStore:
-    """``ai_reports`` 表的 CRUD 封装。"""
+    """``ai_reports`` 表的 CRUD 封装（v5: 已迁库到 ai_inference.db）。"""
 
     def __init__(self) -> None:
-        init_database()  # 确保表存在
+        get_ai_inference_db().ensure_schema()  # 确保表存在
 
     # ------------- 写入 -------------
 
@@ -92,9 +90,9 @@ class AIReportsStore:
             report_date, file_path, provider, model,
             prompt_category, prompt_id, prompt_version,
             news_range_start, news_range_end, news_count,
-            used_market_date, theme_extracted,
+            used_market_date, theme_extracted, is_backtest,
             file_size, md5, created_at
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(file_path) DO UPDATE SET
             report_date      = excluded.report_date,
             provider         = excluded.provider,
@@ -107,6 +105,7 @@ class AIReportsStore:
             news_count       = excluded.news_count,
             used_market_date = excluded.used_market_date,
             theme_extracted  = excluded.theme_extracted,
+            is_backtest      = excluded.is_backtest,
             file_size        = excluded.file_size,
             md5              = excluded.md5
         """
@@ -123,12 +122,13 @@ class AIReportsStore:
             record.news_count,
             record.used_market_date,
             int(bool(record.theme_extracted)),
+            int(bool(record.is_backtest)),
             size if record.file_size is None else record.file_size,
             md5_hex if record.md5 is None else record.md5,
             created_at,
         )
 
-        with get_connection() as conn:
+        with get_ai_inference_db().connect() as conn:
             conn.execute(sql, params)
             row = conn.execute(
                 "SELECT id FROM ai_reports WHERE file_path = ?",
@@ -141,7 +141,7 @@ class AIReportsStore:
     ) -> bool:
         """标记一份报告已抽过题材入 ``theme_predictions``。"""
         rel = _to_relative_posix(file_path)
-        with get_connection() as conn:
+        with get_ai_inference_db().connect() as conn:
             cursor = conn.execute(
                 "UPDATE ai_reports SET theme_extracted = ? "
                 "WHERE file_path = ?",
@@ -152,7 +152,7 @@ class AIReportsStore:
     def delete_by_path(self, file_path: str) -> bool:
         """删除一条索引（不删文件）。"""
         rel = _to_relative_posix(file_path)
-        with get_connection() as conn:
+        with get_ai_inference_db().connect() as conn:
             cursor = conn.execute(
                 "DELETE FROM ai_reports WHERE file_path = ?", (rel,)
             )
@@ -162,7 +162,7 @@ class AIReportsStore:
 
     def get_by_path(self, file_path: str) -> Optional[AIReportRecord]:
         rel = _to_relative_posix(file_path)
-        with get_connection() as conn:
+        with get_ai_inference_db().connect() as conn:
             row = conn.execute(
                 "SELECT * FROM ai_reports WHERE file_path = ?", (rel,)
             ).fetchone()
@@ -195,7 +195,7 @@ class AIReportsStore:
             + " ORDER BY report_date DESC, id DESC"
             + suffix
         )
-        with get_connection() as conn:
+        with get_ai_inference_db().connect() as conn:
             rows = conn.execute(sql, params).fetchall()
             return [AIReportRecord.from_row(r) for r in rows]
 
@@ -214,7 +214,7 @@ class AIReportsStore:
         sql += " ORDER BY report_date DESC, id DESC"
         if limit:
             sql += f" LIMIT {int(limit)}"
-        with get_connection() as conn:
+        with get_ai_inference_db().connect() as conn:
             rows = conn.execute(sql, params).fetchall()
             return [AIReportRecord.from_row(r) for r in rows]
 
@@ -228,12 +228,12 @@ class AIReportsStore:
         )
         if limit:
             sql += f" LIMIT {int(limit)}"
-        with get_connection() as conn:
+        with get_ai_inference_db().connect() as conn:
             rows = conn.execute(sql).fetchall()
             return [AIReportRecord.from_row(r) for r in rows]
 
     def count(self) -> int:
-        with get_connection() as conn:
+        with get_ai_inference_db().connect() as conn:
             row = conn.execute("SELECT COUNT(*) FROM ai_reports").fetchone()
             return int(row[0]) if row else 0
 
@@ -271,8 +271,13 @@ def record_report(
     news_count: Optional[int] = None,
     used_market_date: Optional[str] = None,
     theme_extracted: bool = False,
+    is_backtest: bool = False,
 ) -> int:
     """便捷入口：生成 AI 分析报告后回写一条索引。
+
+    Args:
+        is_backtest: True = 虚拟回测 CLI 产物（Phase 6 用），
+                     False = 真实日常生成（默认）
 
     返回新写入或更新的 record id。绝对不抛异常（任何错误降级为日志），
     以避免索引环节的故障破坏正常的报告生成流程。
@@ -292,6 +297,7 @@ def record_report(
             news_count=news_count,
             used_market_date=used_market_date,
             theme_extracted=1 if theme_extracted else 0,
+            is_backtest=1 if is_backtest else 0,
         )
         return store.record(rec)
     except Exception as exc:  # 索引环节不影响主流程

@@ -1,4 +1,15 @@
-"""SQLite 连接与表结构初始化。"""
+"""news.db 连接与表结构初始化（Phase -1 三库重构后瘦身版）。
+
+v5（2026-05-27 Phase -1）：news.db 只保留爬虫产物：
+    - raw_news        原始新闻表（爬虫不可重建数据）
+    - sync_meta       同步元信息表
+
+AI 衍生数据全部迁移到 ``data/ai_inference.db``：
+    - ai_reports / theme_predictions / theme_stocks / theme_news
+    - theme_prediction_scores / theme_stock_scores（本期新增）
+
+详见 doc/design/05-27-1209-三库表结构详细设计.md
+"""
 
 import logging
 import os
@@ -28,104 +39,16 @@ CREATE TABLE IF NOT EXISTS sync_meta (
     key             TEXT PRIMARY KEY,
     value           TEXT NOT NULL
 );
-
--- 题材预测主表：每份分析报告 AI 抽取得到的题材独立一行（快照式）
--- v2 (2026-05-22) 删 catalyst/resonance_count/raw_excerpt，合并语义到 reason
-CREATE TABLE IF NOT EXISTS theme_predictions (
-    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-    report_id           TEXT NOT NULL,
-    report_date         TEXT NOT NULL,
-    report_time         TEXT,
-    report_path         TEXT NOT NULL,
-    theme_name          TEXT NOT NULL,
-    theme_category      TEXT,
-    strength_score      INTEGER NOT NULL,
-    strength_level      TEXT NOT NULL,
-    priority_rank       INTEGER,  -- 单份报告内排序序号；非全局唯一，跨 report_id 可重复
-    duration            TEXT,
-    expectation_gap     TEXT,
-    sentiment           TEXT NOT NULL DEFAULT '利好',
-    is_cold             INTEGER NOT NULL DEFAULT 0,
-    reason              TEXT NOT NULL,
-    risk_note           TEXT,
-    created_at          TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_theme_report_date  ON theme_predictions(report_date DESC);
-CREATE INDEX IF NOT EXISTS idx_theme_name         ON theme_predictions(theme_name);
-CREATE INDEX IF NOT EXISTS idx_theme_strength     ON theme_predictions(report_date, strength_score DESC);
-CREATE INDEX IF NOT EXISTS idx_theme_category     ON theme_predictions(theme_category);
-CREATE INDEX IF NOT EXISTS idx_theme_report_id    ON theme_predictions(report_id);
-
--- 题材-标的 关联表（v2: 删 elasticity）
-CREATE TABLE IF NOT EXISTS theme_stocks (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    theme_id        INTEGER NOT NULL,
-    stock_name      TEXT NOT NULL,
-    stock_code      TEXT,
-    role            TEXT,
-    reason          TEXT,
-    FOREIGN KEY (theme_id) REFERENCES theme_predictions(id) ON DELETE CASCADE
-);
-CREATE INDEX IF NOT EXISTS idx_theme_stocks_theme ON theme_stocks(theme_id);
-CREATE INDEX IF NOT EXISTS idx_theme_stocks_name  ON theme_stocks(stock_name);
-CREATE INDEX IF NOT EXISTS idx_theme_stocks_code  ON theme_stocks(stock_code);
-
--- 题材-新闻 关联表（v2: 删 news_title，news_id 升级为关键字段，由脚本反查报告底部填入）
-CREATE TABLE IF NOT EXISTS theme_news (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    theme_id        INTEGER NOT NULL,
-    news_ref        TEXT NOT NULL,
-    news_id         TEXT,
-    relation_type   TEXT,
-    FOREIGN KEY (theme_id) REFERENCES theme_predictions(id) ON DELETE CASCADE
-);
-CREATE INDEX IF NOT EXISTS idx_theme_news_theme   ON theme_news(theme_id);
-CREATE INDEX IF NOT EXISTS idx_theme_news_news_id ON theme_news(news_id);
-
--- AI 分析报告索引（Phase M1, 2026-05-26）
--- 报告正文仍在 data/AI_analysis/*.md，本表只存元数据 + path 索引，
--- 便于后续 Eval/回测按 prompt_id / 日期范围 / 是否抽过题材等条件查询。
-CREATE TABLE IF NOT EXISTS ai_reports (
-    id                INTEGER PRIMARY KEY AUTOINCREMENT,
-    report_date       TEXT NOT NULL,        -- YYYYMMDD
-    file_path         TEXT NOT NULL UNIQUE, -- 相对仓库根的路径
-    provider          TEXT,                 -- deepseek/openai/qwen/...
-    model             TEXT,
-    prompt_category   TEXT,                 -- 'analysis'
-    prompt_id         TEXT,                 -- news_focused / trinity_resonance / ...
-    prompt_version    TEXT,
-    news_range_start  TEXT,                 -- 涉及新闻的时间范围
-    news_range_end    TEXT,
-    news_count        INTEGER,
-    used_market_date  TEXT,                 -- 用到的盘后数据日期 YYYYMMDD，可空
-    theme_extracted   INTEGER NOT NULL DEFAULT 0, -- 1=已抽过题材入 theme_predictions
-    file_size         INTEGER,              -- 字节
-    md5               TEXT,                 -- 文件 md5（去重 / 校验用）
-    created_at        TEXT NOT NULL         -- ISO 时间
-);
-CREATE INDEX IF NOT EXISTS idx_ai_reports_date
-    ON ai_reports(report_date DESC);
-CREATE INDEX IF NOT EXISTS idx_ai_reports_prompt
-    ON ai_reports(prompt_id, prompt_version);
-CREATE INDEX IF NOT EXISTS idx_ai_reports_theme_flag
-    ON ai_reports(theme_extracted, report_date DESC);
 """
 
-# v2 schema 指纹：每张题材表应该存在的列。如果检测到旧列就 DROP 重建。
-_THEME_V2_COLUMNS = {
-    "theme_predictions": {
-        "id", "report_id", "report_date", "report_time", "report_path",
-        "theme_name", "theme_category", "strength_score", "strength_level",
-        "priority_rank", "duration", "expectation_gap", "sentiment",
-        "is_cold", "reason", "risk_note", "created_at",
-    },
-    "theme_stocks": {
-        "id", "theme_id", "stock_name", "stock_code", "role", "reason",
-    },
-    "theme_news": {
-        "id", "theme_id", "news_ref", "news_id", "relation_type",
-    },
-}
+# Phase -1 三库重构：旧的 AI 相关 4 张表已迁到 ai_inference.db，
+# init_database 入口处 DROP 一次即可（幂等，无害）。
+_LEGACY_AI_TABLES = [
+    "theme_news",          # 子表先删（避免 FK 失败）
+    "theme_stocks",
+    "theme_predictions",
+    "ai_reports",
+]
 
 
 def _ensure_clean_status_columns(conn: sqlite3.Connection) -> None:
@@ -136,12 +59,10 @@ def _ensure_clean_status_columns(conn: sqlite3.Connection) -> None:
     若 ``raw_news`` 表尚不存在（首次初始化的新库），跳过补字段逻辑——
     后续 ``executescript(_SCHEMA)`` 会按最新 schema 直接建表。
     """
-    # 新库兜底：raw_news 还没建出来，没什么字段可补
     if not conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table' "
         "AND name='raw_news'"
     ).fetchone():
-        # 仍要把可能残留的旧分类表清掉（即使是新库也无害）
         for legacy in ("curated_news", "rejected_news"):
             conn.execute(f"DROP TABLE IF EXISTS {legacy}")
         conn.commit()
@@ -166,32 +87,40 @@ def _ensure_clean_status_columns(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
-def _migrate_theme_tables_v2(conn: sqlite3.Connection) -> None:
-    """检测题材三张表的 schema，若与 v2 不一致则 DROP 重建。
+def _drop_legacy_ai_tables(conn: sqlite3.Connection) -> None:
+    """Phase -1 一次性清理：把 AI 相关 4 张老表从 news.db 移除。
 
-    题材数据是衍生的（从分析报告 .md 抽取），重新跑就能再生，
-    所以直接清空比写复杂的 ALTER TABLE 迁移脚本更干净。
+    迁库后 news.db 不再持有 AI 衍生数据，旧表（如果存在）也已被主人决策"直接清空"。
+    DROP IF EXISTS 幂等，重复跑无害。
+
+    主人决策（v3）：
+        - 不迁移任何旧数据到 ai_inference.db
+        - 19 份历史 md 文件保留在磁盘但不批量重抽
     """
-    needs_rebuild = False
-    for table, want_cols in _THEME_V2_COLUMNS.items():
+    dropped: list[str] = []
+    for table in _LEGACY_AI_TABLES:
+        # 仅在表存在时记录日志，DROP IF EXISTS 始终安全
+        exists = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+            (table,),
+        ).fetchone()
+        conn.execute(f"DROP TABLE IF EXISTS {table}")
+        if exists:
+            dropped.append(table)
+    if dropped:
+        # 清理 AUTOINCREMENT 计数残留（不存在则 OperationalError，忽略）
         try:
-            rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
-        except sqlite3.OperationalError:
-            continue  # 表不存在，CREATE 时会建
-        if not rows:
-            continue
-        actual_cols = {r[1] for r in rows}
-        if actual_cols != want_cols:
-            needs_rebuild = True
-            _log.warning(
-                "题材表 %s schema 与 v2 不一致：actual=%s expect=%s，将清空重建",
-                table, sorted(actual_cols), sorted(want_cols),
+            conn.execute(
+                "DELETE FROM sqlite_sequence WHERE name IN "
+                "('theme_predictions','theme_stocks','theme_news','ai_reports')"
             )
-            break
-
-    if needs_rebuild:
-        for table in ("theme_news", "theme_stocks", "theme_predictions"):
-            conn.execute(f"DROP TABLE IF EXISTS {table}")
+        except sqlite3.OperationalError:
+            pass
+        _log.warning(
+            "Phase -1: 已从 news.db DROP 旧 AI 表 %s（数据已按主人决策清空，"
+            "未来写入将走 data/ai_inference.db）",
+            dropped,
+        )
         conn.commit()
 
 
@@ -204,8 +133,10 @@ def get_db_path() -> str:
 
 
 def init_database(db_path=None) -> str:
-    """
-    创建 data 目录并初始化表结构。
+    """创建 data 目录并初始化 news.db 表结构（仅 raw_news + sync_meta）。
+
+    Phase -1 后此函数不再管 AI 表，那部分由
+    ``services.storage.ai_inference_db.AIInferenceDB.ensure_schema()`` 负责。
 
     Returns:
         数据库文件路径
@@ -213,8 +144,8 @@ def init_database(db_path=None) -> str:
     path = db_path or get_db_path()
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with sqlite3.connect(path) as conn:
-        _migrate_theme_tables_v2(conn)
-        _ensure_clean_status_columns(conn)  # 旧库补列 + DROP 旧 curated/rejected 表
+        _drop_legacy_ai_tables(conn)        # Phase -1: 清旧 AI 表
+        _ensure_clean_status_columns(conn)  # 老库补 raw_news 字段 + DROP 旧 curated/rejected
         conn.executescript(_SCHEMA)
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA foreign_keys=ON")
@@ -224,7 +155,11 @@ def init_database(db_path=None) -> str:
 
 @contextmanager
 def get_connection(db_path=None) -> Iterator[sqlite3.Connection]:
-    """获取数据库连接（Row 工厂）。"""
+    """获取 news.db 连接（Row 工厂）。
+
+    Phase -1 后**只**用于 raw_news / sync_meta；
+    AI 相关读写请走 ``services.storage.ai_inference_db.get_ai_inference_db().connect()``。
+    """
     path = db_path or get_db_path()
     if not os.path.exists(path):
         init_database(path)

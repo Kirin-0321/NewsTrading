@@ -573,32 +573,61 @@ ThemeStore.save_themes(report_meta, themes)
        └── INSERT theme_news (batch)
 ```
 
-### 14.3 表结构（已写入 `services/storage/database.py`）
+### 14.3 表结构（已写入 `services/storage/database.py`，**v4 2026-05-27**）
 
 **主表 `theme_predictions`** —— 20 列，按报告快照存储：
-- 来源元数据：`report_id` / `report_date` / `report_time` / `report_path`
-- 题材属性：`theme_name` / `theme_category` / `strength_score` (0-100) / `strength_level` (极强/强/中/弱)
-- 业务属性：`priority_rank` / `duration` / `expectation_gap` / `sentiment` / `is_cold`
-- 内容：`reason` / `catalyst` / `resonance_count` / `risk_note` / `raw_excerpt`
-- 索引：`(report_date DESC)`、`(theme_name)`、`(report_date, strength_score DESC)`、`(theme_category)`、`(report_id)`
+- 来源元数据：`report_id`（文件名 string，**非 ai_reports.id**）/ `report_date` / `report_time` / `report_path`（相对 posix）
+- 题材属性：`theme_name` / `theme_category` / `strength_score` (**-100~+100 带符号**) / `strength_level`（**9 档**）
+- 业务属性：`priority_rank` / `duration` / `expectation_gap` / `is_cold`
+- 内容：`reason` / `risk_note`
+- **v4 新增**：`prompt_id` / `prompt_version`（从 ai_reports 反查冗余）；`sector_ts_code` / `sector_match_conf`（matcher 富化结果）
+- 索引：`(report_date DESC)`、`(theme_name)`、`(report_date, strength_score DESC)`、`(theme_category)`、`(report_id)`、`(prompt_id, prompt_version)`、`(sector_ts_code)`
 
 **关联表 `theme_stocks`** —— `theme_id` 外键 + CASCADE：
-- `stock_name` (必) / `stock_code` (可空) / `role` / `elasticity` (1-3) / `reason`
-- 索引：`(theme_id)`、`(stock_name)`、`(stock_code)`，支持反查"某只票踩了哪些题材"
+- `stock_name` (必) / `stock_code` (可空，AI 原始) / **`normalized_code` (v4 新增，matcher 规范化如 600172.SH)** / `role` / `reason`
+- 索引：`(theme_id)`、`(stock_name)`、`(stock_code)`、`(normalized_code)`，支持反查"某只票踩了哪些题材"
 
 **关联表 `theme_news`** —— `theme_id` 外键 + CASCADE：
-- `news_ref` (报告锚点如"新闻107") / `news_id` (可关联 raw_news.id) / `news_title` / `relation_type` (主因/共振/风险/背景)
+- `news_ref` (报告锚点如"新闻107") / `news_id` (可关联 raw_news.id) / `relation_type` (主因/共振/风险/背景)
 
-### 14.4 强度等级自洽规则
+### 14.4 强度评分自洽规则（v4：带符号 + 9 档）
+
+`strength_score` 改为 **-100 ~ +100 带符号整数**：正数 = 利多（绝对值越大越强），负数 = 利空（绝对值越大越强），0 = 中性。**v3 (2026-05-27) 起删除冗余 `sentiment` 字段，由 score 正负号承载方向。**
 
 | 输入 `strength_score` | 输入 `strength_level` | 入库结果 |
 |---------------------|---------------------|----------|
-| 85 | 极强 | score=85, level=极强 ✅ 自洽 |
-| 95 | 弱（冲突） | **score=95 优先**，level=极强（覆写） |
-| None | 强 | score=70（区间中位），level=强 |
-| None | None | score=50, level=中（兜底） |
+| 85 | 重大利多 | score=85, level=重大利多 ✅ 自洽 |
+| 95 | 弱利空（冲突） | **score=95 优先**，level=重大利多（覆写） |
+| -65 | 较强利空 | score=-65, level=较强利空 ✅ 自洽 |
+| -50 | None | score=-50, level=弱利空（按 score 推断） |
+| None | None | score=0, level=中性（兜底） |
+| 999 | * | score=100（clamp 上限），level=重大利多 |
 
-区间：极强 80-100 / 强 60-79 / 中 40-59 / 弱 0-39。**`strength_score` 永远是裁判**。
+**9 档对照区间**（由 `_score_to_level()` 派生）：
+
+| 分数区间 | 等级标签 |
+|---------|---------|
+| score ≥ +80 | 重大利多 |
+| +60 ~ +79 | 较强利多 |
+| +40 ~ +59 | 弱利多 |
+| +1 ~ +39 | 中性偏多 |
+| 0 | 中性 |
+| -39 ~ -1 | 中性偏空 |
+| -59 ~ -40 | 弱利空 |
+| -79 ~ -60 | 较强利空 |
+| score ≤ -80 | 重大利空 |
+
+**`strength_score` 永远是裁判**。
+
+### 14.5 v4 配套修复点（review 发现）
+
+- **P1 路径规范化**：`report_path` 入库前统一 `_to_relative_posix`，与 `ai_reports.file_path` 对齐，让下游 `get_by_path` 反查 prompt_id 能命中
+- **P2 重复入库防护**：`save_themes` 入口先 `DELETE WHERE report_id = ?`，同 md 抽两次自动幂等
+- **P6 组合筛选**：`get_by_date(date, prompt_id=None)` 双维过滤 + `list_distinct_prompts()` 给 GUI 下拉
+- **N1 路径反查约定**：`theme_predictions.report_id`（文件名）≠ `ai_reports.id`（自增 INT），不能 join，必须走 `report_path` 反查
+- **N2 调度接入**：4 个新任务类型（`stock_daily_sync` / `sector_daily_sync` / `theme_score_daily` / `theme_ai_review`）已加入 `scheduled_runner.py` 桩，等 plan M3 真实逻辑
+
+详见 [doc/design/05-27-1003-题材抽取保存与GUI补全设计.md §10 / §10·B](05-27-1003-题材抽取保存与GUI补全设计.md)。
 
 ### 14.5 配置项（`config/ai_config.json`）
 

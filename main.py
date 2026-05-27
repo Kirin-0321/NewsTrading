@@ -17,9 +17,12 @@ load_dotenv(os.path.join(_ROOT, ".env"))
 
 from services.storage.database import init_database  # noqa: E402
 
-init_database()
+init_database()  # news.db (含 Phase -1 一次性 DROP 旧 AI 表)
 
 from services.market import MarketDB  # noqa: E402
+from services.storage.ai_inference_db import (  # noqa: E402
+    get_ai_inference_db,
+)
 
 
 def _init_market_db_on_startup() -> None:
@@ -41,7 +44,26 @@ def _init_market_db_on_startup() -> None:
         print(f"[启动] market.db 初始化失败: {exc}", file=sys.stderr)
 
 
+def _init_ai_inference_db_on_startup() -> None:
+    """初始化 ``data/ai_inference.db``（Phase -1 三库重构新增）。
+
+    存放所有 AI 衍生数据（ai_reports / theme_* / *_scores），
+    迁移失败仅写 stderr 不阻断启动。
+    """
+    try:
+        applied = get_ai_inference_db().ensure_schema()
+        if applied:
+            print(
+                "[启动] ai_inference.db 迁移完成: "
+                + ", ".join(str(v) for v in applied),
+                file=sys.stderr,
+            )
+    except Exception as exc:  # noqa: BLE001
+        print(f"[启动] ai_inference.db 初始化失败: {exc}", file=sys.stderr)
+
+
 _init_market_db_on_startup()
+_init_ai_inference_db_on_startup()
 
 from core.prompt_loader import PromptLoader  # noqa: E402
 

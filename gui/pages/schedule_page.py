@@ -22,6 +22,11 @@ TASK_TYPE_LABELS = {
     "clean_sync": "数据清理（AI清洗）",
     "analyze": "新闻分析",
     "market_fetch": "盘后数据拉取",
+    # 打分系统（plan M3 桩，等 M3 上线后真实可用）
+    "stock_daily_sync": "📊 个股日行情同步（plan M3）",
+    "sector_daily_sync": "📊 板块日行情同步（plan M3）",
+    "theme_score_daily": "📊 题材每日打分（plan M3）",
+    "theme_ai_review": "🤖 AI 评分员 D+5 复审（plan M3）",
 }
 
 

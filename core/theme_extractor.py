@@ -20,6 +20,7 @@
 """
 
 import json
+import logging
 import os
 import re
 from datetime import datetime
@@ -28,15 +29,52 @@ from typing import Callable, Dict, List, Optional, Tuple
 from core.ai_config import AIConfig, DEFAULT_MAX_OUTPUT_TOKENS
 from core.prompt_loader import PromptError, get_loader
 
+logger = logging.getLogger(__name__)
+
 
 _REPORT_REF_HEADER = "## 📰 引用新闻详情"
 
-_VALID_LEVELS = {"极强", "强", "中", "弱"}
-_VALID_SENTIMENT = {"利好", "利空", "中性"}
+_VALID_LEVELS = {
+    "重大利空", "较强利空", "弱利空", "中性偏空",
+    "中性",
+    "中性偏多", "弱利多", "较强利多", "重大利多",
+}
 _VALID_DURATION = {"短期", "中期", "长期"}
 _VALID_GAP = {"高", "中高", "中", "中低", "低"}
 _VALID_CATEGORY = {"科技AI", "新能源", "基建", "消费", "医药", "金融", "军工", "周期", "其他"}
 _VALID_ROLE = {"核心", "上游", "中游", "下游", "潜力", "边缘"}
+
+
+def _score_to_level(score: int) -> str:
+    """strength_score -> strength_level（9 档映射，与 prompt v2 schema 对齐）。
+
+    score >= +80                  -> 重大利多
+    +60 <= score <= +79           -> 较强利多
+    +40 <= score <= +59           -> 弱利多
+    +1  <= score <= +39           -> 中性偏多
+    score == 0                    -> 中性
+    -39 <= score <= -1            -> 中性偏空
+    -59 <= score <= -40           -> 弱利空
+    -79 <= score <= -60           -> 较强利空
+    score <= -80                  -> 重大利空
+    """
+    if score >= 80:
+        return "重大利多"
+    if score >= 60:
+        return "较强利多"
+    if score >= 40:
+        return "弱利多"
+    if score >= 1:
+        return "中性偏多"
+    if score == 0:
+        return "中性"
+    if score >= -39:
+        return "中性偏空"
+    if score >= -59:
+        return "弱利空"
+    if score >= -79:
+        return "较强利空"
+    return "重大利空"
 _VALID_RELATION = {"主因", "共振", "风险", "背景"}
 
 _PROMPT_CATEGORY = "theme_extraction"
@@ -143,6 +181,16 @@ class ThemeExtractor:
         if err and not themes:
             self._dump_failure(report_text, raw_response, err)
             return [], err
+
+        # 接入 matcher：补板块代码 + 标的标准化代码（v4 新增）
+        # 失败不抛异常，保留原数据
+        if themes:
+            try:
+                from services.scoring.matcher import enrich_themes_with_matcher
+                enrich_themes_with_matcher(themes)
+            except Exception as e:
+                logger.warning("matcher 富化失败，沿用原数据: %s", e)
+
         return themes, err  # 部分成功时也带 warning 出去
 
     @staticmethod
@@ -486,15 +534,20 @@ class ThemeExtractor:
 
         news = ThemeExtractor._normalize_news_field(item.get("news"))
 
+        score = pick_int(item.get("strength_score"), -100, 100)
+        if score is None:
+            score = 0
+        level_raw = pick_enum(item.get("strength_level"), _VALID_LEVELS)
+        level = _score_to_level(score) if not level_raw else level_raw
+
         return {
             "theme_name": name,
             "theme_category": pick_enum(item.get("theme_category"), _VALID_CATEGORY),
-            "strength_score": pick_int(item.get("strength_score"), 0, 100),
-            "strength_level": pick_enum(item.get("strength_level"), _VALID_LEVELS),
+            "strength_score": score,
+            "strength_level": level,
             "priority_rank": pick_int(item.get("priority_rank")),
             "duration": pick_enum(item.get("duration"), _VALID_DURATION),
             "expectation_gap": pick_enum(item.get("expectation_gap"), _VALID_GAP),
-            "sentiment": pick_enum(item.get("sentiment"), _VALID_SENTIMENT) or "利好",
             "is_cold": 1 if item.get("is_cold") else 0,
             "reason": reason,
             "risk_note": item.get("risk_note") or None,
@@ -675,11 +728,16 @@ def parse_report_meta(report_path: str) -> Dict:
 
     示例输入: data/AI_analysis/5月22日/5月22日_18时25分_盘后总结分析报告.md
     输出: {
-        'report_id': '5月22日_18时25分_盘后总结分析报告',
+        'report_id': '5月22日_18时25分_盘后总结分析报告',  # 文件名（非 ai_reports.id）
         'report_date': '2026-05-22',  # 优先用文件 mtime
         'report_time': '18:25',
-        'report_path': 绝对路径
+        'report_path': 'data/AI_analysis/5月22日/...'  # 相对 posix（P1 修复）
     }
+
+    P1 修复（2026-05-27 review）：
+        历史上 report_path 存 os.path.abspath() 绝对 Windows 路径，与
+        ai_reports.file_path（相对 posix）不一致，导致下游反查 prompt_id 永远 NULL。
+        统一改用 _to_relative_posix() 规范化为相对 posix 路径。
     """
     abspath = os.path.abspath(report_path)
     basename = os.path.basename(report_path)
@@ -700,9 +758,15 @@ def parse_report_meta(report_path: str) -> Dict:
         if not report_time:
             report_time = datetime.now().strftime("%H:%M")
 
+    try:
+        from services.storage.ai_reports_store import _to_relative_posix
+        rel_path = _to_relative_posix(report_path)
+    except Exception:
+        rel_path = report_path.replace("\\", "/")
+
     return {
         "report_id": report_id,
         "report_date": report_date,
         "report_time": report_time,
-        "report_path": abspath,
+        "report_path": rel_path,
     }
