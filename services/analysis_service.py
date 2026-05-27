@@ -135,8 +135,12 @@ class AnalysisService:
             }
 
             # 回测命名时间：模拟交易日 00:00（前缀显示该日期，便于人辨识）
+            # 回测产物附加 _backtest_{template_id}_{HHMMSS} 后缀：
+            #   - {template_id} 避免同日多模板互相覆盖
+            #   - {HHMMSS} 真实生成时间，避免同日同模板多次跑互相覆盖
             naming_dt: Optional[datetime] = None
             backtest_suffix = False
+            extra_suffix = ""
             if simulated_trade_date:
                 if not (
                     len(simulated_trade_date) == 8
@@ -151,6 +155,13 @@ class AnalysisService:
                     simulated_trade_date + "0000", "%Y%m%d%H%M"
                 )
                 backtest_suffix = True
+                sanitized_tpl = self._sanitize_template_id(template_id)
+                run_stamp = datetime.now().strftime("%H%M%S")
+                # 拼装规则：tpl 为空时只保留 HHMMSS；都有时下划线连接
+                extra_suffix = (
+                    f"{sanitized_tpl}_{run_stamp}"
+                    if sanitized_tpl else run_stamp
+                )
 
             temp_path = self._write_temp_json(news_list, source)
             try:
@@ -169,6 +180,7 @@ class AnalysisService:
                     cancel_check=cancel_check,
                     naming_dt=naming_dt,
                     backtest_suffix=backtest_suffix,
+                    extra_suffix=extra_suffix,
                 )
             finally:
                 try:
@@ -226,6 +238,24 @@ class AnalysisService:
             out.error = str(e)
 
         return out
+
+    @staticmethod
+    def _sanitize_template_id(template_id: Optional[str]) -> str:
+        """把 ``template_id`` 清洗成文件名安全片段。
+
+        - None / 空 → 返回 ``""``（调用方按"无 template"处理）
+        - 仅保留 ``[a-zA-Z0-9_-]``，其它字符全部丢弃
+        - 截断到 64 字符，避免 Windows MAX_PATH 风险
+
+        典型回测 template_id 形如 ``custom_1770292858`` / ``speculator_scalper``
+        本身就是字母数字下划线，不会损失信息；防御主要是兜底未来 UI 自定义模板
+        允许中文/空格名字时不会污染文件系统。
+        """
+        if not template_id:
+            return ""
+        import re
+        cleaned = re.sub(r"[^A-Za-z0-9_-]", "", template_id)
+        return cleaned[:64]
 
     @staticmethod
     def _record_ai_report(

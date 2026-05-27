@@ -1,6 +1,9 @@
 """一次性迁移 CLI：把历史 ``report_date`` 字段从 ``YYYY-MM-DD`` 规范化为 ``YYYYMMDD``，
-顺手修正 backtest 产物的错误命名（``5月27日_18时12分_..._backtest_20260522.md`` →
-``5月22日_0时00分_..._backtest.md``）。
+顺手把 backtest 产物的文件名对齐到 v3 终态：
+
+* v1 旧命名：``5月27日_18时12分_..._backtest_20260522.md``（前缀是真实生成时间）
+* v2 中间命名：``5月22日_0时00分_..._backtest.md``（缺 template_id，同日多模板会互相覆盖）
+* v3 终态命名：``5月22日_0时00分_..._backtest_{template_id}.md``
 
 业务背景
 --------
@@ -145,31 +148,61 @@ def _migrate_table(conn, table: str) -> int:
 # ---------------------------------------------------------------------------
 
 
-# 旧命名：5月27日_18时12分_盘后总结分析报告_backtest_20260522.md
+# 旧命名 v1：5月27日_18时12分_盘后总结分析报告_backtest_20260522.md
 #   前缀的月日时分 ≠ 后缀 _backtest_YYYYMMDD 里的日期
-_RE_OLD_BACKTEST = re.compile(
+_RE_OLD_BACKTEST_V1 = re.compile(
     r"^(\d{1,2})月(\d{1,2})日_(\d{1,2})时(\d{2})分_(.+?)_backtest_(\d{8})\.md$"
 )
 
-# 新命名：5月22日_0时00分_盘后总结分析报告_backtest.md
-_RE_NEW_BACKTEST = re.compile(
+# 旧命名 v2（2026-05-27 18:30 第一版重构后，缺 template_id 后缀）：
+#   5月22日_0时00分_盘后总结分析报告_backtest.md
+_RE_OLD_BACKTEST_V2 = re.compile(
     r"^(\d{1,2})月(\d{1,2})日_(\d{1,2})时(\d{2})分_(.+?)_backtest\.md$"
 )
 
+# v3（2026-05-27 20:00 hotfix）：
+#   5月22日_0时00分_盘后总结分析报告_backtest_{template_id}.md
+# v4（2026-05-27 20:30 hotfix2，终态）：
+#   5月22日_0时00分_盘后总结分析报告_backtest_{template_id}_{HHMMSS}.md
+#   兼容无 template 的极端兜底：_backtest_{HHMMSS}.md
+# 注意：v3/v4 后缀都属于「合法终态」，迁移脚本不再动它们；以下正则只用于识别
+_RE_TERMINAL_BACKTEST = re.compile(
+    r"^(\d{1,2})月(\d{1,2})日_(\d{1,2})时(\d{2})分_(.+?)_backtest"
+    r"(?:_[A-Za-z0-9_-]+)?\.md$"
+)
 
-def _expected_backtest_basename(report_date: str, base_title: str) -> str:
+
+def _sanitize_template_id(template_id: Optional[str]) -> str:
+    """与 :meth:`AnalysisService._sanitize_template_id` 保持一致。"""
+    if not template_id:
+        return ""
+    import re
+    return re.sub(r"[^A-Za-z0-9_-]", "", template_id)[:64]
+
+
+def _expected_backtest_basename(
+    report_date: str,
+    base_title: str,
+    template_id: Optional[str] = None,
+) -> str:
     """根据 ``report_date(YYYYMMDD)`` + 报告题目部分，构造新规则下的标准文件名。
 
     Args:
         report_date: YYYYMMDD（必须已经迁移好）
         base_title: 报告题目部分，如 ``"盘后总结分析报告"``；不含 ``_backtest`` 后缀
+        template_id: 同一天多模板回测时用作隔离后缀；为 None/空 时不附加（兼容旧链路）
 
     Returns:
-        ``"5月22日_0时00分_盘后总结分析报告_backtest.md"``
+        - 无 template_id: ``"5月22日_0时00分_盘后总结分析报告_backtest.md"``
+        - 有 template_id: ``"5月22日_0时00分_盘后总结分析报告_backtest_custom_6.md"``
     """
     month = int(report_date[4:6])
     day = int(report_date[6:8])
-    return f"{month}月{day}日_0时00分_{base_title}_backtest.md"
+    tail = "_backtest"
+    safe_tpl = _sanitize_template_id(template_id)
+    if safe_tpl:
+        tail += f"_{safe_tpl}"
+    return f"{month}月{day}日_0时00分_{base_title}{tail}.md"
 
 
 def _expected_backtest_dir(report_date: str) -> str:
@@ -197,33 +230,47 @@ def _normalize_to_yyyymmdd(s: str) -> Optional[str]:
 def _scan_rename_plan(conn) -> List[RenamePlan]:
     """扫描所有 ``is_backtest=1`` 的 ai_reports，列出需要重命名的文件清单。
 
+    覆盖三种历史/中间命名，统一对齐到 v3 终态：
+
+    * **v1 旧命名**：``5月27日_18时12分_..._backtest_20260522.md``
+      （事后 rename 链路的产物；前缀是真实生成时间）
+    * **v2 中间命名**：``5月22日_0时00分_..._backtest.md``
+      （第一版 hotfix 后；缺 template_id 后缀，同日多模板会互相覆盖）
+    * **v3 终态命名**：``5月22日_0时00分_..._backtest_{template_id}.md``
+
     兼容 db 字段尚未迁移的场景（dry-run 时也能正确扫到旧命名）：
     ``report_date`` 是 YYYY-MM-DD 也会被规范化为 YYYYMMDD 后参与命名推导。
     """
     plans: List[RenamePlan] = []
     rows = conn.execute(
-        "SELECT id, file_path, report_date FROM ai_reports "
-        "WHERE is_backtest = 1"
+        "SELECT id, file_path, report_date, prompt_id "
+        "FROM ai_reports WHERE is_backtest = 1"
     ).fetchall()
     for r in rows:
         rid = int(r["id"])
         fp = (r["file_path"] or "").strip()
         raw_rd = (r["report_date"] or "").strip()
+        prompt_id = (r["prompt_id"] or "").strip() or None
         rd = _normalize_to_yyyymmdd(raw_rd)
         if not fp or not rd:
             continue
         basename = os.path.basename(fp.replace("\\", "/"))
-        # 已经是新命名 → 跳过
-        if _RE_NEW_BACKTEST.match(basename):
+        # 已经是 v3/v4 终态命名 → 跳过（既支持 _backtest_{tpl}.md 也支持
+        # _backtest_{tpl}_{HHMMSS}.md / _backtest_{HHMMSS}.md）
+        if _RE_TERMINAL_BACKTEST.match(basename):
             continue
-        # 尝试从旧命名拆出题目
-        m = _RE_OLD_BACKTEST.match(basename)
-        if m:
-            base_title = m.group(5)
+        # 尝试从 v1 拆出题目
+        m1 = _RE_OLD_BACKTEST_V1.match(basename)
+        m2 = _RE_OLD_BACKTEST_V2.match(basename)
+        if m1:
+            base_title = m1.group(5)
+        elif m2:
+            base_title = m2.group(5)
         else:
-            # 兜底：未识别命名，用「盘后总结分析报告」
             base_title = "盘后总结分析报告"
-        new_basename = _expected_backtest_basename(rd, base_title)
+        new_basename = _expected_backtest_basename(
+            rd, base_title, template_id=prompt_id,
+        )
         new_dir = _expected_backtest_dir(rd)
         new_rel = f"data/AI_analysis/{new_dir}/{new_basename}"
         if new_rel == fp.replace("\\", "/"):

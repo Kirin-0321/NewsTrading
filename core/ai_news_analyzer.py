@@ -331,6 +331,7 @@ class AINewsAnalyzer:
         cancel_check: Optional[Callable[[], bool]] = None,
         naming_dt: Optional[datetime] = None,
         backtest_suffix: bool = False,
+        extra_suffix: str = "",
     ) -> Dict:
         """
         分析新闻文件
@@ -346,6 +347,9 @@ class AINewsAnalyzer:
                 - None（默认）：真实生成，用 ``datetime.now()`` 命名
                 - 给定 datetime：用该值命名（典型场景：回测产物用模拟交易日 00:00）
             backtest_suffix: True 时文件名追加 ``_backtest`` 后缀，标识虚拟回测产物。
+            extra_suffix: 追加在 ``_backtest`` 之后的可选片段（不带前导下划线，
+                调用方传 ``"custom_6"`` 会得到 ``..._backtest_custom_6.md``）。
+                典型用途：同一天跑多个模板回测时区分 ``template_id``。
         """
         try:
             _raise_if_cancelled(cancel_check)
@@ -413,6 +417,7 @@ class AINewsAnalyzer:
                 news_list,
                 naming_dt=naming_dt,
                 backtest_suffix=backtest_suffix,
+                extra_suffix=extra_suffix,
             )
 
             if progress_callback:
@@ -453,6 +458,7 @@ class AINewsAnalyzer:
         news_list: Optional[list] = None,
         naming_dt: Optional[datetime] = None,
         backtest_suffix: bool = False,
+        extra_suffix: str = "",
     ) -> str:
         """保存分析报告。
 
@@ -460,6 +466,8 @@ class AINewsAnalyzer:
             naming_dt: 文件命名用的时间戳；None=用 ``datetime.now()``（真实生成），
                 给定值=用该时间命名（典型：回测产物用模拟交易日 00:00）
             backtest_suffix: True 时文件名追加 ``_backtest`` 后缀
+            extra_suffix: 追加在 ``_backtest`` 之后的可选片段（不带前导下划线）。
+                同一天跑多模板回测必传 ``template_id``，否则会互相覆盖。
         """
         basename = os.path.basename(source_file)
 
@@ -469,10 +477,17 @@ class AINewsAnalyzer:
         month_day = f"{naming.month}月{naming.day}日"
         time_str = f"{naming.hour}时{naming.strftime('%M')}分"
 
-        # 文件名（回测追加 _backtest 后缀，便于人/程序一眼识别）
-        suffix = "_backtest" if backtest_suffix else ""
+        # 后缀拼装：[_backtest][_{extra_suffix}]
+        # extra_suffix 由调用方保证已 sanitize（仅 [a-zA-Z0-9_-]）
+        tail = ""
+        if backtest_suffix:
+            tail = "_backtest"
+            if extra_suffix:
+                tail += f"_{extra_suffix}"
+        elif extra_suffix:
+            tail = f"_{extra_suffix}"
         report_filename = (
-            f"{month_day}_{time_str}_盘后总结分析报告{suffix}.md"
+            f"{month_day}_{time_str}_盘后总结分析报告{tail}.md"
         )
 
         # 生成保存路径: data/AI_analysis/月日/

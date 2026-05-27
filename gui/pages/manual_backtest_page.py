@@ -142,17 +142,10 @@ class ManualBacktestPage(QWidget):
         )
         self.curated_checkbox.stateChanged.connect(self._refresh_preview)
         row1.addWidget(self.curated_checkbox)
-        row1.addSpacing(15)
-
-        self.overwrite_checkbox = QCheckBox("已存在则覆盖")
-        self.overwrite_checkbox.setChecked(True)
-        self.overwrite_checkbox.setToolTip(
-            "命中同 (模板, 交易日, is_backtest=1) 时：\n"
-            "  勾选 = 删除旧记录(ai_reports + theme_predictions +\n"
-            "         子表 + md 文件) 后重跑，得到全新结果\n"
-            "  取消 = 直接跳过，保留旧记录（避免无意中重跑浪费 LLM）"
-        )
-        row1.addWidget(self.overwrite_checkbox)
+        # 「已存在则覆盖」checkbox 已于 2026-05-27 20:30 hotfix2 移除：
+        # 新策略下 GUI 永远走默认追加（同 (template, date) 多份共存，
+        # 文件名 `_backtest_{tpl}_{HHMMSS}` 自动去重），无需 UI 选项。
+        # 极少数破坏性清空场景请走 `python tools/backtest_prompt.py --overwrite`。
         row1.addStretch()
         outer.addLayout(row1)
 
@@ -428,7 +421,6 @@ class ManualBacktestPage(QWidget):
                 "curated" if self.curated_checkbox.isChecked() else ""
             ),
             "provider": self.provider_combo.currentText() or None,
-            "overwrite": self.overwrite_checkbox.isChecked(),
         }
 
     def _refresh_preview(self):
@@ -547,6 +539,8 @@ class ManualBacktestPage(QWidget):
         self.open_md_btn.setEnabled(False)
         self._set_buttons_running(True)
 
+        # overwrite 永远 False（GUI 策略已切到「默认追加多份共存」，
+        # 详见 doc/bugfix/05-27-1830-报告日期与回测命名重构.md §八 hotfix2）
         self.worker = ManualBacktestWorker(
             template_id=inputs["template_id"],
             trade_date=inputs["trade_date"],
@@ -554,7 +548,7 @@ class ManualBacktestPage(QWidget):
             news_end_dt=inputs["news_end_dt"],
             news_status=inputs["news_status"],
             provider=inputs["provider"],
-            overwrite=inputs["overwrite"],
+            overwrite=False,
             dry_run=dry_run,
         )
         self.worker.stage.connect(self._on_stage)
@@ -625,9 +619,11 @@ class ManualBacktestPage(QWidget):
             )
             return
         if skipped:
+            # GUI 策略下 skipped 只在 snapshot 无新闻 / dry_run 时触发；
+            # 「已存在」不再是 skip 原因（默认追加多份共存）
             self.status_label.setText(
                 f"<span style='color:#c80'>⚠ 跳过: "
-                f"{result.get('error') or '已存在或无新闻'}</span>"
+                f"{result.get('error') or '无新闻或 dry-run'}</span>"
             )
             return
 
@@ -636,21 +632,10 @@ class ManualBacktestPage(QWidget):
         news_count = result.get("snapshot_news_count")
         elapsed_ms = result.get("elapsed_ms")
 
-        overwrite_html = ""
-        if result.get("overwritten"):
-            overwrite_html = (
-                f"&nbsp;&nbsp;<span style='color:#c80'>"
-                f"🗑 已覆盖旧记录: "
-                f"-ai_reports={result.get('deleted_reports', 0)} "
-                f"-themes={result.get('deleted_themes', 0)} "
-                f"-md={result.get('deleted_md_files', 0)}</span>"
-            )
-
         self.status_label.setText(
             f"<span style='color:#0a0'>✅ 成功</span>"
             f"&nbsp;&nbsp;news={news_count} themes={themes_count} "
             f"&nbsp;{elapsed_ms} ms"
-            + overwrite_html
             + (
                 f"&nbsp;&nbsp;<span style='color:#888'>"
                 f"file={Path(report_path).name}</span>"

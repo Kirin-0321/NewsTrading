@@ -11,6 +11,7 @@
     "breadth.limit_up":              {"layer": "L1", "weight": 3, "required": true},
     "breadth.limit_down":            {"layer": "L1", "weight": 2, "required": true},
     "breadth.failed_limit":          {"layer": "L1", "weight": 2, "required": true},
+    "breadth.stock_daily_rows":      {"layer": "L1", "weight": 2, "required": true},
 
     "sentiment.seal_rate":           {"layer": "L2", "weight": 3, "required": true},
     "sentiment.fail_rate":           {"layer": "L2", "weight": 2, "required": false},

@@ -1,16 +1,23 @@
-"""模板虚拟回测 CLI（Phase 6 Step 6.2 + 2026-05-27 18:30 命名重构）。
+"""模板虚拟回测 CLI（Phase 6 Step 6.2 + 2026-05-27 18:30 命名重构 + 20:30 hotfix2）。
 
 业务定位
 --------
 "时光机"工具：模拟在 ``trade_date`` 的 ``[news_start_dt, news_end_dt)``
 新闻窗口下，用指定 ``template_id`` 跑一次 AI 分析，产物：
 
-* ``data/AI_analysis/{月}月{日}日/{月}月{日}日_0时00分_盘后总结分析报告_backtest.md``
-  ——文件名前缀直接用模拟交易日，时分填 ``0时00分``，后缀 ``_backtest`` 标识
+* ``data/AI_analysis/{月}月{日}日/{月}月{日}日_0时00分_盘后总结分析报告_backtest_{template_id}_{HHMMSS}.md``
+  ——文件名前缀直接用模拟交易日，时分填 ``0时00分``；后缀链
+  ``_backtest_{template_id}_{HHMMSS}`` 保证同 (template, date) 多次跑不互相覆盖
+  （``HHMMSS`` 取自真实生成时刻，用于人辨识"哪次跑"）
 * ``ai_inference.db`` 的 ``ai_reports`` / ``theme_predictions`` 多
-  ``is_backtest=1`` 的行，``report_date`` = ``trade_date``（YYYYMMDD）
+  ``is_backtest=1`` 的行，``report_date`` = ``trade_date``（YYYYMMDD）；
+  同 (template, date) 允许多行共存（``file_path`` UNIQUE 即可）
 * 接到 Phase 2 打分链路里，可直接被 :mod:`services.scoring.scoring_service`
   消费
+
+覆盖策略（20:30 hotfix2 起改为「默认追加」）：
+* ``--overwrite`` 不传 → 默认追加新版本，旧版本完整保留
+* ``--overwrite`` 传 → 删全部同 (template, date) 旧版本（5 表 + md）再写新版本
 
 时间窗主人语义（**2026-05-27 重构**）
 -----------------------------------
@@ -19,8 +26,8 @@
 * **右边界硬上限 = next_trade_date(trade_date) 09:00**
 * 详见 :func:`services.scoring.snapshot.build_snapshot`
 
-实现链路（2026-05-27 18:30 简化版）
-----------------------------------
+实现链路（2026-05-27 18:30 简化版 + 20:30 hotfix2）
+---------------------------------------------------
 ::
 
     build_snapshot(trade_date, news_start_dt, news_end_dt, news_status)
@@ -29,8 +36,11 @@
                             market_summary=snap.market_summary_md,
                             simulated_trade_date=trade_date)  # ← 一切由此驱动
         ↓ 自动调
-        AINewsAnalyzer.save_report(naming_dt=trade_date 00:00,
-                                   backtest_suffix=True)  # 文件名正确
+        AINewsAnalyzer.save_report(
+            naming_dt=trade_date 00:00,
+            backtest_suffix=True,
+            extra_suffix=f"{sanitized_tpl}_{now.strftime('%H%M%S')}")
+            # → _backtest_{tpl}_{HHMMSS} 保证同 (tpl,date) 多跑不冲突
         → _record_ai_report(simulated_trade_date=...)     # is_backtest=1
         → _maybe_extract_themes(simulated_trade_date=...) # theme is_backtest=1
         ↓
@@ -153,9 +163,10 @@ def backtest_one(
         news_status: "curated"（精选，默认）/ ""（全部，含 rejected）
         provider: LLM provider，None = 走默认
         overwrite: 命中同 (template, date, is_backtest=1) 时：
-            * True  → 调 :func:`_delete_existing_backtest` 删旧 5 表 + md
-              文件后重跑（**会真的删数据**）
-            * False → 跳过本次回测，error 提示传 --overwrite
+            * False（**默认，2026-05-27 20:30 后改**）→ **不阻拦**，直接追加新版本
+              （文件名通过 ``_backtest_{tpl}_{HHMMSS}`` 后缀保证唯一）
+            * True → 调 :func:`_delete_existing_backtest` 删旧 5 表 + 全部历史 md
+              文件后再写新版本（**会真的删数据**）
         dry_run: 仅重建 snapshot 不调 LLM
         progress_callback: 可选回调，签名兼容
             ``callback(message: str, is_streaming: bool = False)``。
@@ -260,37 +271,30 @@ def backtest_one(
             error="snapshot 无新闻（历史新闻库未覆盖该窗），自动跳过",
         )
 
-    # 6. 已存在 backtest 记录 → overwrite 则删旧重跑，否则跳过
-    if _has_existing_backtest(template_id, trade_date):
-        if overwrite:
-            if progress_callback:
-                progress_callback(
-                    "命中已存在 backtest 记录，开始覆盖删除..."
-                )
-            stats = _delete_existing_backtest(template_id, trade_date)
-            overwrite_stats["overwritten"] = True
-            overwrite_stats["deleted_reports"] = stats["ai_reports"]
-            overwrite_stats["deleted_themes"] = stats["theme_predictions"]
-            overwrite_stats["deleted_md_files"] = stats["md_files"]
-            _log.info(
-                "overwrite: 清理旧 backtest 记录 "
-                "ai_reports=%d theme_predictions=%d md_files=%d",
-                stats["ai_reports"], stats["theme_predictions"],
-                stats["md_files"],
+    # 6. 覆盖策略（2026-05-27 20:30 起改为「默认追加」）：
+    #   - overwrite=True  → 删全部同 (template, date) 旧版本再写新版本
+    #   - overwrite=False → 直接追加新版本，文件名通过 HHMMSS 后缀保证唯一
+    if overwrite and _has_existing_backtest(template_id, trade_date):
+        if progress_callback:
+            progress_callback(
+                "命中已存在 backtest 记录，--overwrite 开始覆盖删除..."
             )
-            if progress_callback:
-                progress_callback(
-                    f"已清理：ai_reports={stats['ai_reports']} "
-                    f"themes={stats['theme_predictions']} "
-                    f"md={stats['md_files']}"
-                )
-        else:
-            return _make_result(
-                ok=True, snap_news_count=snap.news_count, skipped=True,
-                error=(
-                    "已存在同 (template, date) 的 backtest 记录，"
-                    "传 --overwrite 删旧重跑"
-                ),
+        stats = _delete_existing_backtest(template_id, trade_date)
+        overwrite_stats["overwritten"] = True
+        overwrite_stats["deleted_reports"] = stats["ai_reports"]
+        overwrite_stats["deleted_themes"] = stats["theme_predictions"]
+        overwrite_stats["deleted_md_files"] = stats["md_files"]
+        _log.info(
+            "overwrite: 清理旧 backtest 记录 "
+            "ai_reports=%d theme_predictions=%d md_files=%d",
+            stats["ai_reports"], stats["theme_predictions"],
+            stats["md_files"],
+        )
+        if progress_callback:
+            progress_callback(
+                f"已清理：ai_reports={stats['ai_reports']} "
+                f"themes={stats['theme_predictions']} "
+                f"md={stats['md_files']}"
             )
 
     # 7. 调 AnalysisService（这里 LLM 真实消耗发生处）
@@ -523,7 +527,8 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--workers", type=int, default=1,
                    help="并发 worker 数（默认 1 = 串行）")
     p.add_argument("--overwrite", action="store_true",
-                   help="覆盖已存在的 backtest md")
+                   help=("命中同 (template, date) 已存在 backtest 时，"
+                         "删全部历史版本再写新版本；不传则默认追加新版本不删旧"))
     p.add_argument("--dry-run", action="store_true",
                    help="仅重建 snapshot 不调 LLM")
     p.add_argument(

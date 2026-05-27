@@ -81,6 +81,9 @@ class FetchResult:
     api_call_count: int = 0
     elapsed_ms: int = 0
 
+    #: 是否走「强制重拉」（fetch 入参传入；step 自检时用来决定要不要跳过）
+    force_refresh: bool = False
+
     #: 北向资金实际取到的日期（可能因 T 日空回退到 prev）
     hsgt_data_date: Optional[str] = None
     hsgt_is_delayed: bool = False
@@ -91,7 +94,7 @@ class FetchResult:
     #: 失败/降级的 warning
     warnings: List[str] = field(default_factory=list)
 
-    #: 缓存命中跳过了哪些步骤
+    #: 缓存命中跳过了哪些步骤（逐表幂等：每个 step 自检命中后追加表名）
     skipped: List[str] = field(default_factory=list)
 
     #: kpl_list(prev_trade_date) 内存缓存，给 metrics.calc_promotion_rate 用
@@ -132,6 +135,16 @@ class TushareMarketFetcher:
     ) -> FetchResult:
         """把 ``trade_date`` 的全部行情数据拉到 ``market.db``。
 
+        缓存语义（2026-05-27 修订为「逐表幂等」）
+        ----------------------------------------
+        * ``force_refresh=True`` → 先清空 14+1 张 fact 表的当日数据再全量重拉
+        * ``force_refresh=False`` → 进入主循环 14+1 个 step；
+            * **A 组**（独立表）：每个 step 自检"该表当日已有数据→ skip 入 result.skipped"
+            * **B 组**（``fact_limit_stock``：4 个 step 共写无来源字段无法分辨）：
+              进入第一步前统一 DELETE 当日 limit_stock 行后顺序重写
+            * **C 组**（``dim_sector`` 字典）：不参与按日自检，每次刷 last_seen_date
+        * 第 15 步「全 A 股个股日线」复用 :func:`sync_stock_daily`，幂等内置
+
         Args:
             trade_date: 目标交易日 ``YYYYMMDD``，由
                 ``trade_date.resolve_trade_date`` 给出。
@@ -142,29 +155,22 @@ class TushareMarketFetcher:
                 供 GUI Worker 实时更新进度文字。
 
         Returns:
-            :class:`FetchResult`，含每步入库条数、警告、北向延迟标记等。
+            :class:`FetchResult`，含每步入库条数、警告、北向延迟标记、
+            ``skipped``（逐表幂等命中的表名列表）等。
         """
         progress = progress_callback or (lambda _msg: None)
         t0 = time.time()
         api0 = self.client.call_count
 
         result = FetchResult(
-            trade_date=trade_date, prev_trade_date=prev_trade_date
+            trade_date=trade_date,
+            prev_trade_date=prev_trade_date,
+            force_refresh=force_refresh,
         )
 
         if force_refresh:
             progress("清理已有数据…")
             self._purge_trade_date(trade_date)
-        elif self._has_index_data(trade_date):
-            # 缓存命中：fact_index_daily 有当天数据，直接复用全部 fact_*
-            _log.info(
-                "fact_* 表已有 %s 数据，本次跳过 Tushare 拉取（force_refresh=False）",
-                trade_date,
-            )
-            result.skipped.append("all")
-            result.api_call_count = 0
-            result.elapsed_ms = int((time.time() - t0) * 1000)
-            return result
 
         steps: List[Tuple[str, Callable[[FetchResult], None]]] = [
             ("拉取 7 大指数", self._fetch_index_daily),
@@ -181,6 +187,7 @@ class TushareMarketFetcher:
             ("拉取财联社个股异动 (cls_stock_shock)", self._fetch_cls_stock_shock),
             ("拉取财联社板块异动 (cls_market_shock)", self._fetch_cls_market_shock),
             ("拉取全市场涨跌家数 (daily)", self._fetch_market_breadth),
+            ("拉取全 A 股个股日线 (daily) → fact_stock_daily", self._fetch_stock_daily),
         ]
         for label, func in steps:
             progress(label)
@@ -211,15 +218,50 @@ class TushareMarketFetcher:
     # ==================================================================
 
     def _has_index_data(self, trade_date: str) -> bool:
+        """⚠️ 保留向后兼容（旧 all-or-nothing 早退用），新代码请用 _table_has_data。"""
+        return self._table_has_data("fact_index_daily", trade_date)
+
+    def _table_has_data(self, table: str, trade_date: str) -> bool:
+        """检测某 fact 表在某交易日是否已有数据（逐表幂等 step 自检用）。
+
+        输入:
+            table       表名（白名单内，调用方自己保证安全）
+            trade_date  YYYYMMDD
+        输出:
+            True  → 当日已有至少 1 行 → step 应跳过 ingest
+            False → 表无该日数据 → step 正常拉取
+        """
         with self.db.connect(readonly=True) as conn:
             row = conn.execute(
-                "SELECT 1 FROM fact_index_daily WHERE trade_date = ? LIMIT 1",
+                f"SELECT 1 FROM {table} WHERE trade_date = ? LIMIT 1",
                 (trade_date,),
             ).fetchone()
         return row is not None
 
+    def _purge_limit_stock(self, trade_date: str) -> None:
+        """清空 ``fact_limit_stock`` 在某交易日的全部行。
+
+        为什么单独抽出：涨停表被 step 4/5/6 三个 step 共写（limit_list_d /
+        kpl_today / ths × 3 池），表无 src 字段无法按来源分辨，逐 step 自检
+        会互相打架。统一策略：在 step 4 进入前先清当日，3 个 step 顺序
+        INSERT OR REPLACE 重写（PK 冲突自动覆盖）。
+
+        说明：step 8 ``_fetch_kpl_prev`` 是「仅内存」step，把 rows 暂存
+        ``result.kpl_prev_rows`` 给 metrics.calc_promotion_rate 用，
+        **不写 fact_limit_stock**，因此本函数与它无关。
+        """
+        with self.db.connect() as conn:
+            conn.execute(
+                "DELETE FROM fact_limit_stock WHERE trade_date = ?",
+                (trade_date,),
+            )
+
     def _purge_trade_date(self, trade_date: str) -> None:
-        """把某交易日的所有 fact_* 数据清空（force_refresh=True 时调用）。"""
+        """把某交易日的所有 fact_* 数据清空（force_refresh=True 时调用）。
+
+        2026-05-27 修订：加上 ``fact_stock_daily``（新增 step 15 写入表），
+        确保「强制重拉」语义对全部 14+1 张 fact 表一致。
+        """
         tables = [
             "fact_index_daily",
             "fact_sector_daily",
@@ -231,6 +273,7 @@ class TushareMarketFetcher:
             "fact_cls_stock_shock",
             "fact_cls_market_shock",
             "fact_market_breadth",
+            "fact_stock_daily",
         ]
         with self.db.connect() as conn:
             for t in tables:
@@ -245,6 +288,11 @@ class TushareMarketFetcher:
     # --- 1. index_daily × 7 ---
 
     def _fetch_index_daily(self, result: FetchResult) -> None:
+        if not result.force_refresh and self._table_has_data(
+            "fact_index_daily", result.trade_date
+        ):
+            result.skipped.append("fact_index_daily")
+            return
         all_rows: List[dict] = []
         for ts_code, _key, _label in INDEX_CODES:
             try:
@@ -368,6 +416,11 @@ class TushareMarketFetcher:
     # --- 3. moneyflow_ind_dc → fact_sector_daily ---
 
     def _fetch_sector_moneyflow(self, result: FetchResult) -> None:
+        if not result.force_refresh and self._table_has_data(
+            "fact_sector_daily", result.trade_date
+        ):
+            result.skipped.append("fact_sector_daily")
+            return
         rows = self.client.call(
             "moneyflow_ind_dc",
             params={
@@ -438,6 +491,15 @@ class TushareMarketFetcher:
     # --- 4. limit_list_d × 3 ---
 
     def _fetch_limit_list_d(self, result: FetchResult) -> None:
+        """涨/跌/炸板首批写入 fact_limit_stock。
+
+        共享表策略（2026-05-27 修订）：``fact_limit_stock`` 由 step 4/5/6/8
+        共写且无 src 字段无法分辨来源，所以在 step 4 进入前**统一 DELETE 当日
+        全部 limit 行**，后续 3 个 step 顺序 INSERT OR REPLACE 重写。
+        force_refresh=True 时主流程已 _purge_trade_date 清过，无需重复。
+        """
+        if not result.force_refresh:
+            self._purge_limit_stock(result.trade_date)
         total = 0
         for limit_type in LIMIT_TYPES:
             try:
@@ -775,6 +837,11 @@ class TushareMarketFetcher:
 
     def _fetch_limit_sprint(self, result: FetchResult) -> None:
         """同花顺冲刺涨停池入 fact_limit_sprint（独立表，不属涨停股）。"""
+        if not result.force_refresh and self._table_has_data(
+            "fact_limit_sprint", result.trade_date
+        ):
+            result.skipped.append("fact_limit_sprint")
+            return
         try:
             rows = self.client.call(
                 "limit_list_ths",
@@ -843,6 +910,11 @@ class TushareMarketFetcher:
     # --- 7. moneyflow_hsgt（北向，T 日空兜底 T-1） ---
 
     def _fetch_hsgt(self, result: FetchResult) -> None:
+        if not result.force_refresh and self._table_has_data(
+            "fact_hsgt_daily", result.trade_date
+        ):
+            result.skipped.append("fact_hsgt_daily")
+            return
         actual_date = result.trade_date
         is_delayed = False
         rows = self.client.call(
@@ -905,6 +977,11 @@ class TushareMarketFetcher:
     # --- 8. top_list ---
 
     def _fetch_top_list(self, result: FetchResult) -> None:
+        if not result.force_refresh and self._table_has_data(
+            "fact_top_list", result.trade_date
+        ):
+            result.skipped.append("fact_top_list")
+            return
         rows = self.client.call(
             "top_list",
             params={"trade_date": result.trade_date},
@@ -953,6 +1030,11 @@ class TushareMarketFetcher:
     # --- 9. top_inst ---
 
     def _fetch_top_inst(self, result: FetchResult) -> None:
+        if not result.force_refresh and self._table_has_data(
+            "fact_top_inst", result.trade_date
+        ):
+            result.skipped.append("fact_top_inst")
+            return
         rows = self.client.call(
             "top_inst",
             params={"trade_date": result.trade_date},
@@ -1010,6 +1092,11 @@ class TushareMarketFetcher:
     # --- 10. cls_stock_shock（财联社涨停个股催化原因 + 板块映射） ---
 
     def _fetch_cls_stock_shock(self, result: FetchResult) -> None:
+        if not result.force_refresh and self._table_has_data(
+            "fact_cls_stock_shock", result.trade_date
+        ):
+            result.skipped.append("fact_cls_stock_shock")
+            return
         rows = self.client.call(
             "cls_stock_shock",
             params={"trade_date": result.trade_date},
@@ -1058,6 +1145,11 @@ class TushareMarketFetcher:
     # --- 11. cls_market_shock（财联社板块异动时间线） ---
 
     def _fetch_cls_market_shock(self, result: FetchResult) -> None:
+        if not result.force_refresh and self._table_has_data(
+            "fact_cls_market_shock", result.trade_date
+        ):
+            result.skipped.append("fact_cls_market_shock")
+            return
         rows = self.client.call(
             "cls_market_shock",
             params={"trade_date": result.trade_date},
@@ -1131,6 +1223,11 @@ class TushareMarketFetcher:
         A 股全市场 ~5400 只够用）。按 pct_chg 分桶聚合后写
         ``fact_market_breadth`` 单行；本字段不需要历史明细，重拉即可。
         """
+        if not result.force_refresh and self._table_has_data(
+            "fact_market_breadth", result.trade_date
+        ):
+            result.skipped.append("fact_market_breadth")
+            return
         try:
             rows = self.client.call(
                 "daily",
@@ -1194,7 +1291,39 @@ class TushareMarketFetcher:
             )
         result.ingested["fact_market_breadth"] = 1
 
-    # --- 13. dc_daily 5 日累计派生 ---
+    # --- 13. daily 全 A 股个股日线 → fact_stock_daily ---
+
+    def _fetch_stock_daily(self, result: FetchResult) -> None:
+        """全 A 股个股 OHLCV+pct_chg 入 ``fact_stock_daily``。
+
+        与 step 14 相互独立（B1 纯净版决策）：各自调一次 ``daily(trade_date)``。
+        实现复用 :func:`services.market.stock_daily_sync.sync_stock_daily`
+        （内置幂等检查、INSERT OR REPLACE、防穿越校验）。
+
+        失败容忍：本 step 失败不抛主流程，写 warning + 0 ingested。
+        """
+        if not result.force_refresh and self._table_has_data(
+            "fact_stock_daily", result.trade_date
+        ):
+            result.skipped.append("fact_stock_daily")
+            return
+
+        from services.market.stock_daily_sync import sync_stock_daily
+
+        res = sync_stock_daily(
+            result.trade_date,
+            db=self.db,
+            client=self.client,
+            force=result.force_refresh,
+        )
+        if not res.ok:
+            result.warnings.append(
+                f"sync_stock_daily 失败: {res.error}"
+            )
+            return
+        result.ingested["fact_stock_daily"] = res.rows_written
+
+    # --- 14. dc_daily 5 日累计派生 ---
 
     def _enrich_sector_5d_pct(
         self, result: FetchResult, *, top_n: int = 0

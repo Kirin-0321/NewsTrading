@@ -239,11 +239,33 @@ class MarketSummaryService:
             if _maybe_cancelled(cancel_check, result):
                 return _finalize(result, t0)
 
-            # ---- 3) 缓存命中 ----
+            # ---- 3) 缓存命中：fall-through 跑 fetcher 补缺失维度 ----
+            #
+            # 2026-05-27 修订：旧版命中即 return，导致按钮按完后只有 summary_md
+            # 复用、底层 fact_* 表的缺失维度（如 fact_stock_daily）永远填不上。
+            # 新版命中后**仍跑一次 fetcher.fetch(force=False)**，让 14+1 个 step
+            # 各自自检：已有数据→skip（毫秒级 COUNT），缺失→补齐。整体性能
+            # 仍接近秒级（绝大多数 step 命中 skip）。
             if not force_refresh:
                 cached = self.get(td)
                 if cached.ok:
-                    progress("命中缓存，直接复用…")
+                    progress("命中缓存，开始逐表自检补缺失维度…")
+                    try:
+                        fr = self.fetcher.fetch(
+                            trade_date=td,
+                            prev_trade_date=ptd,
+                            top_sector_n=top_sector_n,
+                            force_refresh=False,
+                            progress_callback=progress,
+                        )
+                        cached.api_call_count = (
+                            (cached.api_call_count or 0) + fr.api_call_count
+                        )
+                        cached.warnings.extend(fr.warnings)
+                    except Exception as exc:  # noqa: BLE001
+                        cached.warnings.append(
+                            f"缓存命中后补缺失败: {exc}"
+                        )
                     cached.from_cache = True
                     cached.warnings.extend(result.warnings)
                     cached.elapsed_ms = int((time.time() - t0) * 1000)
@@ -597,6 +619,13 @@ class MarketSummaryService:
                 "FROM fact_market_breadth WHERE trade_date = ?",
                 (td,),
             ).fetchone()
+            # 全 A 股个股日线行数（fact_stock_daily 由 step 15 写入）
+            # 2026-05-27 新增：纳入完整度评分 → schema.json:breadth.stock_daily_rows
+            sd_row = conn.execute(
+                "SELECT COUNT(*) AS c FROM fact_stock_daily WHERE trade_date = ?",
+                (td,),
+            ).fetchone()
+            stock_daily_rows = int(sd_row["c"]) if sd_row else 0
             kpl_dicts = [dict(r) for r in kpl_rows]
             null_cons_codes = [
                 r["ts_code"] for r in kpl_rows if r["cons_nums"] is None
@@ -645,11 +674,17 @@ class MarketSummaryService:
             "decline_5": int(mb_row["decline_5"]) if mb_row and mb_row["decline_5"] is not None else None,
             "advance_pct": float(mb_row["advance_pct"]) if mb_row and mb_row["advance_pct"] is not None else None,
             "total": int(mb_row["total"]) if mb_row and mb_row["total"] is not None else None,
+            "stock_daily_rows": stock_daily_rows or None,
         }
         if mb_row is None:
             gaps.append({
                 "field": "breadth.advance",
                 "reason": "fact_market_breadth 该日无数据（daily 接口未拉到 / 接口失败）",
+            })
+        if stock_daily_rows <= 0:
+            gaps.append({
+                "field": "breadth.stock_daily_rows",
+                "reason": "fact_stock_daily 该日无数据（step 15 未跑 / 失败）",
             })
         if not u_cnt:
             gaps.append({
