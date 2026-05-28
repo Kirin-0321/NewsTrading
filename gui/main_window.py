@@ -272,4 +272,14 @@ class MainWindow(QMainWindow):
                 self.theme_extract_manager.shutdown()
             except Exception as e:
                 print(f"[MainWindow] theme_extract_manager.shutdown 失败: {e}")
+        # 取消 AI 分析 / 手动回测页内的任务队列（page.closeEvent 不会被 Qt
+        # 自动递归触发到 StackedWidget 子页面，必须显式兜底调一次）
+        for pid in ('ai_analysis', 'manual_backtest'):
+            page = self.pages.get(pid) if hasattr(self, 'pages') else None
+            mgr = getattr(page, 'manager', None) if page else None
+            if mgr is not None and hasattr(mgr, 'shutdown'):
+                try:
+                    mgr.shutdown()
+                except Exception as e:
+                    print(f"[MainWindow] {pid}.manager.shutdown 失败: {e}")
         event.accept()
