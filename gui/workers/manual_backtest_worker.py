@@ -71,7 +71,16 @@ class ManualBacktestWorker(QThread):
         provider: Optional[str] = None,
         overwrite: bool = False,
         dry_run: bool = False,
+        task_id: Optional[int] = None,
     ):
+        """单次手动回测线程构造。
+
+        Args:
+            task_id: 队列管理器分配的任务 id（2026-05-27 多任务队列改造）。
+                manager 模式下由 BacktestTaskManager.enqueue 分配；单线程旧
+                调用方式不传则为 None，等价旧行为。本字段不参与业务，仅供
+                manager 在信号槽里反查 BacktestTask 对象用。
+        """
         super().__init__()
         self.template_id = template_id
         self.trade_date = trade_date
@@ -81,6 +90,7 @@ class ManualBacktestWorker(QThread):
         self.provider = provider
         self.overwrite = overwrite
         self.dry_run = dry_run
+        self.task_id = task_id
 
     def run(self):
         try:

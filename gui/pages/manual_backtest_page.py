@@ -1,16 +1,20 @@
-"""手动回测页面（Phase 6 配套 GUI + 2026-05-27 时间窗语义重构）。
+"""手动回测页面（Phase 6 配套 GUI + 2026-05-27 多任务队列并行改造）。
 
 业务定位
 --------
 让主人在 GUI 上手选「模板 / 交易日 / 新闻时间窗 / 新闻状态」一键跑单次
-虚拟回测，实时看到：
+虚拟回测，**支持连点 N 次排队、后台 8 并发、点哪个任务看哪个**：
 
 1. 时间边界预览（snapshot_inspect 同款，包含 D+1~D+5）
 2. dry-run 试算（不调 LLM，看 snapshot 通不通）
 3. 正式跑（异步调 ``tools.backtest_prompt.backtest_one``）
-4. 结果：md 内容预览 + 题材列表
+4. 任务列表实时看每个任务状态/用时；点行 → 下方三块联动切换
+5. 结果：md 内容预览 + 题材列表 + 完整流式日志
 
-对应规约：``doc/design/05-27-1515-回测时间边界说明书.md``
+对应规约：
+* ``doc/design/05-27-1515-回测时间边界说明书.md``（时间窗语义）
+* ``doc/design/05-27-2101-手动回测任务队列并行设计.md``（队列并行设计）
+* ``doc/design/05-27-2110-手动回测任务队列并行施工方案.md``（本次施工方案）
 
 时间窗主人语义
 --------------
@@ -18,21 +22,28 @@
 * 右边界（**只可向左调，硬上限**）默认 = next_trade_date 09:00
 * 「精选新闻」默认勾选（``curated``）；取消勾选 = ``raw_news`` 全部
 
-调用链
-------
+调用链（2026-05-27 改造后）
+------------------------
 ::
 
     ManualBacktestPage
-       ├── _build_time_preview()  →  inspect_snapshot(...)（同步）
-       ├── _on_dry_run_clicked()  →  ManualBacktestWorker(dry_run=True)
-       └── _on_run_clicked()      →  ManualBacktestWorker(dry_run=False)
-                                       └── backtest_one(...)（异步）
+       ├── _refresh_preview()     →  inspect_snapshot(...)（同步）
+       └── _on_run_clicked()
+              └── self.manager.enqueue(task_kwargs) → task_id
+                     ├── 队列空位 → 立即起 ManualBacktestWorker
+                     └── 队列满（8 并发）→ PENDING 排队等
+
+    BacktestTaskManager
+       ├── task_added/started/progress/streaming/finished/removed signal
+       └── 槽函数把 chunk/log 写到 task.stream_buffer/log_buffer
+              → 当前选中行的任务实时刷下方三块；其它任务安静累积
 
 注意事项
 --------
-* 单次只允许一个 worker 在跑（按钮 disable / enable 二态）
 * trade_date 限制 ≤ 今天（QDateEdit.setMaximumDate(today)）
 * 右边界 QDateTimeEdit.setMaximumDateTime(next_open 09:00) 兜底
+* 删除已完成任务**只删 GUI 行**，不动 md/db（那是「评估页·删除」的职责）
+* 关 GUI 时 manager.shutdown() 取消 PENDING，RUNNING 自然结束
 """
 
 from __future__ import annotations
@@ -42,11 +53,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from PyQt5.QtCore import QDate, QDateTime, Qt
-from PyQt5.QtGui import QTextCursor
+from PyQt5.QtCore import QDate, QDateTime, Qt, QTimer
+from PyQt5.QtGui import QColor, QTextCursor
 from PyQt5.QtWidgets import (
-    QCheckBox, QComboBox, QDateEdit, QDateTimeEdit, QGroupBox,
-    QHBoxLayout, QHeaderView, QLabel, QMessageBox, QPushButton,
+    QAbstractItemView, QCheckBox, QComboBox, QDateEdit, QDateTimeEdit,
+    QGroupBox, QHBoxLayout, QHeaderView, QLabel, QMessageBox, QPushButton,
     QSplitter, QTableWidget, QTableWidgetItem, QTextBrowser,
     QVBoxLayout, QWidget,
 )
@@ -55,7 +66,10 @@ from gui.utils.styles import (
     BUTTON_DANGER, BUTTON_PRIMARY, BUTTON_SUCCESS,
     COMBOBOX_STYLE, INPUT_STYLE, TABLE_STYLE, TEXTBROWSER_STYLE,
 )
-from gui.workers.manual_backtest_worker import ManualBacktestWorker
+from gui.workers.manual_backtest_manager import (
+    BacktestTask, BacktestTaskManager, STATUS_COLOR, STATUS_LABEL,
+    TaskStatus,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -68,12 +82,16 @@ class ManualBacktestPage(QWidget):
 
     def __init__(self):
         super().__init__()
-        self.worker: Optional[ManualBacktestWorker] = None
         self._suppress_window_signal = False
+        self._current_task_id: Optional[int] = None
+        self._theme_section_marked_for_task: dict[int, bool] = {}
+        self.manager = BacktestTaskManager(self)
         self.init_ui()
         self.load_template_list()
         self._apply_default_window()
         self._refresh_preview()
+        self._wire_manager_signals()
+        self._start_elapsed_timer()
 
     # =====================================================================
     # UI 构建
@@ -100,7 +118,15 @@ class ManualBacktestPage(QWidget):
         layout.addWidget(subtitle)
 
         layout.addWidget(self._build_config_group())
-        layout.addWidget(self._build_preview_group(), 1)
+
+        # 中段：横向 splitter「时间边界预览（左）｜任务列表（右）」
+        # 复用「时间预览」右边的空白区，主人点哪个任务下面三块联动切换
+        middle_split = QSplitter(Qt.Horizontal)
+        middle_split.addWidget(self._build_preview_group())
+        middle_split.addWidget(self._build_task_list_group())
+        middle_split.setStretchFactor(0, 1)
+        middle_split.setStretchFactor(1, 1)
+        layout.addWidget(middle_split, 1)
 
         splitter = QSplitter(Qt.Horizontal)
         splitter.addWidget(self._build_md_group())
@@ -211,18 +237,22 @@ class ManualBacktestPage(QWidget):
 
         self.run_btn = QPushButton("🚀 正式跑回测（消耗 LLM）")
         self.run_btn.setStyleSheet(BUTTON_PRIMARY)
+        self.run_btn.setToolTip(
+            "支持连点：每次点击都进队列，后台同时跑 8 个，"
+            "其余排队等位"
+        )
         self.run_btn.clicked.connect(
             lambda: self._on_run_clicked(dry_run=False)
         )
         row3.addWidget(self.run_btn, 1)
 
-        self.cancel_btn = QPushButton("⏹ 取消")
-        self.cancel_btn.setStyleSheet(BUTTON_DANGER)
-        self.cancel_btn.setEnabled(False)
-        self.cancel_btn.setToolTip(
-            "一期 LLM 调用难以中断；先用 dry-run 验证时间边界"
+        self.queue_hint_label = QLabel(
+            "📋 多任务模式：连点排队 + 后台 8 并发"
         )
-        row3.addWidget(self.cancel_btn)
+        self.queue_hint_label.setStyleSheet(
+            "color: #888; font-size: 12px; padding: 0 8px;"
+        )
+        row3.addWidget(self.queue_hint_label)
         outer.addLayout(row3)
 
         return group
@@ -235,6 +265,48 @@ class ManualBacktestPage(QWidget):
         self.preview_browser.setMaximumHeight(220)
         self.preview_browser.setOpenLinks(False)
         layout.addWidget(self.preview_browser)
+        return group
+
+    def _build_task_list_group(self) -> QGroupBox:
+        """任务列表（2026-05-27 多任务队列改造新增）。
+
+        6 列：# / 模板 / 日期 / 状态 / 用时 / 删除
+        - 点击行 → 下方三块（流式 / md / 题材）联动切换
+        - 删除列嵌按钮：仅终态任务可删；运行中按钮 disable
+        """
+        group = QGroupBox(
+            "📋 任务列表（连点排队，后台 8 并发，点行联动下方）"
+        )
+        layout = QVBoxLayout(group)
+
+        self.task_table = QTableWidget(0, 6)
+        self.task_table.setHorizontalHeaderLabels(
+            ["#", "模板", "日期", "状态", "用时", "删除"]
+        )
+        self.task_table.setStyleSheet(TABLE_STYLE)
+        self.task_table.verticalHeader().setVisible(False)
+        self.task_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.task_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.task_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.task_table.setMinimumHeight(180)
+
+        header = self.task_table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.Fixed)
+        header.setSectionResizeMode(1, QHeaderView.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.Fixed)
+        header.setSectionResizeMode(3, QHeaderView.Fixed)
+        header.setSectionResizeMode(4, QHeaderView.Fixed)
+        header.setSectionResizeMode(5, QHeaderView.Fixed)
+        self.task_table.setColumnWidth(0, 40)
+        self.task_table.setColumnWidth(2, 100)
+        self.task_table.setColumnWidth(3, 90)
+        self.task_table.setColumnWidth(4, 70)
+        self.task_table.setColumnWidth(5, 60)
+
+        self.task_table.itemSelectionChanged.connect(
+            self._on_task_selection_changed
+        )
+        layout.addWidget(self.task_table)
         return group
 
     def _build_md_group(self) -> QGroupBox:
@@ -502,17 +574,16 @@ class ManualBacktestPage(QWidget):
     # =====================================================================
 
     def _on_run_clicked(self, *, dry_run: bool):
-        if self.worker and self.worker.isRunning():
-            QMessageBox.information(
-                self, "正在跑", "已有一个回测在跑，请等它完成"
-            )
-            return
+        """连点 N 次跑按钮：每次点击都把任务进队列，后台 8 并发跑。
+
+        2026-05-27 多任务队列改造：取消「已有一个在跑就拒绝」的串行锁，
+        改为无条件 enqueue；并发上限由 BacktestTaskManager 管理。
+        """
         inputs = self._current_inputs()
         if not inputs["template_id"]:
             QMessageBox.warning(self, "缺参数", "请先选择模板")
             return
 
-        # 防穿越提示（GUI 也提前拦一道，体验更好）
         if inputs["news_end_dt"] > datetime.now():
             QMessageBox.warning(
                 self, "穿越保护",
@@ -528,121 +599,233 @@ class ManualBacktestPage(QWidget):
             )
             return
 
-        action_text = "dry-run 试算" if dry_run else "正式跑回测"
-        self.status_label.setText(
-            f"<span style='color:#06c'>⏳ {action_text}中...</span>"
+        # 取下拉框当前显示文本作为友好标签（去掉" [key]"后缀）
+        raw_label = self.template_combo.currentText()
+        tmpl_label = raw_label.split("  [")[0] if raw_label else (
+            inputs["template_id"]
         )
-        self.md_browser.clear()
+        if dry_run:
+            tmpl_label = f"[dry-run] {tmpl_label}"
+
+        # 入队（manager 内部决定立即跑还是 PENDING）
+        self.manager.enqueue({
+            "template_id": inputs["template_id"],
+            "template_label": tmpl_label,
+            "trade_date": inputs["trade_date"],
+            "news_start_dt": inputs["news_start_dt"],
+            "news_end_dt": inputs["news_end_dt"],
+            "news_status": inputs["news_status"],
+            "provider": inputs["provider"],
+            "overwrite": False,
+            "dry_run": dry_run,
+        })
+
+    # =====================================================================
+    # 任务列表 ↔ 下方三块联动（2026-05-27 多任务队列改造）
+    # =====================================================================
+
+    def _wire_manager_signals(self) -> None:
+        """连接 BacktestTaskManager 的 6 个信号到本页槽函数。"""
+        self.manager.task_added.connect(self._on_task_added)
+        self.manager.task_started.connect(self._on_task_started)
+        self.manager.task_progress.connect(self._on_task_progress)
+        self.manager.task_streaming.connect(self._on_task_streaming)
+        self.manager.task_finished.connect(self._on_task_finished)
+        self.manager.task_removed.connect(self._on_task_removed)
+
+    def _start_elapsed_timer(self) -> None:
+        """QTimer 1s 刷新所有 RUNNING 任务的「用时」列。"""
+        self._tick_timer = QTimer(self)
+        self._tick_timer.setInterval(1000)
+        self._tick_timer.timeout.connect(self._refresh_running_elapsed)
+        self._tick_timer.start()
+
+    # --- 任务行操作 helpers -------------------------------------------------
+
+    def _row_of_task(self, task_id: int) -> int:
+        """通过 task_id 找表行号（首列存 task_id）。-1 表示找不到。"""
+        for r in range(self.task_table.rowCount()):
+            item = self.task_table.item(r, 0)
+            if item is not None and int(item.data(Qt.UserRole)) == task_id:
+                return r
+        return -1
+
+    def _set_status_cell(self, row: int, task: BacktestTask) -> None:
+        """渲染状态列：emoji + 中文 + 颜色。"""
+        item = QTableWidgetItem(STATUS_LABEL[task.status])
+        item.setForeground(QColor(STATUS_COLOR[task.status]))
+        item.setTextAlignment(Qt.AlignCenter)
+        self.task_table.setItem(row, 3, item)
+
+    def _set_elapsed_cell(self, row: int, task: BacktestTask) -> None:
+        item = QTableWidgetItem(task.elapsed_text())
+        item.setTextAlignment(Qt.AlignCenter)
+        self.task_table.setItem(row, 4, item)
+
+    def _set_delete_button(self, row: int, task: BacktestTask) -> None:
+        """嵌入第 6 列的删除按钮；运行中灰化。"""
+        btn = QPushButton("🗑")
+        btn.setToolTip(
+            "删除该任务（仅 GUI 行；不动 md 文件 / 数据库）"
+        )
+        btn.setEnabled(task.status != TaskStatus.RUNNING)
+        btn.clicked.connect(
+            lambda _checked=False, tid=task.task_id:
+            self._on_delete_task_clicked(tid)
+        )
+        self.task_table.setCellWidget(row, 5, btn)
+
+    # --- manager 信号槽 -----------------------------------------------------
+
+    def _on_task_added(self, task_id: int) -> None:
+        """新任务入队 → 追加一行 + 自动选中（追加决策 q3：默认选最新）。"""
+        task = self.manager.get(task_id)
+        if task is None:
+            return
+        row = self.task_table.rowCount()
+        self.task_table.insertRow(row)
+
+        id_item = QTableWidgetItem(str(task.task_id))
+        id_item.setData(Qt.UserRole, task.task_id)
+        id_item.setTextAlignment(Qt.AlignCenter)
+        self.task_table.setItem(row, 0, id_item)
+        self.task_table.setItem(
+            row, 1, QTableWidgetItem(task.template_label)
+        )
+        date_str = (
+            f"{task.trade_date[:4]}-{task.trade_date[4:6]}-"
+            f"{task.trade_date[6:8]}"
+        )
+        date_item = QTableWidgetItem(date_str)
+        date_item.setTextAlignment(Qt.AlignCenter)
+        self.task_table.setItem(row, 2, date_item)
+        self._set_status_cell(row, task)
+        self._set_elapsed_cell(row, task)
+        self._set_delete_button(row, task)
+
+        # 自动选中新行（行选中触发 _on_task_selection_changed 刷下方）
+        self.task_table.selectRow(row)
+        self.task_table.scrollToBottom()
+
+    def _on_task_started(self, task_id: int) -> None:
+        task = self.manager.get(task_id)
+        if task is None:
+            return
+        row = self._row_of_task(task_id)
+        if row < 0:
+            return
+        self._set_status_cell(row, task)
+        self._set_elapsed_cell(row, task)
+        self._set_delete_button(row, task)
+        if task_id == self._current_task_id:
+            self._refresh_for_selected_task()
+
+    def _on_task_progress(self, task_id: int, line: str) -> None:
+        """阶段日志：仅当前选中任务才 append 到 stream_browser。"""
+        if task_id == self._current_task_id:
+            self.stream_browser.insertPlainText(line)
+            self.stream_browser.moveCursor(QTextCursor.End)
+
+    def _on_task_streaming(self, task_id: int, chunk: str) -> None:
+        """LLM chunk：仅当前选中任务才 append。"""
+        if task_id == self._current_task_id:
+            self.stream_browser.insertPlainText(chunk)
+            self.stream_browser.moveCursor(QTextCursor.End)
+
+    def _on_task_finished(self, task_id: int) -> None:
+        task = self.manager.get(task_id)
+        if task is None:
+            return
+        row = self._row_of_task(task_id)
+        if row < 0:
+            return
+        self._set_status_cell(row, task)
+        self._set_elapsed_cell(row, task)
+        self._set_delete_button(row, task)
+        if task_id == self._current_task_id:
+            self._refresh_for_selected_task()
+
+    def _on_task_removed(self, task_id: int) -> None:
+        row = self._row_of_task(task_id)
+        if row >= 0:
+            self.task_table.removeRow(row)
+        if task_id == self._current_task_id:
+            self._current_task_id = None
+            self._clear_lower_panels()
+
+    # --- 行选中 & 下方三块联动渲染 ------------------------------------------
+
+    def _on_task_selection_changed(self) -> None:
+        rows = self.task_table.selectionModel().selectedRows()
+        if not rows:
+            self._current_task_id = None
+            self._clear_lower_panels()
+            return
+        row = rows[0].row()
+        id_item = self.task_table.item(row, 0)
+        if id_item is None:
+            return
+        self._current_task_id = int(id_item.data(Qt.UserRole))
+        self._refresh_for_selected_task()
+
+    def _refresh_for_selected_task(self) -> None:
+        """整段回灌当前选中任务的 stream / md / themes 到下方三块。"""
+        tid = self._current_task_id
+        if tid is None:
+            self._clear_lower_panels()
+            return
+        task = self.manager.get(tid)
+        if task is None:
+            self._clear_lower_panels()
+            return
+
+        # 流式区：清空 → 回灌 log_buffer + stream_buffer
         self.stream_browser.clear()
-        self._theme_section_marked = False
-        self.themes_table.setRowCount(0)
-        self.open_md_btn.setEnabled(False)
-        self._set_buttons_running(True)
-
-        # overwrite 永远 False（GUI 策略已切到「默认追加多份共存」，
-        # 详见 doc/bugfix/05-27-1830-报告日期与回测命名重构.md §八 hotfix2）
-        self.worker = ManualBacktestWorker(
-            template_id=inputs["template_id"],
-            trade_date=inputs["trade_date"],
-            news_start_dt=inputs["news_start_dt"],
-            news_end_dt=inputs["news_end_dt"],
-            news_status=inputs["news_status"],
-            provider=inputs["provider"],
-            overwrite=False,
-            dry_run=dry_run,
-        )
-        self.worker.stage.connect(self._on_stage)
-        self.worker.progress.connect(self._append_progress)
-        self.worker.streaming.connect(self._append_stream)
-        self.worker.finished_result.connect(self._on_finished)
-        self.worker.error.connect(self._on_error)
-        self.worker.start()
-
-    def _set_buttons_running(self, running: bool):
-        self.refresh_btn.setEnabled(not running)
-        self.dry_run_btn.setEnabled(not running)
-        self.run_btn.setEnabled(not running)
-        self.cancel_btn.setEnabled(False)  # 一期始终 disable
-
-    def _on_stage(self, msg: str):
-        self.status_label.setText(
-            f"<span style='color:#06c'>⏳ {msg}</span>"
-        )
-
-    # =====================================================================
-    # 流式输出（AI 分析页 / 题材抽取页同款双信号桥接）
-    # =====================================================================
-
-    # 标记是否已经把"题材抽取"分隔栏插过，防止重复插
-    _theme_section_marked: bool = False
-
-    def _append_progress(self, msg: str):
-        """阶段日志写入流式区上方（带 [HH:MM:SS] 时间戳）。
-
-        启发式：第一次出现 "题材" 关键字时插一行视觉分隔，提示主人
-        现在进入了第二阶段（LLM 分析 → JSON 抽取）的过渡。
-        """
-        ts = datetime.now().strftime("%H:%M:%S")
-        line = f"\n[{ts}] {msg}\n"
-        if (
-            not self._theme_section_marked
-            and "题材" in msg
-            and ("抽取" in msg or "入库" in msg)
-        ):
-            line = (
-                "\n\n────────── 题材抽取阶段 ──────────\n" + line
-            )
-            self._theme_section_marked = True
-        self.stream_browser.insertPlainText(line)
+        for line in task.log_buffer:
+            self.stream_browser.insertPlainText(line)
+        for chunk in task.stream_buffer:
+            self.stream_browser.insertPlainText(chunk)
         self.stream_browser.moveCursor(QTextCursor.End)
 
-    def _append_stream(self, chunk: str):
-        """LLM / 题材抽取流式 chunk 粘连写入，自动滚到末尾。"""
-        self.stream_browser.insertPlainText(chunk)
-        self.stream_browser.moveCursor(QTextCursor.End)
+        # 状态栏
+        self._update_status_label_for(task)
 
-    def _on_error(self, msg: str):
-        self._set_buttons_running(False)
-        self.status_label.setText(
-            f"<span style='color:#c00'>❌ {msg.splitlines()[0]}</span>"
-        )
-        QMessageBox.critical(self, "回测异常", msg)
-
-    def _on_finished(self, result: dict):
-        self._set_buttons_running(False)
-        ok = result.get("ok")
-        skipped = result.get("skipped")
-        if not ok:
-            self.status_label.setText(
-                f"<span style='color:#c00'>❌ 失败: "
-                f"{result.get('error') or '未知错误'}</span>"
-            )
-            return
-        if skipped:
-            # GUI 策略下 skipped 只在 snapshot 无新闻 / dry_run 时触发；
-            # 「已存在」不再是 skip 原因（默认追加多份共存）
-            self.status_label.setText(
-                f"<span style='color:#c80'>⚠ 跳过: "
-                f"{result.get('error') or '无新闻或 dry-run'}</span>"
-            )
-            return
-
+        # md / themes 区
+        result = task.result or {}
         report_path = result.get("report_path")
-        themes_count = result.get("themes_count") or 0
-        news_count = result.get("snapshot_news_count")
-        elapsed_ms = result.get("elapsed_ms")
 
-        self.status_label.setText(
-            f"<span style='color:#0a0'>✅ 成功</span>"
-            f"&nbsp;&nbsp;news={news_count} themes={themes_count} "
-            f"&nbsp;{elapsed_ms} ms"
-            + (
-                f"&nbsp;&nbsp;<span style='color:#888'>"
-                f"file={Path(report_path).name}</span>"
-                if report_path else ""
+        if task.status == TaskStatus.PENDING:
+            self.md_browser.setHtml(
+                "<i style='color:#888'>⌛ 排队中，等待空位...</i>"
             )
-        )
-
+            self.themes_table.setRowCount(0)
+            self.open_md_btn.setEnabled(False)
+            return
+        if task.status == TaskStatus.RUNNING:
+            self.md_browser.setHtml(
+                "<i style='color:#888'>⏳ 跑中，完成后显示报告 md</i>"
+            )
+            self.themes_table.setRowCount(0)
+            self.open_md_btn.setEnabled(False)
+            return
+        if task.status == TaskStatus.FAILED:
+            err_html = (
+                f"<pre style='color:#c00'>❌ 失败\n\n"
+                f"{(task.error or '未知错误')}</pre>"
+            )
+            self.md_browser.setHtml(err_html)
+            self.themes_table.setRowCount(0)
+            self.open_md_btn.setEnabled(False)
+            return
+        if task.status == TaskStatus.SKIPPED:
+            self.md_browser.setHtml(
+                f"<i style='color:#c80'>⏹ 跳过："
+                f"{result.get('error') or '无新闻或 dry-run'}</i>"
+            )
+            self.themes_table.setRowCount(0)
+            self.open_md_btn.setEnabled(False)
+            return
+        # SUCCESS
         if report_path:
             self._render_md(report_path)
             self._render_themes(report_path)
@@ -652,6 +835,85 @@ class ManualBacktestPage(QWidget):
             self.md_browser.setHtml(
                 "<i style='color:#888'>dry-run 模式：无 md 产出</i>"
             )
+            self.themes_table.setRowCount(0)
+            self.open_md_btn.setEnabled(False)
+
+    def _update_status_label_for(self, task: BacktestTask) -> None:
+        """根据 task 状态刷 status_label（位于 md_group 顶部 toolbar）。"""
+        color = STATUS_COLOR[task.status]
+        label = STATUS_LABEL[task.status]
+        meta = (
+            f"#{task.task_id} {task.template_label} @ "
+            f"{task.trade_date}"
+        )
+        suffix = ""
+        if task.status in (
+            TaskStatus.SUCCESS, TaskStatus.SKIPPED, TaskStatus.FAILED,
+        ):
+            elapsed = (
+                f"{task.elapsed_ms} ms"
+                if task.elapsed_ms is not None else "-"
+            )
+            res = task.result or {}
+            news_count = res.get("snapshot_news_count")
+            themes_count = res.get("themes_count")
+            if task.status == TaskStatus.SUCCESS:
+                suffix = (
+                    f"&nbsp;&nbsp;news={news_count} "
+                    f"themes={themes_count} &nbsp;{elapsed}"
+                )
+            else:
+                suffix = f"&nbsp;&nbsp;{elapsed}"
+        self.status_label.setText(
+            f"<span style='color:{color}'>{label}</span>"
+            f"&nbsp;&nbsp;<span style='color:#888'>{meta}</span>"
+            f"{suffix}"
+        )
+
+    def _clear_lower_panels(self) -> None:
+        """没选中任务时下方三块的默认态。"""
+        self.status_label.setText(
+            "（点「正式跑回测」后这里出结果）"
+        )
+        self.stream_browser.clear()
+        self.md_browser.clear()
+        self.themes_table.setRowCount(0)
+        self.open_md_btn.setEnabled(False)
+
+    # --- 删除任务 -----------------------------------------------------------
+
+    def _on_delete_task_clicked(self, task_id: int) -> None:
+        task = self.manager.get(task_id)
+        if task is None:
+            return
+        if task.status == TaskStatus.RUNNING:
+            QMessageBox.information(
+                self, "跑中不能删",
+                f"任务 #{task_id} 正在跑，等它完成或失败后再删"
+            )
+            return
+        # 不弹二次确认：删除本身仅删 GUI 行，无破坏性
+        self.manager.remove(task_id)
+
+    # --- QTimer 1s 刷新 RUNNING 用时 ---------------------------------------
+
+    def _refresh_running_elapsed(self) -> None:
+        for task in self.manager.list_tasks():
+            if task.status != TaskStatus.RUNNING:
+                continue
+            row = self._row_of_task(task.task_id)
+            if row < 0:
+                continue
+            self._set_elapsed_cell(row, task)
+
+    # --- 关 GUI 时清理 ------------------------------------------------------
+
+    def closeEvent(self, event):  # noqa: N802 (Qt 约定大写驼峰)
+        """关页面（或 main 退出）时取消 PENDING；RUNNING 自然结束。"""
+        try:
+            self.manager.shutdown()
+        finally:
+            super().closeEvent(event)
 
     # =====================================================================
     # 渲染辅助
@@ -706,9 +968,9 @@ class ManualBacktestPage(QWidget):
             score_item = QTableWidgetItem(score_str)
             if score is not None:
                 if score > 0:
-                    score_item.setForeground(Qt.darkGreen)
-                elif score < 0:
                     score_item.setForeground(Qt.darkRed)
+                elif score < 0:
+                    score_item.setForeground(Qt.darkGreen)
             self.themes_table.setItem(r, 2, score_item)
             self.themes_table.setItem(
                 r, 3, QTableWidgetItem(row["strength_level"] or "")

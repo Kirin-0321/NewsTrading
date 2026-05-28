@@ -651,9 +651,9 @@ class PromptEvalPage(QWidget):
         except ValueError:
             return
         if val > 0:
-            item.setForeground(QColor("#2e7d32"))  # 绿
+            item.setForeground(QColor("#c62828"))  # 红涨
         elif val < 0:
-            item.setForeground(QColor("#c62828"))  # 红
+            item.setForeground(QColor("#2e7d32"))  # 绿跌
 
     # ------------------------------------------------------------------
     # 交互 handlers

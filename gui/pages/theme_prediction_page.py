@@ -30,6 +30,7 @@ from gui.utils.styles import (
     BUTTON_PRIMARY, BUTTON_SUCCESS, COMBOBOX_STYLE, INPUT_STYLE,
     TEXTBROWSER_STYLE, TABLE_STYLE,
 )
+from gui.widgets.sparkline import SparklineWidget
 from gui.workers.theme_extract_worker import ThemeExtractWorker
 
 
@@ -87,6 +88,18 @@ _NEWS_TABLE_COLS = [
 ]
 
 _NEWS_TITLE_COL = 4
+
+# 板块走势 Tab 的表格列
+_SECTOR_TREND_COLS = [
+    ("交易日", 100),
+    ("偏移", 60),
+    ("涨跌幅 %", 90),
+    ("主力净流入 (亿)", 130),
+    ("当日排名", 80),
+]
+
+# 评估窗口（D+1 ~ D+EVAL_DAYS）长度，与打分模块对齐
+_TREND_EVAL_DAYS = 5
 
 
 class ThemePredictionPage(QWidget):
@@ -345,14 +358,56 @@ class ThemePredictionPage(QWidget):
             '</div>'
         )
 
+        # 板块走势 Tab：迷你折线图 + 每日明细表
+        self.sector_trend_tab = self._build_sector_trend_tab()
+
         self.detail_tab.addTab(self.reason_browser, "📝 逻辑/原因")
         self.detail_tab.addTab(self.stock_table, "💼 关联标的")
         self.detail_tab.addTab(self.news_splitter, "📰 关联新闻")
         self.detail_tab.addTab(self.score_detail_browser, "📊 打分明细")
+        self.detail_tab.addTab(self.sector_trend_tab, "📈 板块走势")
         layout.addWidget(self.detail_tab, 2)
 
         group.setLayout(layout)
         return group
+
+    def _build_sector_trend_tab(self) -> QWidget:
+        """构造「📈 板块走势」Tab：顶部迷你折线图 + 底部每日明细表。"""
+        from PyQt5.QtWidgets import QSizePolicy
+        container = QWidget()
+        v = QVBoxLayout(container)
+        v.setContentsMargins(8, 8, 8, 8)
+        v.setSpacing(6)
+
+        # 顶栏：板块标识 + 全量统计
+        self.trend_header = QLabel("（请在上表选中一个题材以查看其板块走势）")
+        self.trend_header.setStyleSheet("color: #595959; font-weight: 600;")
+        self.trend_header.setWordWrap(True)
+        v.addWidget(self.trend_header)
+
+        # 迷你折线图（高度固定，宽度跟随）
+        self.trend_sparkline = SparklineWidget()
+        self.trend_sparkline.setFixedHeight(120)
+        self.trend_sparkline.setSizePolicy(
+            QSizePolicy.Expanding, QSizePolicy.Fixed
+        )
+        v.addWidget(self.trend_sparkline)
+
+        # 每日明细表
+        self.trend_table = QTableWidget(0, len(_SECTOR_TREND_COLS))
+        self.trend_table.setHorizontalHeaderLabels(
+            [c[0] for c in _SECTOR_TREND_COLS]
+        )
+        self.trend_table.setStyleSheet(TABLE_STYLE)
+        self.trend_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.trend_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.trend_table.verticalHeader().setVisible(False)
+        self.trend_table.horizontalHeader().setStretchLastSection(True)
+        for i, (_, w) in enumerate(_SECTOR_TREND_COLS):
+            self.trend_table.setColumnWidth(i, w)
+        v.addWidget(self.trend_table, 1)
+
+        return container
 
     # ---------- 数据加载 ----------
 
@@ -660,6 +715,14 @@ class ThemePredictionPage(QWidget):
                     item.setData(Qt.UserRole, detail_payload)
                 self.news_table.setItem(r, c, item)
 
+        # 板块走势 Tab：用题材的 sector_ts_code + report_date 刷新
+        self._reload_sector_trend(
+            sector_ts_code=theme.get("sector_ts_code") or "",
+            sector_name=theme.get("sector_name") or "",
+            anchor_report_date=theme.get("report_date") or "",
+            theme_name=theme.get("theme_name") or "",
+        )
+
     def _on_news_cell_clicked(self, row: int, col: int):
         """点击标题列 → 右侧展示时间与原文。"""
         if col != _NEWS_TITLE_COL:
@@ -743,6 +806,240 @@ class ThemePredictionPage(QWidget):
         self.stock_table.setRowCount(0)
         self.news_table.setRowCount(0)
         self.news_content_browser.clear()
+        # 板块走势 Tab 一并清空
+        self.trend_header.setText("（请在上表选中一个题材以查看其板块走势）")
+        self.trend_sparkline.clear()
+        self.trend_table.setRowCount(0)
+
+    # ---------- 板块走势 Tab ----------
+
+    def _reload_sector_trend(
+        self,
+        *,
+        sector_ts_code: str,
+        sector_name: str,
+        anchor_report_date: str,
+        theme_name: str,
+    ) -> None:
+        """根据选中题材的板块代码刷新折线图 + 明细表。
+
+        无 ``sector_ts_code`` 时清空并提示「题材未匹配到板块」。
+
+        Args:
+            sector_ts_code: 题材关联板块 ts_code（如 ``BK0477.DC``）
+            sector_name:    板块名（``theme_predictions`` 没冗余存板块名，传 ``""``
+                            即可，查询时会从 ``dim_sector`` 反查）
+            anchor_report_date: 报告日 YYYYMMDD（折线图竖线锚点）
+            theme_name:     题材名（仅用于顶栏展示）
+        """
+        if not sector_ts_code:
+            self.trend_header.setText(
+                f"题材「{theme_name or '—'}」未匹配到板块代码，"
+                f"无走势可展示"
+            )
+            self.trend_sparkline.clear()
+            self.trend_table.setRowCount(0)
+            return
+
+        try:
+            from services.market.sector_daily_query import (
+                get_sector_daily_history,
+            )
+            history = get_sector_daily_history(
+                sector_ts_code, order="asc"
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.trend_header.setText(
+                f"<span style='color:#c00'>板块行情查询失败：{exc}</span>"
+            )
+            self.trend_sparkline.clear()
+            self.trend_table.setRowCount(0)
+            return
+
+        display_name = history.name or sector_name or "—"
+        if history.count == 0:
+            # 两种情况分别提示
+            if not history.in_dim:
+                # 字典都没——多半 sector_ts_code 写错了 / dim_sector 未同步
+                self.trend_header.setText(
+                    f"<span style='color:#c00'>板块代码 "
+                    f"<b>{sector_ts_code}</b> 不存在于板块字典 "
+                    f"dim_sector</span><br>"
+                    f"<span style='color:#8c8c8c;'>"
+                    f"多半是题材 matcher 写入了错误的 ts_code，"
+                    f"或 dim_sector 未同步最新板块（跑 tushare_fetcher "
+                    f"_fetch_sector_dict）"
+                    f"</span>"
+                )
+            else:
+                # 字典有名字，但 fact 表无行——典型的数据源未覆盖
+                self.trend_header.setText(
+                    f"<b>{display_name}</b>　({sector_ts_code})　"
+                    f"<span style='color:#c80'>"
+                    f"类型: {history.idx_type or '—'}"
+                    f"</span><br>"
+                    f"<span style='color:#8c8c8c;'>"
+                    f"⚠️ 该板块在 dim_sector 字典里有名字，但 "
+                    f"fact_sector_daily 没数据。<br>"
+                    f"根因：Tushare <code>moneyflow_ind_dc</code> "
+                    f"接口只返回<b>概念板块</b>的资金流，"
+                    f"<b>行业板块</b>（如稀土 / 钴 / 镍 / 被动元件 等）"
+                    f"不返。<br>"
+                    f"修复路径：主线后续补抓 "
+                    f"<code>moneyflow_ind_ths</code>（同花顺行业）或 "
+                    f"<code>moneyflow_ind_sw</code>（申万行业）"
+                    f"接入 fact_sector_daily，本 Tab 自动有数据。"
+                    f"</span>"
+                )
+            self.trend_sparkline.clear()
+            self.trend_table.setRowCount(0)
+            return
+
+        # ---- 顶栏统计 ----
+        latest = history.rows[-1]
+        earliest = history.rows[0]
+        idx_type_tag = (
+            f"<span style='color:#1890ff;'>[{history.idx_type}]</span>　"
+            if history.idx_type else ""
+        )
+        self.trend_header.setText(
+            f"<b>{display_name}</b>　({sector_ts_code})　"
+            f"{idx_type_tag}"
+            f"<span style='color:#8c8c8c;'>"
+            f"题材「{theme_name or '—'}」　|　"
+            f"全量 {history.count} 个交易日（"
+            f"{self._fmt_date_dash(earliest.trade_date)} ~ "
+            f"{self._fmt_date_dash(latest.trade_date)}）　|　"
+            f"最新涨跌 <b>{self._fmt_pct(latest.pct_chg)}</b>"
+            f"</span>"
+        )
+
+        # ---- 折线图（升序数据） ----
+        points = [(r.trade_date, r.pct_chg) for r in history.rows]
+        self.trend_sparkline.set_data(
+            points,
+            anchor_date=anchor_report_date or None,
+            eval_days=_TREND_EVAL_DAYS,
+        )
+
+        # ---- 表格（降序展示：最新在前） ----
+        rows_desc = list(reversed(history.rows))
+        self._render_sector_trend_table(rows_desc, anchor_report_date)
+
+    def _render_sector_trend_table(
+        self,
+        rows: list,
+        anchor_report_date: str,
+    ) -> None:
+        """填充板块走势明细表。
+
+        渲染规则:
+            * 报告日 D 那行底色 = 浅橙（#fff7e6）
+            * 报告日 +1 ~ +5 评估窗口底色 = 浅黄（#feffe6）
+            * 涨跌幅 / 主力净流入按正负染色（红涨绿跌）
+        """
+        from gui.utils.date_format import format_yyyymmdd_to_dash
+
+        self.trend_table.setRowCount(len(rows))
+
+        # 计算偏移：报告日 D 在 rows 中的位置；rows 是降序的（新→旧）
+        # 但偏移仍按交易日相对 anchor 的位置
+        anchor_idx_in_desc = None
+        if anchor_report_date:
+            for i, r in enumerate(rows):
+                if r.trade_date == anchor_report_date:
+                    anchor_idx_in_desc = i
+                    break
+
+        for r_idx, row in enumerate(rows):
+            # 偏移文本：D / D+N / D-N
+            if anchor_idx_in_desc is None:
+                offset_text = ""
+            else:
+                # rows 是降序：anchor 之前（更新）的是 D+N，之后（更旧）是 D-N
+                delta = anchor_idx_in_desc - r_idx
+                if delta == 0:
+                    offset_text = "D"
+                elif delta > 0:
+                    offset_text = f"D+{delta}"
+                else:
+                    offset_text = f"D{delta}"
+
+            cells = [
+                format_yyyymmdd_to_dash(row.trade_date),
+                offset_text,
+                self._fmt_pct(row.pct_chg),
+                self._fmt_net_yi(row.main_net_yi),
+                self._fmt_int(row.rank_today),
+            ]
+
+            # 行底色规则
+            row_bg: Optional[QColor] = None
+            if anchor_idx_in_desc is not None:
+                delta = anchor_idx_in_desc - r_idx
+                if delta == 0:
+                    row_bg = QColor("#fff7e6")  # D 报告日：浅橙
+                elif 1 <= delta <= _TREND_EVAL_DAYS:
+                    row_bg = QColor("#feffe6")  # D+1~D+5：浅黄
+
+            for c_idx, text in enumerate(cells):
+                item = QTableWidgetItem(text)
+                item.setToolTip(text)
+                if c_idx == 2:  # 涨跌幅染色
+                    item.setForeground(self._pct_color(row.pct_chg))
+                elif c_idx == 3:  # 主力净流入：>0 红 / <0 绿
+                    item.setForeground(self._pct_color(row.main_net_yi))
+                if row_bg is not None:
+                    item.setBackground(row_bg)
+                self.trend_table.setItem(r_idx, c_idx, item)
+
+    @staticmethod
+    def _fmt_pct(v) -> str:
+        if v is None:
+            return "—"
+        try:
+            return f"{float(v):+.2f}%"
+        except (TypeError, ValueError):
+            return "—"
+
+    @staticmethod
+    def _fmt_net_yi(v) -> str:
+        if v is None:
+            return "—"
+        try:
+            return f"{float(v):+.2f}"
+        except (TypeError, ValueError):
+            return "—"
+
+    @staticmethod
+    def _fmt_int(v) -> str:
+        if v is None:
+            return "—"
+        try:
+            return str(int(v))
+        except (TypeError, ValueError):
+            return "—"
+
+    @staticmethod
+    def _fmt_date_dash(yyyymmdd: str) -> str:
+        if isinstance(yyyymmdd, str) and len(yyyymmdd) == 8 and yyyymmdd.isdigit():
+            return f"{yyyymmdd[:4]}-{yyyymmdd[4:6]}-{yyyymmdd[6:]}"
+        return yyyymmdd or "—"
+
+    @staticmethod
+    def _pct_color(v) -> QColor:
+        """正红负绿零灰（与 _score_color 同色系，配 A 股习惯）。"""
+        if v is None:
+            return QColor("#8c8c8c")
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return QColor("#8c8c8c")
+        if f > 0:
+            return QColor("#cf1322")
+        if f < 0:
+            return QColor("#389e0d")
+        return QColor("#8c8c8c")
 
     # ---------- 删除 ----------
 
