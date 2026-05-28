@@ -58,9 +58,9 @@ from typing import List, Optional, Tuple
 from PyQt5.QtCore import QDateTime, Qt, QTimer
 from PyQt5.QtGui import QColor, QTextCursor
 from PyQt5.QtWidgets import (
-    QAbstractItemView, QCheckBox, QComboBox, QDateTimeEdit, QFrame,
+    QAbstractItemView, QCheckBox, QComboBox, QDateTimeEdit,
     QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget,
-    QListWidgetItem, QMessageBox, QPushButton, QScrollArea, QSizePolicy,
+    QListWidgetItem, QMessageBox, QPushButton, QSizePolicy,
     QSpinBox, QSplitter, QTableWidget, QTableWidgetItem, QTextBrowser,
     QTextEdit, QVBoxLayout, QWidget,
 )
@@ -131,22 +131,12 @@ class AIAnalysisPage(QWidget):
         subtitle.setWordWrap(True)
         layout.addWidget(subtitle)
 
-        # 上半区：配置（可滚动，避免窄屏挤压）
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.NoFrame)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        scroll.setMaximumHeight(440)
-
-        config_wrap = QWidget()
-        cfg_layout = QVBoxLayout(config_wrap)
-        cfg_layout.setContentsMargins(0, 0, 0, 0)
-        cfg_layout.setSpacing(8)
-        cfg_layout.addWidget(self._build_top_config_group())
-        cfg_layout.addWidget(self._build_params_group())
-        cfg_layout.addWidget(self._build_actions_row())
-        scroll.setWidget(config_wrap)
-        layout.addWidget(scroll)
+        # 上半区：配置直接展开（不套 QScrollArea，避免按钮被滚动条吃掉）。
+        # 三个子组件按自身 sizeHint 占空间，stretch=0 → 剩余空间全留给中段
+        # （任务队列 / 进度日志）+ 下方（结果区）。
+        layout.addWidget(self._build_top_config_group())
+        layout.addWidget(self._build_params_group())
+        layout.addWidget(self._build_actions_row())
 
         # 中段：横向 splitter（左=进度 / 右=任务队列）
         middle_split = QSplitter(Qt.Horizontal)
