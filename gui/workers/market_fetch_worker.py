@@ -32,7 +32,7 @@ class MarketFetchWorker(QThread):
         *,
         trade_date: Optional[str] = None,
         mode: str = "hybrid",
-        top_sector_n: int = 20,
+        top_sector_n: int = 30,  # 2026-05-28 v3 聚类版升级 20→30
         force_refresh: bool = False,
     ) -> None:
         super().__init__()

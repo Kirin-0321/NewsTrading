@@ -1,7 +1,18 @@
-"""打分服务入口（Phase 2 Step 2.2 + 2026-05-27 评估页改造扩展）。
+"""打分服务入口（Phase 2 Step 2.2 + 2026-05-27 评估页改造 + 2026-05-28 树形展开扩展
++ 2026-05-28 11:30 板块行情接入 + 加权平均改造）。
 
-把 :mod:`services.scoring.script_scorer` 单题材单日的算法包装成 5 个对外
+把 :mod:`services.scoring.script_scorer` 单题材单日的算法包装成 7 个对外
 API，给 CLI / scheduled_runner / GUI 复用：
+
+D+N 列口径（2026-05-28 改造后）
+-------------------------------
+* **标的级**（第 3 层 ``get_stock_scores_for_theme``）：``theme_stock_scores.pct_chg``
+  即个股当日涨跌幅（不变）
+* **题材级**（第 2 层 ``get_theme_eval_for_report``）：``sector_pct`` 即题材
+  绑定板块的当日涨跌幅（**改自** stock_weighted_pct 即标的均值）
+* **报告级 / 模板级**（第 1 层 ``get_report_eval`` / ``get_template_eval``）：
+  按 ``|strength_score|`` 加权平均，**仅 strength > 0 的看多题材**参与；
+  全部题材 strength≤0 时 D+N=NULL（NULLIF 兜底）
 
 | API | 用途 |
 |------|------|
@@ -9,7 +20,9 @@ API，给 CLI / scheduled_runner / GUI 复用：
 | :func:`rescore_range` | GUI「重打分（区间）」按钮：指定 ``report_date`` 区间重算 |
 | :func:`rescore_one_report` | 评估页「单报告打分」按钮：按 ``ai_reports.id`` 精准打 |
 | :func:`get_template_eval` | 模板评估页**上表**（按 prompt_id 聚合 D+1~D+5 均值） |
-| :func:`get_report_eval` | 模板评估页**下表**（按 ai_reports.id 聚合，每份报告一行） |
+| :func:`get_report_eval` | 模板评估页**树第 1 层**（按 ai_reports.id 聚合，每份报告一行） |
+| :func:`get_theme_eval_for_report` | 评估页**树第 2 层**（一份报告下每个题材的 D+1~D+5 透视）|
+| :func:`get_stock_scores_for_theme` | 评估页**树第 3 层**（一个题材下每只标的的逐日涨跌）|
 | :func:`get_theme_score_detail` | 题材详情第 4 个 Tab（单题材 D+1~D+5 明细） |
 
 时间维度
@@ -371,25 +384,29 @@ def get_template_eval(
         )
         time_params = [cutoff_compact]
 
-    # CTE：先把每个 theme 的 D+N 拍平 + 标记是否打分过
+    # CTE：每个 theme 的 D+N 拍平 + 标记是否打分过
+    # 2026-05-28 v2 改造：
+    #   * 题材级 D+N 用 sector_pct（板块涨跌幅）替换 stock_weighted_pct（标的均值）
+    #   * 报告级聚合用 |strength_score| 加权，仅 strength > 0 的题材参与
     sql = f"""
     WITH per_theme AS (
         SELECT
             tp.id AS theme_id,
             tp.prompt_id,
             tp.prompt_version,
+            tp.strength_score,
             tp.report_date AS theme_report_date,
             CASE WHEN COUNT(tps.id) > 0 THEN 1 ELSE 0 END AS is_scored,
             MAX(CASE WHEN tps.days_offset=1
-                     THEN tps.stock_weighted_pct END) AS d1,
+                     THEN tps.sector_pct END) AS d1,
             MAX(CASE WHEN tps.days_offset=2
-                     THEN tps.stock_weighted_pct END) AS d2,
+                     THEN tps.sector_pct END) AS d2,
             MAX(CASE WHEN tps.days_offset=3
-                     THEN tps.stock_weighted_pct END) AS d3,
+                     THEN tps.sector_pct END) AS d3,
             MAX(CASE WHEN tps.days_offset=4
-                     THEN tps.stock_weighted_pct END) AS d4,
+                     THEN tps.sector_pct END) AS d4,
             MAX(CASE WHEN tps.days_offset=5
-                     THEN tps.stock_weighted_pct END) AS d5,
+                     THEN tps.sector_pct END) AS d5,
             AVG(tps.alpha) AS alpha_avg,
             AVG(tps.hit_rate) AS hit_rate_avg,
             AVG(CASE WHEN tps.direction_correct IS NOT NULL
@@ -400,18 +417,33 @@ def get_template_eval(
                ON tps.theme_id = tp.id
         WHERE {time_where} {backtest_clause}
         GROUP BY tp.id, tp.prompt_id, tp.prompt_version,
-                 tp.report_date
+                 tp.strength_score, tp.report_date
     )
     SELECT
         prompt_id,
         {"NULL AS prompt_version" if ignore_version else "prompt_version"},
         COUNT(*) AS themes_total,
         SUM(is_scored) AS scored_themes,
-        AVG(d1) AS d1_avg,
-        AVG(d2) AS d2_avg,
-        AVG(d3) AS d3_avg,
-        AVG(d4) AS d4_avg,
-        AVG(d5) AS d5_avg,
+        SUM(CASE WHEN strength_score > 0 AND d1 IS NOT NULL
+                 THEN d1 * ABS(strength_score) END)
+          / NULLIF(SUM(CASE WHEN strength_score > 0 AND d1 IS NOT NULL
+                            THEN ABS(strength_score) END), 0) AS d1_avg,
+        SUM(CASE WHEN strength_score > 0 AND d2 IS NOT NULL
+                 THEN d2 * ABS(strength_score) END)
+          / NULLIF(SUM(CASE WHEN strength_score > 0 AND d2 IS NOT NULL
+                            THEN ABS(strength_score) END), 0) AS d2_avg,
+        SUM(CASE WHEN strength_score > 0 AND d3 IS NOT NULL
+                 THEN d3 * ABS(strength_score) END)
+          / NULLIF(SUM(CASE WHEN strength_score > 0 AND d3 IS NOT NULL
+                            THEN ABS(strength_score) END), 0) AS d3_avg,
+        SUM(CASE WHEN strength_score > 0 AND d4 IS NOT NULL
+                 THEN d4 * ABS(strength_score) END)
+          / NULLIF(SUM(CASE WHEN strength_score > 0 AND d4 IS NOT NULL
+                            THEN ABS(strength_score) END), 0) AS d4_avg,
+        SUM(CASE WHEN strength_score > 0 AND d5 IS NOT NULL
+                 THEN d5 * ABS(strength_score) END)
+          / NULLIF(SUM(CASE WHEN strength_score > 0 AND d5 IS NOT NULL
+                            THEN ABS(strength_score) END), 0) AS d5_avg,
         AVG(alpha_avg) AS alpha_avg,
         AVG(hit_rate_avg) AS hit_rate_avg,
         AVG(dir_rate) AS direction_correct_rate,
@@ -527,21 +559,25 @@ def get_report_eval(
         )
         time_params = [cutoff_compact]
 
+    # 2026-05-28 v2 改造：
+    #   * 题材级 D+N 用 sector_pct 替换 stock_weighted_pct
+    #   * 报告级聚合用 |strength_score| 加权，仅 strength > 0 的题材参与
     sql = f"""
     WITH per_theme AS (
         SELECT
             tp.id AS theme_id,
             tp.report_path,
+            tp.strength_score,
             MAX(CASE WHEN tps.days_offset=1
-                     THEN tps.stock_weighted_pct END) AS d1,
+                     THEN tps.sector_pct END) AS d1,
             MAX(CASE WHEN tps.days_offset=2
-                     THEN tps.stock_weighted_pct END) AS d2,
+                     THEN tps.sector_pct END) AS d2,
             MAX(CASE WHEN tps.days_offset=3
-                     THEN tps.stock_weighted_pct END) AS d3,
+                     THEN tps.sector_pct END) AS d3,
             MAX(CASE WHEN tps.days_offset=4
-                     THEN tps.stock_weighted_pct END) AS d4,
+                     THEN tps.sector_pct END) AS d4,
             MAX(CASE WHEN tps.days_offset=5
-                     THEN tps.stock_weighted_pct END) AS d5,
+                     THEN tps.sector_pct END) AS d5,
             AVG(tps.alpha) AS alpha_avg,
             AVG(tps.hit_rate) AS hit_rate_avg,
             AVG(CASE WHEN tps.direction_correct IS NOT NULL
@@ -551,7 +587,7 @@ def get_report_eval(
         FROM theme_predictions tp
         LEFT JOIN theme_prediction_scores tps
                ON tps.theme_id = tp.id
-        GROUP BY tp.id, tp.report_path
+        GROUP BY tp.id, tp.report_path, tp.strength_score
     )
     SELECT
         ar.id AS report_id,
@@ -563,11 +599,41 @@ def get_report_eval(
         COALESCE(SUM(CASE WHEN per_theme.theme_id IS NOT NULL
                           THEN 1 ELSE 0 END), 0) AS themes_count,
         COALESCE(SUM(per_theme.scored_pairs_one), 0) AS scored_pairs,
-        AVG(per_theme.d1) AS d1_avg,
-        AVG(per_theme.d2) AS d2_avg,
-        AVG(per_theme.d3) AS d3_avg,
-        AVG(per_theme.d4) AS d4_avg,
-        AVG(per_theme.d5) AS d5_avg,
+        SUM(CASE WHEN per_theme.strength_score > 0
+                  AND per_theme.d1 IS NOT NULL
+                 THEN per_theme.d1 * ABS(per_theme.strength_score) END)
+          / NULLIF(SUM(CASE WHEN per_theme.strength_score > 0
+                              AND per_theme.d1 IS NOT NULL
+                            THEN ABS(per_theme.strength_score) END), 0)
+          AS d1_avg,
+        SUM(CASE WHEN per_theme.strength_score > 0
+                  AND per_theme.d2 IS NOT NULL
+                 THEN per_theme.d2 * ABS(per_theme.strength_score) END)
+          / NULLIF(SUM(CASE WHEN per_theme.strength_score > 0
+                              AND per_theme.d2 IS NOT NULL
+                            THEN ABS(per_theme.strength_score) END), 0)
+          AS d2_avg,
+        SUM(CASE WHEN per_theme.strength_score > 0
+                  AND per_theme.d3 IS NOT NULL
+                 THEN per_theme.d3 * ABS(per_theme.strength_score) END)
+          / NULLIF(SUM(CASE WHEN per_theme.strength_score > 0
+                              AND per_theme.d3 IS NOT NULL
+                            THEN ABS(per_theme.strength_score) END), 0)
+          AS d3_avg,
+        SUM(CASE WHEN per_theme.strength_score > 0
+                  AND per_theme.d4 IS NOT NULL
+                 THEN per_theme.d4 * ABS(per_theme.strength_score) END)
+          / NULLIF(SUM(CASE WHEN per_theme.strength_score > 0
+                              AND per_theme.d4 IS NOT NULL
+                            THEN ABS(per_theme.strength_score) END), 0)
+          AS d4_avg,
+        SUM(CASE WHEN per_theme.strength_score > 0
+                  AND per_theme.d5 IS NOT NULL
+                 THEN per_theme.d5 * ABS(per_theme.strength_score) END)
+          / NULLIF(SUM(CASE WHEN per_theme.strength_score > 0
+                              AND per_theme.d5 IS NOT NULL
+                            THEN ABS(per_theme.strength_score) END), 0)
+          AS d5_avg,
         AVG(per_theme.alpha_avg) AS alpha_avg,
         AVG(per_theme.hit_rate_avg) AS hit_rate_avg,
         AVG(per_theme.dir_rate) AS direction_correct_rate
@@ -747,6 +813,205 @@ def get_theme_score_detail(theme_id: int) -> List[Dict]:
             "WHERE theme_id = ? "
             "ORDER BY score_date ASC, days_offset ASC",
             (theme_id,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# 6. 评估页树形第 2 层：一份报告下每个题材的聚合打分
+# ---------------------------------------------------------------------------
+
+
+def get_theme_eval_for_report(report_id: int) -> List[Dict]:
+    """按 ``ai_reports.id`` 取该报告下每个题材的聚合打分。
+
+    业务定位：
+        评估页 QTreeWidget 第 2 层（点击 📄 报告 ▶ 展开后调）。
+        每行 1 个题材，已按 D+1~D+5 透视 + 跨 score_date 聚合，
+        与 :func:`get_report_eval` 的均值口径一致但更细粒度。
+
+    Args:
+        report_id: ``ai_reports.id``。不存在则返回空列表（不抛错）。
+
+    Returns:
+        每行 dict（按 theme_id ASC 排序）::
+
+            {
+                "theme_id": 999,
+                "theme_name": "人形机器人",
+                "theme_category": "硬科技",
+                "strength_score": 75,        # -100~+100
+                "strength_level": "较强利多",
+                "priority_rank": 1,
+                "duration": "中线",
+                "expectation_gap": "高",
+                "is_cold": 0,
+                "sector_ts_code": "BK0871.DC",
+                "stocks_count": 6,           # theme_stocks 行数（懒加载下一层用）
+                "scored_pairs": 5,           # theme_prediction_scores 行数
+                "d1": ..., "d5": ...,        # stock_weighted_pct 透视
+                "alpha_avg": None,
+                "hit_rate_avg": None,
+                "direction_correct_rate": None,
+                "sector_pct_avg": None,      # 板块涨跌幅均值
+            }
+
+    SQL 性能：
+        命中 ``theme_predictions(report_path)`` 索引 + 子查询 GROUP BY
+        ``theme_id``，单报告（5~20 题材）耗时 < 50ms。
+    """
+    # 2026-05-28 v2：题材级 D+N 改用 sector_pct（与第 1 层口径对齐）
+    sql = """
+    WITH per_theme_scores AS (
+        SELECT
+            tps.theme_id,
+            MAX(CASE WHEN tps.days_offset=1
+                     THEN tps.sector_pct END) AS d1,
+            MAX(CASE WHEN tps.days_offset=2
+                     THEN tps.sector_pct END) AS d2,
+            MAX(CASE WHEN tps.days_offset=3
+                     THEN tps.sector_pct END) AS d3,
+            MAX(CASE WHEN tps.days_offset=4
+                     THEN tps.sector_pct END) AS d4,
+            MAX(CASE WHEN tps.days_offset=5
+                     THEN tps.sector_pct END) AS d5,
+            AVG(tps.alpha) AS alpha_avg,
+            AVG(tps.hit_rate) AS hit_rate_avg,
+            AVG(CASE WHEN tps.direction_correct IS NOT NULL
+                     THEN CAST(tps.direction_correct AS REAL) END)
+                 AS dir_rate,
+            AVG(tps.sector_pct) AS sector_pct_avg,
+            COUNT(tps.id) AS scored_pairs
+        FROM theme_prediction_scores tps
+        GROUP BY tps.theme_id
+    ),
+    stock_count AS (
+        SELECT theme_id, COUNT(*) AS n
+        FROM theme_stocks
+        GROUP BY theme_id
+    )
+    SELECT
+        tp.id AS theme_id,
+        tp.theme_name,
+        tp.theme_category,
+        tp.strength_score,
+        tp.strength_level,
+        tp.priority_rank,
+        tp.duration,
+        tp.expectation_gap,
+        tp.is_cold,
+        tp.sector_ts_code,
+        tp.sector_match_conf,
+        COALESCE(sc.n, 0) AS stocks_count,
+        COALESCE(pts.scored_pairs, 0) AS scored_pairs,
+        pts.d1, pts.d2, pts.d3, pts.d4, pts.d5,
+        pts.alpha_avg,
+        pts.hit_rate_avg,
+        pts.dir_rate AS direction_correct_rate,
+        pts.sector_pct_avg
+    FROM ai_reports ar
+    INNER JOIN theme_predictions tp
+            ON tp.report_path = ar.file_path
+    LEFT JOIN per_theme_scores pts ON pts.theme_id = tp.id
+    LEFT JOIN stock_count       sc  ON sc.theme_id = tp.id
+    WHERE ar.id = ?
+    ORDER BY tp.id ASC
+    """
+
+    ai = get_ai_inference_db()
+    with ai.connect(readonly=True) as conn:
+        rows = conn.execute(sql, (int(report_id),)).fetchall()
+    return [dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# 7. 评估页树形第 3 层：一个题材下每只标的的逐日涨跌
+# ---------------------------------------------------------------------------
+
+
+def get_stock_scores_for_theme(theme_id: int) -> List[Dict]:
+    """按 ``theme_id`` 取该题材下每只标的的逐日涨跌 + 命中标记。
+
+    业务定位：
+        评估页 QTreeWidget 第 3 层（点击 🎯 题材 ▶ 展开后调）。
+        每行 1 只标的，已按 D+1~D+5 透视。
+
+    Args:
+        theme_id: ``theme_predictions.id``。不存在则返回空列表（不抛错）。
+
+    Returns:
+        每行 dict（按 theme_stock_id ASC 排序）::
+
+            {
+                "theme_stock_id": 1234,
+                "stock_name": "XX龙头",
+                "stock_code": "600172",        # AI 原始
+                "normalized_code": "600172.SH", # matcher 后
+                "role": "核心",                  # 核心 / 辐射 / 受益 / ...
+                "reason": "AI 给的理由",
+                "d1_pct": 5.2, ..., "d5_pct": ...,    # 涨跌幅 %
+                "d1_hit": 1, ..., "d5_hit": 0,        # 1=命中, 0=未命中, None=未打分
+                "scored_days": 3,              # theme_stock_scores 行数
+            }
+
+    边界情况：
+        * 题材无任何 theme_stocks → 返回空列表
+        * 题材有 stocks 但没打过分 → 返回 stocks 但 d*_pct / d*_hit 全 None
+        * scored_days=0 标识"未打分"，GUI 据此显示空态
+
+    SQL 性能：
+        命中 ``theme_stocks(theme_id)`` + ``theme_stock_scores(theme_id)``
+        索引，单题材（3~8 只）耗时 < 30ms。
+    """
+    sql = """
+    WITH per_stock_pivot AS (
+        SELECT
+            tss.theme_stock_id,
+            MAX(CASE WHEN tss.days_offset=1
+                     THEN tss.pct_chg END) AS d1_pct,
+            MAX(CASE WHEN tss.days_offset=2
+                     THEN tss.pct_chg END) AS d2_pct,
+            MAX(CASE WHEN tss.days_offset=3
+                     THEN tss.pct_chg END) AS d3_pct,
+            MAX(CASE WHEN tss.days_offset=4
+                     THEN tss.pct_chg END) AS d4_pct,
+            MAX(CASE WHEN tss.days_offset=5
+                     THEN tss.pct_chg END) AS d5_pct,
+            MAX(CASE WHEN tss.days_offset=1
+                     THEN tss.is_hit END) AS d1_hit,
+            MAX(CASE WHEN tss.days_offset=2
+                     THEN tss.is_hit END) AS d2_hit,
+            MAX(CASE WHEN tss.days_offset=3
+                     THEN tss.is_hit END) AS d3_hit,
+            MAX(CASE WHEN tss.days_offset=4
+                     THEN tss.is_hit END) AS d4_hit,
+            MAX(CASE WHEN tss.days_offset=5
+                     THEN tss.is_hit END) AS d5_hit,
+            COUNT(tss.id) AS scored_days
+        FROM theme_stock_scores tss
+        WHERE tss.theme_id = ?
+        GROUP BY tss.theme_stock_id
+    )
+    SELECT
+        ts.id AS theme_stock_id,
+        ts.stock_name,
+        ts.stock_code,
+        ts.normalized_code,
+        ts.role,
+        ts.reason,
+        psp.d1_pct, psp.d2_pct, psp.d3_pct, psp.d4_pct, psp.d5_pct,
+        psp.d1_hit, psp.d2_hit, psp.d3_hit, psp.d4_hit, psp.d5_hit,
+        COALESCE(psp.scored_days, 0) AS scored_days
+    FROM theme_stocks ts
+    LEFT JOIN per_stock_pivot psp ON psp.theme_stock_id = ts.id
+    WHERE ts.theme_id = ?
+    ORDER BY ts.id ASC
+    """
+
+    ai = get_ai_inference_db()
+    with ai.connect(readonly=True) as conn:
+        rows = conn.execute(
+            sql, (int(theme_id), int(theme_id))
         ).fetchall()
     return [dict(r) for r in rows]
 

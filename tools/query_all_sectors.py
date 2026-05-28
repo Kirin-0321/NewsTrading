@@ -11,6 +11,13 @@
     python tools/query_all_sectors.py --date 20260526 --bottom 10
     python tools/query_all_sectors.py --date 20260526 --search 半导体
 
+    # 2026-05-28 多源改造后：按 idx_type 单一来源筛选
+    python tools/query_all_sectors.py --date 20260527 --idx-type 同花顺概念
+    python tools/query_all_sectors.py --date 20260527 --idx-type 行业板块
+
+    # 查当日各 idx_type 命中行数（GUI ComboBox 动态文案数据源）
+    python tools/query_all_sectors.py --date 20260527 --counts
+
 退出码::
 
     0 成功
@@ -30,7 +37,15 @@ sys.path.insert(0, str(_ROOT))
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 
-from gui.utils.market_db_helper import query_all_sectors  # noqa: E402
+from gui.utils.market_db_helper import (  # noqa: E402
+    query_all_sectors,
+    query_sector_idx_type_counts,
+)
+
+
+_IDX_TYPE_CHOICES = (
+    "概念板块", "行业板块", "地域板块", "同花顺行业", "同花顺概念",
+)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -55,6 +70,14 @@ def _build_parser() -> argparse.ArgumentParser:
         help="只输出跌幅前 N 名（与 --top 互斥；同时给则取 --bottom）",
     )
     p.add_argument(
+        "--idx-type", default=None, choices=_IDX_TYPE_CHOICES,
+        help="按 dim_sector.idx_type 单源筛选（不传 = 全部 5 源合并）",
+    )
+    p.add_argument(
+        "--counts", action="store_true",
+        help="只输出当日各 idx_type 命中行数（不返回明细）",
+    )
+    p.add_argument(
         "--json", dest="as_json", action="store_true",
         help="输出 JSON 数组到 stdout",
     )
@@ -68,9 +91,31 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[ERROR] --date 须为 YYYYMMDD，得到 {args.date!r}", file=sys.stderr)
         return 2
 
-    rows = query_all_sectors(td)
+    if args.counts:
+        counts = query_sector_idx_type_counts(td)
+        if not counts:
+            print(f"[WARN] {td} 无数据", file=sys.stderr)
+            return 1
+        if args.as_json:
+            json.dump(counts, sys.stdout, ensure_ascii=False, indent=2)
+            sys.stdout.write("\n")
+        else:
+            print(f"trade_date={td}  idx_type 分布:")
+            total = 0
+            for it, c in sorted(counts.items(), key=lambda x: -x[1]):
+                print(f"  {it:10s} {c}")
+                total += c
+            print(f"  {'合计':10s} {total}")
+        return 0
+
+    rows = query_all_sectors(td, idx_type=args.idx_type)
     if not rows:
-        print(f"[WARN] {td} 无 fact_sector_daily 数据", file=sys.stderr)
+        print(
+            f"[WARN] {td}"
+            f"{(' idx_type=' + args.idx_type) if args.idx_type else ''}"
+            f" 无 fact_sector_daily 数据",
+            file=sys.stderr,
+        )
         return 1
 
     if args.search:

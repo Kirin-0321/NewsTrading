@@ -328,15 +328,24 @@ def query_all_stocks(trade_date: str) -> List[Dict[str, Any]]:
     return out
 
 
-def query_all_sectors(trade_date: str) -> List[Dict[str, Any]]:
+def query_all_sectors(
+    trade_date: str,
+    *,
+    idx_type: Optional[str] = None,
+) -> List[Dict[str, Any]]:
     """直查 fact_sector_daily 取某交易日全部板块行情（GUI 全部板块 Tab 用）。
 
-    与 :func:`query_sectors_extended` 同口径，但取**全部**约 480 个板块，
-    一次 SQL 完成；leaders/limit_up_count 仍走 :func:`_derive_sector_leaders`
-    LIKE 查询，~480 次 LIKE 在 SSD 上约 1~2s（已与主人对齐接受）。
+    与 :func:`query_sectors_extended` 同口径，2026-05-28 多源改造后取**全部**
+    约 1489 个板块（dc 概念 486 + dc 行业 496 + dc 地域 31 + ths 行业 90 +
+    ths 概念 386）；leaders/limit_up_count 仍走 :func:`_derive_sector_leaders`
+    LIKE 查询，1489 次 LIKE 在 SSD 上约 3~5s（首次加载，可接受）。
 
     输入:
         trade_date  YYYYMMDD（必传，空串/None → []）
+        idx_type    可选，按 ``dim_sector.idx_type`` 精确筛选；
+                    取值之一: "概念板块" / "行业板块" / "地域板块" /
+                              "同花顺行业" / "同花顺概念"
+                    None = 不筛选返回全部 5 源合并。
 
     输出:
         list of dict —— 字段对齐 sectors_top[]::
@@ -353,16 +362,20 @@ def query_all_sectors(trade_date: str) -> List[Dict[str, Any]]:
     db = get_market_db()
     try:
         with db.connect(readonly=True) as conn:
-            rows = conn.execute(
+            sql = (
                 "SELECT s.ts_code, s.pct_chg, s.main_net_yi, "
                 "       s.main_elg_yi, s.main_lg_yi, s.pct_chg_5d, "
                 "       s.rank_today, d.name "
                 "FROM fact_sector_daily s "
                 "LEFT JOIN dim_sector d ON d.ts_code = s.ts_code "
                 "WHERE s.trade_date = ? "
-                "ORDER BY s.pct_chg DESC NULLS LAST",
-                (trade_date,),
-            ).fetchall()
+            )
+            params: List[Any] = [trade_date]
+            if idx_type:
+                sql += "  AND d.idx_type = ? "
+                params.append(idx_type)
+            sql += "ORDER BY s.pct_chg DESC NULLS LAST"
+            rows = conn.execute(sql, params).fetchall()
 
             out: List[Dict[str, Any]] = []
             for i, r in enumerate(rows, 1):
@@ -387,6 +400,93 @@ def query_all_sectors(trade_date: str) -> List[Dict[str, Any]]:
     except Exception as exc:  # noqa: BLE001
         _log.warning("query_all_sectors 失败 td=%s: %s", trade_date, exc)
         return []
+
+
+def query_grouped_sectors_tree(
+    trade_date: str,
+) -> List[Dict[str, Any]]:
+    """聚类后视图（含成员明细）—— GUI QTreeWidget 直接消费的格式。
+
+    服务层封装：直接转发 :func:`services.market.sector_grouping
+    .query_grouped_sectors_with_members` 的输出。
+
+    返回结构详见服务层 docstring：每项含 group_name / display_name /
+    median_pct_chg / cnt_in_data / members[]，按 median_pct_chg DESC 排序。
+
+    输入空 trade_date → []。
+    """
+    if not trade_date:
+        return []
+    try:
+        from services.market.sector_grouping import (
+            query_grouped_sectors_with_members,
+        )
+        return query_grouped_sectors_with_members(trade_date)
+    except Exception as exc:  # noqa: BLE001
+        _log.warning(
+            "query_grouped_sectors_tree(%s) 失败: %s", trade_date, exc,
+        )
+        return []
+
+
+def query_grouped_sectors_count(trade_date: str) -> int:
+    """当日聚类后剩多少行（GUI ComboBox label 动态用）。"""
+    if not trade_date:
+        return 0
+    try:
+        from services.market.sector_grouping import (
+            count_grouped_sectors_for_date,
+        )
+        return count_grouped_sectors_for_date(trade_date)
+    except Exception as exc:  # noqa: BLE001
+        _log.warning(
+            "query_grouped_sectors_count(%s) 失败: %s", trade_date, exc,
+        )
+        return 0
+
+
+def query_sector_idx_type_counts(
+    trade_date: str,
+) -> Dict[str, int]:
+    """返回某交易日 fact_sector_daily 各 idx_type 命中行数。
+
+    用途:
+        GUI 视图 ComboBox 动态显示真实数量（如 "🔵 dc 概念 ~486"），
+        不再写死。每 page 初始化或切换日期时调一次（< 50ms）。
+
+    输入:
+        trade_date  YYYYMMDD
+
+    输出:
+        ``{idx_type: count}``，例如::
+
+            {
+                "概念板块": 486, "行业板块": 496, "地域板块": 31,
+                "同花顺行业": 90, "同花顺概念": 386,
+            }
+
+        某 idx_type 当日无数据时不出现在 dict 中。
+    """
+    if not trade_date:
+        return {}
+    db = get_market_db()
+    try:
+        with db.connect(readonly=True) as conn:
+            rows = conn.execute(
+                "SELECT d.idx_type, COUNT(*) AS c "
+                "FROM fact_sector_daily s "
+                "LEFT JOIN dim_sector d ON d.ts_code = s.ts_code "
+                "WHERE s.trade_date = ? "
+                "  AND d.idx_type IS NOT NULL "
+                "GROUP BY d.idx_type",
+                (trade_date,),
+            ).fetchall()
+        return {str(r["idx_type"]): int(r["c"]) for r in rows}
+    except Exception as exc:  # noqa: BLE001
+        _log.warning(
+            "query_sector_idx_type_counts(%s) 失败: %s", trade_date, exc,
+        )
+        return {}
 
 
 def query_stock_names(ts_codes: List[str]) -> Dict[str, str]:
@@ -497,6 +597,7 @@ __all__ = [
     "query_sectors_extended",
     "query_all_stocks",
     "query_all_sectors",
+    "query_sector_idx_type_counts",
     "query_stock_names",
     "last_settled_trade_date",
     "get_cached_summary_md",

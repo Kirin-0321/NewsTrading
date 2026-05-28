@@ -180,6 +180,11 @@ class ThemeStore:
                 (report_id,),
             )
 
+            # 2026-05-28 抽取层强制绑定 sector_ts_code（决策点 2.2·A）
+            # 兜底：如果上游 enrich_themes_with_matcher 没绑上（旧调用方
+            # 或 force_sector=False），落库前用 matcher.force=True 再补一次
+            self._ensure_sector_bound(themes)
+
             for raw in themes:
                 t = _normalize_theme(raw)
                 theme_name = (t.get("theme_name") or "").strip()
@@ -281,6 +286,58 @@ class ThemeStore:
             "news": news_count,
             "prompt_id": prompt_id,
         }
+
+    @staticmethod
+    def _ensure_sector_bound(themes: List[Dict]) -> None:
+        """落库前最后一道兜底：所有 sector_ts_code 空的题材强制 fallback。
+
+        2026-05-28 决策点 2.2·A：抽取层强制绑定，打分层零处理逻辑。
+        即使上游 enrich_themes_with_matcher 没启用 force_sector=True，本方法也
+        能保证 sector_ts_code 100% 非空（市场字典完全空除外）。
+        """
+        if not themes:
+            return
+        empty_themes = [
+            t for t in themes
+            if not t.get("sector_ts_code")
+        ]
+        if not empty_themes:
+            return
+
+        try:
+            from services.market.market_db import get_market_db
+            from services.scoring.matcher import match_sector_ts_code
+            db = get_market_db()
+            with db.connect(readonly=True) as conn:
+                rows = conn.execute(
+                    "SELECT ts_code, name, src FROM dim_sector "
+                    "WHERE name IS NOT NULL"
+                ).fetchall()
+                sectors = [(r[0], r[1], r[2] or "dc") for r in rows]
+        except Exception as exc:  # noqa: BLE001
+            # market.db 不可用时静默跳过，保留原 None
+            return
+
+        if not sectors:
+            return
+
+        for t in empty_themes:
+            name = (t.get("theme_name") or "").strip()
+            if not name:
+                continue
+            keywords = t.get("keywords") or t.get("theme_keywords")
+            category = t.get("theme_category") or t.get("category")
+            code, conf = match_sector_ts_code(
+                name,
+                theme_category=category,
+                theme_keywords=(
+                    list(keywords) if isinstance(keywords, list) else None
+                ),
+                sectors=sectors,
+                force=True,
+            )
+            t["sector_ts_code"] = code
+            t["sector_match_conf"] = conf
 
     # ------------------------------------------------------------------
     # 读

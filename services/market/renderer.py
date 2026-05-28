@@ -236,20 +236,22 @@ class MarketSummaryRenderer:
         lines: List[str] = ["## 四、板块强弱榜", ""]
 
         # ---- Top ----
-        cap_top = min(20, len(top))
-        lines.append(f"### 涨幅 Top {cap_top}")
+        # v3 聚类版：service 已按 top_sector_n（默认 30）切好，
+        # renderer 不再做 [:N] 二次切片，全量渲染
+        cap_top = len(top)
+        lines.append(f"### 涨幅 Top {cap_top}（聚类后）")
         if not top:
             lines.append("（无数据）")
         else:
             lines.append(
-                "| # | 板块 | 涨幅 | 5日累计 | "
+                "| # | 板块 | 成员 | 涨幅 | 5日累计 | "
                 "主力净流入(亿) | 涨停数 | 龙头 | 催化 |"
             )
             lines.append(
-                "|---|------|------|--------|"
+                "|---|------|------|------|--------|"
                 "--------------|------|------|------|"
             )
-            for s in top[:cap_top]:
+            for s in top:
                 leaders = s.get("leaders") or []
                 leader_str = "／".join(
                     _format_leader(le) for le in leaders[:3]
@@ -259,9 +261,13 @@ class MarketSummaryRenderer:
                     str(c.get("text") if isinstance(c, dict) else c)
                     for c in catalysts[:2]
                 ) or EMPTY
+                # 聚类组员数：×N（N>1 才显示）
+                mc = s.get("members_count") or 1
+                mc_str = f"×{mc}" if mc > 1 else "—"
                 lines.append(
                     f"| {_v(s.get('rank'))} "
                     f"| {_v(s.get('name'))} "
+                    f"| {mc_str} "
                     f"| {_fmt_pct(s.get('pct_chg'))} "
                     f"| {_fmt_pct(s.get('pct_chg_5d'))} "
                     f"| {_fmt_num(s.get('main_net_yi'))} "
@@ -271,28 +277,32 @@ class MarketSummaryRenderer:
                 )
 
         # ---- Bottom ----
-        cap_bot = min(10, len(bottom))
+        # v3 同 Top，service 切好（默认 15）
+        cap_bot = len(bottom)
         lines.append("")
-        lines.append(f"### 跌幅 Bottom {cap_bot}")
+        lines.append(f"### 跌幅 Bottom {cap_bot}（聚类后）")
         if not bottom:
             lines.append("（无数据）")
         else:
             lines.append(
-                "| # | 板块 | 跌幅 | 5日累计 | "
-                "主力净流出(亿) | 跌停数 | 笨蛋 |"
+                "| # | 板块 | 成员 | 跌幅 | 5日累计 | "
+                "主力净流出(亿) | 跌停数 | 领跌 |"
             )
             lines.append(
-                "|---|------|------|--------|"
+                "|---|------|------|------|--------|"
                 "--------------|------|------|"
             )
-            for s in bottom[:cap_bot]:
+            for s in bottom:
                 laggards = s.get("laggards") or []
                 laggard_str = "／".join(
                     _format_leader(le) for le in laggards[:3]
                 ) or EMPTY
+                mc = s.get("members_count") or 1
+                mc_str = f"×{mc}" if mc > 1 else "—"
                 lines.append(
                     f"| {_v(s.get('rank'))} "
                     f"| {_v(s.get('name'))} "
+                    f"| {mc_str} "
                     f"| {_fmt_pct(s.get('pct_chg'))} "
                     f"| {_fmt_pct(s.get('pct_chg_5d'))} "
                     f"| {_fmt_num(s.get('main_net_yi'))} "

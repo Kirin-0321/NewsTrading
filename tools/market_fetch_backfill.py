@@ -334,7 +334,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help="构建模式，默认 hybrid",
     )
     p.add_argument(
-        "--top-n", type=int, default=10,
+        "--top-n", type=int, default=30,
         help="板块榜单 Top N（默认 10）",
     )
     p.add_argument(

@@ -1,4 +1,4 @@
-"""Phase 1 行情同步回归测试（7 用例，全部走 mock client，不耗 Tushare 配额）。
+"""Phase 1 行情同步回归测试（8 用例，全部走 mock client，不耗 Tushare 配额）。
 
 覆盖范围
 --------
@@ -7,9 +7,12 @@
 3. sync_stock_daily 单日同步行数 >= mock 行数（默认 5400）
 4. sync_stock_daily 幂等（重复跑不增行数，且第 2 次 skipped=True）
 5. sync_stock_daily force=True 重写（先 DELETE 再 INSERT）
-6. sync_sector_daily 单日行数（mock 500 行）
+6. sync_sector_daily **5 源** 入库：dc 三类（概念/行业/地域）
+   + ths 行业（moneyflow_ind_ths）+ ths 概念（moneyflow_cnt_ths）共 5 次 API
 7. attached_dbs 跨库 JOIN：从 ai_inference 查 market.fact_stock_daily
    不报错 LIMIT 1
+8. dim_sector 5 种 idx_type/src 组合都正确写入 + ths 行业 vs 概念字段差异
+   （industry vs name）+ ths 资金流字段（无 elg/lg）验证
 
 测试隔离
 --------
@@ -133,7 +136,7 @@ def _cleanup_fake_data() -> None:
         conn.execute(
             "DELETE FROM fact_sector_daily WHERE trade_date LIKE '9999%'"
         )
-        # 同时清理假 ts_code（防止污染 dim_sector）
+        # 同时清理假 ts_code（防止污染 dim_sector）；.TI 来自 ths mock
         conn.execute(
             "DELETE FROM dim_sector WHERE ts_code LIKE 'TEST_%'"
         )
@@ -252,33 +255,76 @@ def case_05_sync_stock_daily_force() -> None:
 
 
 def case_06_sync_sector_daily_basic() -> None:
-    """sync_sector_daily 应入库 mock 返回的 500 行板块行情。
+    """sync_sector_daily 多源调用：dc 三类 + ths 行业 + ths 概念，合计 580 行。
+
+    2026-05-28 5 源改造后：
+      - dc 概念 200 + dc 行业 200 + dc 地域 50
+        + ths 行业 50 + ths 概念 80 = 580 行
+      - 5 次 API 调用（每个子源 1 次）
 
     注意：不能在此清 99990506 数据，case_07 还要用。
     """
     from services.market.sector_daily_sync import sync_sector_daily
     td = "99990507"
-    mock_rows = [
+
+    def dc_mock(params: dict) -> List[dict]:
+        ct = params.get("content_type", "")
+        prefix_map = {"概念": "C", "行业": "I", "地域": "R"}
+        count_map = {"概念": 200, "行业": 200, "地域": 50}
+        prefix = prefix_map.get(ct, "X")
+        count = count_map.get(ct, 0)
+        return [
+            {
+                "ts_code": f"TEST_{prefix}{i:04d}.DC",
+                "name": f"测试{ct}板块{i}",
+                "pct_change": 1.5 + (i % 10) * 0.1,
+                "net_amount": 1e8 * (i % 5),
+                "buy_elg_amount": 5e7,
+                "buy_lg_amount": 3e7,
+                "rank": i + 1,
+            }
+            for i in range(count)
+        ]
+
+    ths_industry_mock = [
         {
-            "ts_code": f"TEST_BK{i:04d}.DC",
-            "name": f"测试板块{i}",
-            "pct_change": 1.5 + (i % 10) * 0.1,
-            "net_amount": 1e8 * (i % 5),
-            "buy_elg_amount": 5e7,
-            "buy_lg_amount": 3e7,
-            "rank": i + 1,
+            "ts_code": f"TEST_TI{i:04d}.TI",
+            "industry": f"同花顺行业测试{i}",  # ⚠ 行业接口字段名 industry
+            "pct_change": 0.5 + (i % 10) * 0.1,
+            "net_amount": float(i % 50),  # ths 已是亿元
+            "lead_stock": f"龙头I{i}",
+            "company_num": 10 + i,
+            "close": 1000 + i,
         }
-        for i in range(500)
+        for i in range(50)
     ]
-    client = MockTushareClient({"moneyflow_ind_dc": mock_rows})
+    ths_concept_mock = [
+        {
+            "ts_code": f"TEST_TC{i:04d}.TI",
+            "name": f"同花顺概念测试{i}",  # ⚠ 概念接口字段名 name
+            "pct_change": 0.3 + (i % 10) * 0.1,
+            "net_amount": float(i % 30),
+            "lead_stock": f"龙头C{i}",
+            "company_num": 10 + i,
+            "close_price": 100 + i,
+        }
+        for i in range(80)
+    ]
+
+    client = MockTushareClient({
+        "moneyflow_ind_dc": dc_mock,
+        "moneyflow_ind_ths": ths_industry_mock,
+        "moneyflow_cnt_ths": ths_concept_mock,
+    })
 
     res = sync_sector_daily(td, client=client)
     assert res.ok, f"sector sync 失败: {res.error}"
-    assert res.rows_written == 500, (
-        f"sector rows_written 期望 500，得到 {res.rows_written}"
+    assert res.rows_written == 580, (
+        f"sector rows_written 期望 580（200+200+50+50+80），得到 {res.rows_written}"
     )
-    assert res.api_calls == 1
-    # 板块涨幅 pct_change 应正确入 pct_chg 列
+    assert res.api_calls == 5, (
+        f"api_calls 期望 5（dc 三类 + ths 行业 + ths 概念）, 得到 {res.api_calls}"
+    )
     from services.market.market_db import get_market_db
     db = get_market_db()
     with db.connect(readonly=True) as conn:
@@ -289,6 +335,75 @@ def case_06_sync_sector_daily_basic() -> None:
         ).fetchone()
     assert sample is not None and sample["pct_chg"] is not None, (
         f"pct_chg 入库为空: {dict(sample) if sample else None}"
+    )
+
+
+def case_08_sector_dual_source_idx_type() -> None:
+    """5 源入库后，dim_sector 应同时有 5 种 idx_type 标记。
+
+    针对 case_06 的副作用做更细粒度校验：每个子源的 idx_type/src 都正确写入。
+    """
+    from services.market.market_db import get_market_db
+    db = get_market_db()
+    with db.connect(readonly=True) as conn:
+        rows = conn.execute("""
+            SELECT idx_type, src, COUNT(*) AS c
+            FROM dim_sector
+            WHERE ts_code LIKE 'TEST_%'
+            GROUP BY idx_type, src
+            ORDER BY c DESC
+        """).fetchall()
+    dist = {(r["idx_type"], r["src"]): r["c"] for r in rows}
+
+    # 5 个子源：3 个 dc + 2 个 ths
+    assert dist.get(("概念板块", "dc")) == 200, (
+        f"概念板块/dc 期望 200，得到 {dist.get(('概念板块', 'dc'))}"
+    )
+    assert dist.get(("行业板块", "dc")) == 200, (
+        f"行业板块/dc 期望 200，得到 {dist.get(('行业板块', 'dc'))}"
+    )
+    assert dist.get(("地域板块", "dc")) == 50, (
+        f"地域板块/dc 期望 50，得到 {dist.get(('地域板块', 'dc'))}"
+    )
+    assert dist.get(("同花顺行业", "ths")) == 50, (
+        f"同花顺行业/ths 期望 50，得到 {dist.get(('同花顺行业', 'ths'))}"
+    )
+    assert dist.get(("同花顺概念", "ths")) == 80, (
+        f"同花顺概念/ths 期望 80，得到 {dist.get(('同花顺概念', 'ths'))}"
+    )
+
+    # ths ts_code 后缀必须是 .TI
+    with db.connect(readonly=True) as conn:
+        ths_codes = conn.execute(
+            "SELECT ts_code FROM dim_sector WHERE src='ths' "
+            "AND ts_code LIKE 'TEST_%' LIMIT 5"
+        ).fetchall()
+    assert all(r["ts_code"].endswith(".TI") for r in ths_codes), (
+        f"ths ts_code 后缀应为 .TI，得到 {[r['ts_code'] for r in ths_codes]}"
+    )
+
+    # ths 资金流字段：main_net_yi 直填，elg/lg 为 NULL
+    with db.connect(readonly=True) as conn:
+        ths_sample = conn.execute("""
+            SELECT main_net_yi, main_elg_yi, main_lg_yi, rank_today
+            FROM fact_sector_daily
+            WHERE trade_date='99990507'
+              AND ts_code LIKE 'TEST_TI%' LIMIT 1
+        """).fetchone()
+    assert ths_sample is not None, "ths 样本应入库"
+    assert ths_sample["main_elg_yi"] is None, "ths 的 elg 字段应为 NULL"
+    assert ths_sample["main_lg_yi"] is None, "ths 的 lg 字段应为 NULL"
+    assert ths_sample["rank_today"] is None, "ths 无 rank 字段，应为 NULL"
+
+    # ths 概念字段名差异：moneyflow_cnt_ths 用 name 字段
+    # 校验概念也正确入库（数据库里只能查 dim_sector.name，应为"同花顺概念测试X"）
+    with db.connect(readonly=True) as conn:
+        concept_name = conn.execute(
+            "SELECT name FROM dim_sector WHERE ts_code LIKE 'TEST_TC%' LIMIT 1"
+        ).fetchone()
+    assert concept_name is not None, "ths 概念应入 dim_sector"
+    assert "同花顺概念测试" in concept_name["name"], (
+        f"ths 概念 name 字段映射错误，得到 {concept_name['name']!r}"
     )
 
 
@@ -310,8 +425,8 @@ def case_07_cross_db_join_smoke() -> None:
         ).fetchone()["c"]
     assert row is not None, "跨库 SELECT 应该能查到 99990506 的 stock 数据"
     assert str(row["trade_date"]) == "99990506"
-    assert sector_n == 500, (
-        f"跨库 sector COUNT 期望 500，得到 {sector_n}"
+    assert sector_n == 580, (
+        f"跨库 sector COUNT 期望 580（5 源 mock 总和），得到 {sector_n}"
     )
 
 
@@ -328,6 +443,7 @@ _CASES: List[Tuple[str, Callable[[], None]]] = [
     ("05_sync_stock_daily_force", case_05_sync_stock_daily_force),
     ("06_sync_sector_daily_basic", case_06_sync_sector_daily_basic),
     ("07_cross_db_join_smoke", case_07_cross_db_join_smoke),
+    ("08_sector_dual_source_idx_type", case_08_sector_dual_source_idx_type),
 ]
 
 

@@ -4,7 +4,10 @@
 
     1.  index_daily       × 7 大指数      → fact_index_daily
     2.  dc_index          (idx_type=概念) → dim_sector upsert
-    3.  moneyflow_ind_dc  (concept)       → fact_sector_daily
+    3.  moneyflow_ind_dc  × 3（概念/行业/地域）
+        + moneyflow_ind_ths（同花顺行业）
+        + moneyflow_cnt_ths（同花顺概念）
+                                          → fact_sector_daily（5 源）
     4.  limit_list_d      × 3 (U/Z/D)     → fact_limit_stock
     5.  kpl_list          (T 日)          → fact_limit_stock 合并连板信息
     6.  kpl_list          (T-1 日)        → 内存返回，供 metrics.calc_promotion_rate
@@ -413,31 +416,107 @@ class TushareMarketFetcher:
             ).fetchone()[0]
         return int(inserted)
 
-    # --- 3. moneyflow_ind_dc → fact_sector_daily ---
+    # --- 3. moneyflow_ind_dc / ths → fact_sector_daily（多源：dc 三类 + ths 行业/概念）---
+    #
+    # 2026-05-28 改造：原来仅拉 content_type="概念"（506 个板块），导致 39.5%
+    # 已绑板块的题材（行业板块）打分时 sector_pct 永远空。新版同时拉：
+    #   * dc 概念（~486）+ dc 行业（~496）+ dc 地域（~31）→ ts_code 后缀 .DC
+    #   * ths 同花顺行业（moneyflow_ind_ths, ~90）→ ts_code 81XXX.TI
+    #   * ths 同花顺概念（moneyflow_cnt_ths, ~386）→ ts_code 885/886XXX.TI
+    #
+    # 字段差异：
+    #   dc 接口：name / pct_change / net_amount / buy_elg_amount / buy_lg_amount
+    #   ths 行业：industry / pct_change / net_amount（无 elg/lg 细分）
+    #   ths 概念：name / pct_change / net_amount（无 elg/lg 细分）
+
+    #: dc 子源配置：(content_type, idx_type 名称)
+    _DC_SECTOR_VARIANTS: List[Tuple[str, str]] = [
+        ("概念", "概念板块"),
+        ("行业", "行业板块"),
+        ("地域", "地域板块"),
+    ]
+
+    #: ths 子源配置：(api_name, name_field, idx_type)
+    _THS_SECTOR_VARIANTS: List[Tuple[str, str, str]] = [
+        ("moneyflow_ind_ths", "industry", "同花顺行业"),
+        ("moneyflow_cnt_ths", "name", "同花顺概念"),
+    ]
 
     def _fetch_sector_moneyflow(self, result: FetchResult) -> None:
+        """多源板块行情拉取（dc 三类 + ths 行业 + ths 概念）。
+
+        逐表幂等检查：fact_sector_daily 在该日有数据即跳过——这意味着任何
+        一个子源拉到数据就视为命中，**不再重复拉其他子源**。后台批量
+        backfill 时务必传 force_refresh=True 或先 DELETE 当日再调用。
+        """
         if not result.force_refresh and self._table_has_data(
             "fact_sector_daily", result.trade_date
         ):
             result.skipped.append("fact_sector_daily")
             return
-        rows = self.client.call(
-            "moneyflow_ind_dc",
-            params={
-                "trade_date": result.trade_date,
-                "content_type": "概念",
-            },
-        )
-        n = self._ingest_sector_daily(rows, result.trade_date)
-        result.ingested["fact_sector_daily"] = n
 
+        total = 0
+        # --- 3a. dc 三类 ---
+        for content_type, idx_type in self._DC_SECTOR_VARIANTS:
+            try:
+                rows = self.client.call(
+                    "moneyflow_ind_dc",
+                    params={
+                        "trade_date": result.trade_date,
+                        "content_type": content_type,
+                    },
+                )
+            except TushareError as exc:
+                result.warnings.append(
+                    f"moneyflow_ind_dc({content_type}): {exc}"
+                )
+                continue
+            total += self._ingest_sector_daily_dc(
+                rows, result.trade_date, idx_type=idx_type,
+            )
+
+        # --- 3b. ths 两类（行业 + 概念）---
+        for api_name, name_field, idx_type in self._THS_SECTOR_VARIANTS:
+            try:
+                rows_ths = self.client.call(
+                    api_name,
+                    params={"trade_date": result.trade_date},
+                )
+            except TushareError as exc:
+                result.warnings.append(f"{api_name}: {exc}")
+                continue
+            total += self._ingest_sector_daily_ths(
+                rows_ths, result.trade_date,
+                name_field=name_field, idx_type=idx_type,
+            )
+
+        result.ingested["fact_sector_daily"] = total
+
+    # 兼容老调用方（sector_daily_sync 复用了 _fetch_sector_moneyflow）
     def _ingest_sector_daily(
         self, rows: Sequence[dict], trade_date: str
     ) -> int:
+        """兼容入口：老 single-source 路径仍走 dc 概念。新代码请用
+        `_ingest_sector_daily_dc` / `_ingest_sector_daily_ths`。
+        """
+        return self._ingest_sector_daily_dc(
+            rows, trade_date, idx_type="概念板块",
+        )
+
+    def _ingest_sector_daily_dc(
+        self,
+        rows: Sequence[dict],
+        trade_date: str,
+        *,
+        idx_type: str,
+    ) -> int:
+        """dc 接口入库：name+pct_change+三档资金流齐全。
+
+        Args:
+            idx_type: "概念板块" / "行业板块" / "地域板块"，写入 dim_sector
+        """
         if not rows:
             return 0
-        # 兜底：把本批次自带的 ts_code+name 全部 INSERT OR IGNORE 进
-        # dim_sector，避免外键失败（dc_index 可能漏拉，或字典里 src!='dc'）
         dim_payload: List[tuple] = []
         seen: set[str] = set()
         for r in rows:
@@ -447,7 +526,7 @@ class TushareMarketFetcher:
                 continue
             seen.add(str(ts_code))
             dim_payload.append(
-                (ts_code, name, "概念板块", "dc", None, trade_date)
+                (ts_code, name, idx_type, "dc", None, trade_date)
             )
 
         payload = []
@@ -463,9 +542,78 @@ class TushareMarketFetcher:
                     _safe_div(r.get("net_amount"), 1e8),
                     _safe_div(r.get("buy_elg_amount"), 1e8),
                     _safe_div(r.get("buy_lg_amount"), 1e8),
-                    None,  # limit_up_count 后续合并 kpl 后再填（M1b 留空）
+                    None,  # limit_up_count 由 kpl 后续合并
                     None,  # pct_chg_5d 派生步骤填
                     _to_int(r.get("rank")),
+                    json.dumps(_strip_internal(r), ensure_ascii=False),
+                )
+            )
+        with self.db.connect() as conn:
+            if dim_payload:
+                conn.executemany(
+                    "INSERT OR IGNORE INTO dim_sector "
+                    "(ts_code, name, idx_type, src, "
+                    " list_date, last_seen_date) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    dim_payload,
+                )
+            conn.executemany(
+                "INSERT OR REPLACE INTO fact_sector_daily "
+                "(trade_date, ts_code, pct_chg, main_net_yi, "
+                " main_elg_yi, main_lg_yi, limit_up_count, "
+                " pct_chg_5d, rank_today, raw_json) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                payload,
+            )
+        return len(payload)
+
+    def _ingest_sector_daily_ths(
+        self,
+        rows: Sequence[dict],
+        trade_date: str,
+        *,
+        name_field: str = "industry",
+        idx_type: str = "同花顺行业",
+    ) -> int:
+        """ths 接口入库（行业 + 概念两个子源共用）。
+
+        差异（与 dc 比）：
+            * 板块名字段名因接口而异：行业接口 ``industry``，概念接口 ``name``
+              （由 name_field 参数指定）
+            * 资金流仅 ``net_amount``（亿元，已是终值），无 elg/lg 细分
+            * ts_code 后缀 ``.TI``（同花顺指数），与 dc 的 ``.DC`` 共存
+            * src='ths'，idx_type 由调用方指定（"同花顺行业" / "同花顺概念"）
+        """
+        if not rows:
+            return 0
+        dim_payload: List[tuple] = []
+        seen: set[str] = set()
+        for r in rows:
+            ts_code = r.get("ts_code")
+            name = r.get(name_field)  # ⚠ 行业用 industry，概念用 name
+            if not ts_code or not name or ts_code in seen:
+                continue
+            seen.add(str(ts_code))
+            dim_payload.append(
+                (ts_code, name, idx_type, "ths", None, trade_date)
+            )
+
+        payload = []
+        for r in rows:
+            ts_code = r.get("ts_code")
+            if not ts_code:
+                continue
+            payload.append(
+                (
+                    trade_date,
+                    ts_code,
+                    _to_float(r.get("pct_change")),
+                    _to_float(r.get("net_amount")),  # ⚠ 已是亿元，无需除
+                    None,  # ths 无 elg
+                    None,  # ths 无 lg
+                    None,
+                    None,
+                    None,  # ths 无 rank
                     json.dumps(_strip_internal(r), ensure_ascii=False),
                 )
             )

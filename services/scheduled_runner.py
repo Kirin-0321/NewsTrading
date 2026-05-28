@@ -123,7 +123,7 @@ def run_task_sync(task: Dict) -> Dict:
             ms = MarketSummaryService().build(
                 trade_date=params.get("trade_date"),
                 mode=params.get("mode", "hybrid"),
-                top_sector_n=params.get("top_sector_n", 10),
+                top_sector_n=params.get("top_sector_n", 30),
                 force_refresh=params.get("force_refresh", False),
             )
             return {

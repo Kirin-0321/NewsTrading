@@ -1,11 +1,34 @@
 # .huiye/ 文档总索引
 
-> 辉夜的私有工作目录，按 [soul.md §记忆与文档归档](./soul.md) 收紧后**仅保留 4 类**：  
-> ① 角色规约 `soul.md` ② 文档总索引 `README.md`（本文件）  
+> 辉夜的私有工作目录，按 [huiye-persona.mdc §记忆与文档归档](../.cursor/rules/huiye-persona.mdc) 收紧后**仅保留 4 类**：  
+> ① 角色规约（正文已迁移至 [.cursor/rules/huiye-persona.mdc](../.cursor/rules/huiye-persona.mdc)，本目录 `soul.md` 仅作兼容跳板）  
+> ② 文档总索引 `README.md`（本文件）  
 > ③ `_` 前缀的临时草稿 / 调试快照 / 字段审计 ④ 跨多份正式文档的"汇总索引"  
 >  
-> **其余一切正式文档已迁入 `doc/{子目录}/`**（迁移日志见 [doc/updates/05-26-2126-工作目录文档迁移.md](../doc/updates/05-26-2126-工作目录文档迁移.md)）  
-> 最后更新: 2026-05-27 21:58（**题材页·板块走势 Tab 上线** 在「🎯 题材预测库」详情区「📊 打分明细」右边新增「📈 板块走势」Tab：选中题材 → 顶部 sparkline 折线图（QPainter 自绘、正红负绿、报告日橙竖线 + D+1~D+5 浅黄背景带）+ 底部 4 列明细表。新增 service `sector_daily_query.py` + CLI + widget `gui/widgets/sparkline.py`，无第三方依赖）
+> **其余一切正式文档已迁入 `doc/{子目录}/`**（首次迁移见 [05-26-2126-工作目录文档迁移.md](../doc/updates/05-26-2126-工作目录文档迁移.md) / 第二批 [05-28-1545-工作目录第二批迁移.md](../doc/updates/05-28-1545-工作目录第二批迁移.md)）  
+> 最后更新: 2026-05-28 15:50（**板块表字段扩充设计稿 v2 调研纠错**：主人提示"注意聚合表数据问题" → 辉夜深入调研发现 4 个陷阱：①当前 fetcher 用 `moneyflow_ind_dc`（资金流），主人想要的总市值/换手/涨跌家数在 `dc_index` 接口里**完全没拉** → 实际需新增 3 次 dc_index API（31→34/日）+ fact_sector_daily 加 3 列；②聚合表（白酒 ×6）只能取**中位代表板块的值**，SUM 让 up_num/total_mv 翻 6 倍变假数据；③同名跨源重复必然让 SUM 翻倍；④ths 源板块完全没这 4 字段，需要 dc fallback。设计稿 v2 新增 §3.4 数据陷阱专章 + 决策 5（ths fallback 三选一）+ Q7/8/9 防 AI 误读 + 工期估算 ~6h；等主人审 5 个决策点）  
+> 上一更新: 2026-05-28 15:45（**工作目录第二批迁移**：迁出 `_construction_backtest_v3_1.md` / `_施工_抽取保存GUI补全.md` 两份正式施工方案到 `doc/design/`；删除聚类工作 11 份一次性中间产物；同步 5 份 doc/ 外部引用方链接刷新；详见 [迁移日志](../doc/updates/05-28-1545-工作目录第二批迁移.md)）  
+> 上上更新: 2026-05-28 15:30（**盘后报告板块表 3 处 bug 修复 + 字段扩充内容文档 v1 起草**：①「笨蛋」→「领跌」表头 typo；②跌幅榜分隔符 9→8 列对齐；③全市场主力净流入 SQL 加 `idx_type='概念板块' AND src='dc'` 过滤，**-49730 亿 → -22115 亿**回到物理合理范围；test_daily_sync 8/8 全绿）  
+> 上上更新: 2026-05-28 15:03（**soul.md 升级为 Cursor 规则**：原 `.huiye/soul.md` 正文整体迁至 [.cursor/rules/huiye-persona.mdc](../.cursor/rules/huiye-persona.mdc)，`alwaysApply: true` 强制注入每次会话；`.huiye/soul.md` 改为兼容跳板）
+
+---
+
+## 🧠 项目运行环境约束（辉夜每次开局必读）
+
+> ⚠️ **本项目使用的 LLM 是 DeepSeek V4 Pro**，不是 32K / 128K 老模型，不要再按老模型的限制做保守切片或主动缩输出。
+
+| 项 | 配额 |
+|------|------|
+| 模型 | **DeepSeek V4 Pro** |
+| 上下文长度 | **1 M tokens** |
+| 最大单次输出 | **最高 384 K tokens** |
+
+**含义对照**：
+
+- 不需要把长 prompt / 长报告主动截短传给模型——1 M 上下文随便塞
+- 写一次性回测 / 评估 prompt 不需要分批：单次 384 K 输出足够整篇 markdown 报告 + 题材 JSON 一起出
+- 评审 / 重构时遇到大文件，**不要**找借口"上下文不够先省略"——读完整 + 改完整
+- 设计 backtest / streaming 时，超时阈值要按 384 K 输出的真实耗时给（几分钟级，不是几十秒）
 
 ---
 
@@ -25,12 +48,12 @@
 | [题材强度评分带符号化（v3）](../doc/updates/05-27-0949-题材强度评分带符号化.md) | strength_score 改为 -100~100 有符号；删除冗余 sentiment 字段；新增 利空/中性/利多 9 级映射 | 🟢 **已实施**（v3 内容已并入 v4 全部施工完成） |
 | [题材抽取保存与 GUI 补全设计（v3+v4 合并）](../doc/design/05-27-1003-题材抽取保存与GUI补全设计.md) | 技术细节版 — 抽取层 / 保存层 / 题材显示 GUI / 打分显示 GUI 全链路设计；含 12 个决策点表 + §10 第一轮 11 项遗漏 + §10·B 第二轮 10 项 N1~N10 | 🟢 **已实施**（按本文档施工 9 Step 全部完成） |
 | [⭐ 题材抽取打分完整流程·主人通读版](../doc/design/05-27-1025-题材抽取打分完整流程.md) | **给主人看** — 中文化无英文术语，7 阶段流程图 + 中英对照表 + Q&A + 数据库表全清单 + 施工里程碑；P1 已采纳"统一规范化" | 🟢 现行版，**v4 主链路已实施，等 plan M3 打分实施** |
-| [_施工_抽取保存 GUI 补全](_施工_抽取保存GUI补全.md) | 给辉夜看 — 12 个 Step 行号级 diff + §2.X review 补丁（P1~P11） + 测试用例 / 回滚 / 风险 | 🟢 **已实施完成**（待主人验收后可删；旧 _施工_题材强度带符号化.md 已删除） |
+| [题材抽取保存GUI补全施工方案](../doc/design/05-27-1022-题材抽取保存GUI补全施工方案.md) | 12 个 Step 行号级 diff + §2.X review 补丁（P1~P11） + 测试用例 / 回滚 / 风险 | 🟢 **已实施完成**（旧 _施工_题材强度带符号化.md 已删除） |
 | [tools/test_ai_sector_code_accuracy.py](../tools/test_ai_sector_code_accuracy.py) | AI 板块代码准确率回归测试（验证 A2 决策） — 首测 DeepSeek V4 Pro = 7.4%，未来模型升级时重跑 | 🟢 已上线，留作回归 |
 | **v4 配套回归 CLI**（边写边测落地）| `tools/test_matcher.py` / `test_theme_normalize.py` / `test_theme_schema_v4.py` / `test_theme_store_v4.py` / `test_scoring_scheduled_stub.py` | 🟢 50+ 用例全绿 |
 | [⭐ 模板回测功能·设计通读版](../doc/design/05-27-1140-模板回测功能设计.md) | **给主人看** — 两种回测形态对比（A 事后打分 / B 事前虚拟）+ 6 个决策点 + 一图流 + Q&A + 一期/二期里程碑 | 🟢 主人已决策 A+B 并行 + AI 评分员一期 |
 | [⭐ 三库表结构详细设计](../doc/design/05-27-1209-三库表结构详细设计.md) | **辉夜+主人共看** — news / market / ai_inference 三库 10 张表逐字段中文化（v3 新增），跨库 JOIN 模式 | 🟢 **Phase -1 已完整实施**，fact_sector_daily 复用现有 schema |
-| [⭐ 施工文档·模板回测功能 v3.1](_construction_backtest_v3_1.md) | **辉夜内部用** — 9 个 Phase 拆解 + 35+ 子任务 + 命名约定 + 风险登记 + 验收 checklist；总工期 5.5-6 天 ⚠️ 文件名用英文（中文名触发 Cursor Write bug） | 🟢 **Phase -1/0/1 已完成**（-1.7 NewsDB 类按"不过度设计"原则取消）；下一步 Phase 2 打分核心 |
+| [⭐ 模板回测功能施工方案 v3.1](../doc/design/05-27-1213-模板回测功能施工方案v3.1.md) | 9 个 Phase 拆解 + 35+ 子任务 + 命名约定 + 风险登记 + 验收 checklist；总工期 5.5-6 天 | 🟢 **Phase -1/0/1 已完成**（-1.7 NewsDB 类按"不过度设计"原则取消）；下一步 Phase 2 打分核心 |
 | **Phase -1 实装产物（2026-05-27 13:45）** | services/storage/ai_inference_db.py + ai_migrations/001 + cross_db.py + market/migrations/005 + tools/test_three_db.py（10 用例全绿） | 🟢 已交付 |
 | **Phase 0 实装产物（2026-05-27 13:50）** | tools/check_three_db_health.py（三库 schema 巡检，11 项检查全绿）+ main.py 启动卫兵集成 | 🟢 已交付 |
 | **Phase 1 实装产物（2026-05-27 14:00）** | services/market/{stock,sector}_daily_sync.py + trade_date.py 追加 next_trade_date/trade_dates_between + tools/sync_daily_market.py CLI + tools/test_daily_sync.py（7 用例 mock 全绿）+ scheduled_runner 接通两个调度桩 | 🟢 **已交付 + 真实端到端验证**：5/19-26 共 6 个交易日 / 33005 行 fact_stock_daily 已入库；fact_sector_daily 6 天命中幂等跳过 |
@@ -48,6 +71,11 @@
 | **⭐ 盘后数据「逐表幂等」缓存语义修订（2026-05-27 19:20）** | 修复主人发现的"按按钮 + 强制重拉后『全部个股 Tab』仍显示共 0 只"长期 bug；根因：双层早退（service 命中 market_summaries 直 return + fetcher 命中 fact_index_daily 跳 14 步）+ fact_stock_daily 根本不在 fetcher 14 个 step 清单（只能靠计划任务）。改造点：①FetchResult 加 force_refresh 字段 + 新增 _table_has_data/_purge_limit_stock helper ②删除 _has_index_data 一刀切早退 ③A 组 9 个 step 加表级自检（已有 → skipped 列表）④B 组 step 4 进入前 _purge_limit_stock（4 step 共写无 src 字段默认重拉，step 8 仅内存不参与）⑤新增 step 15 _fetch_stock_daily 复用 sync_stock_daily ⑥service.build() 缓存命中改 fall-through 跑 fetcher 自检补缺 ⑦summary.breadth 加 stock_daily_rows + schema.json 加权 ⑧_purge_trade_date 加 fact_stock_daily；[内容文档](../doc/design/05-27-1850-盘后数据逐表幂等缓存设计.md) / [施工方案](../doc/design/05-27-1900-盘后数据逐表幂等缓存施工方案.md) / [bugfix](../doc/bugfix/05-27-1920-逐表幂等缓存修复.md) | 🟢 已交付 + test_fetch_idempotent 4/4 + test_daily_sync 7/7 全绿，等主人 GUI 手测 |
 | **⭐ 手动回测任务队列并行（2026-05-27 21:30，**21:35 hotfix 默认 3→8**）** | 把手动回测从「一次一条」改为「连点 N 次排队 + 后台 **8** 并发 + 任务列表联动三大块」。新增 BacktestTaskManager（队列 + 调度 + 状态机 5 态 + `__init__` 可注入 max_concurrent）+ relay signals 治理跨线程 race；改造 ManualBacktestPage（中段横向 splitter「时间预览/任务列表」+ 11 个槽函数联动下方流式/md/题材）；删除策略只删 GUI 行不动 md/db。21:35 hotfix：主人实测 3 路顺畅要求"更多路"→ 默认从 3 提到 8（不动 UI）。[内容文档](../doc/design/05-27-2101-手动回测任务队列并行设计.md) / [施工方案](../doc/design/05-27-2110-手动回测任务队列并行施工方案.md) / [上线变更日志](../doc/updates/05-27-2130-手动回测任务队列上线.md) | 🟢 **已交付** + test_manual_backtest_queue 11/11 全绿（3 并发上限显式注入/FIFO/状态机/删除策略/shutdown/默认 8 全覆盖），GUI 头像构造烟测通过，待主人手测 |
 | **题材页·板块走势 Tab（2026-05-27 21:58）** | 在「🎯 题材预测库」详情区「📊 打分明细」右边新增「📈 板块走势」Tab：选中题材 → 顶部 sparkline 折线图（QPainter 自绘、正红负绿、报告日橙竖线 + D+1~D+5 浅黄背景带 + hover tooltip）+ 底部 4 列明细表（交易日 / 偏移 / 涨跌幅 / 主力净流入 / 当日排名，报告日行浅橙、评估窗口行浅黄染色）。新增 service `services/market/sector_daily_query.py` + CLI `tools/sector_daily_query.py` + widget `gui/widgets/sparkline.py`（无第三方依赖）；[功能说明](../doc/features/05-27-2158-题材页板块走势Tab.md) | 🟢 已交付 + CLI 烟测 31 行返回正常 + GUI 离屏构造冒烟 OK，待主人 GUI 手测 |
+| **评估页·报告树形展开（2026-05-28 10:48）** | 模板评估页下表 QTableWidget → **3 级 QTreeWidget**（📄 报告 → 🎯 题材 → 📈 标的），点 ▶ 逐级懒加载；13 列共享（同列 3 级语义对齐）；自定义 `_ReportTreeItem.__lt__` 实现"仅顶层排序、子级锁顺序"；「⚡ 打分/🗑 删除」按钮迁到报告父行尾列容器（节省 3 列）；CSV 导出加 `[报告级]/[题材级]/[标的级]` 三节。新增 2 个 service API（`get_theme_eval_for_report` + `get_stock_scores_for_theme`）+ CLI 2 个子模式（`--by theme_in_report/stocks_in_theme`）+ 4 个回归用例（17~20）。[内容文档](../doc/design/05-28-1015-评估页报告打分细节展开设计.md) / [施工方案](../doc/design/05-28-1032-评估页报告打分细节展开施工方案.md) / [上线日志](../doc/updates/05-28-1048-评估页报告树形展开上线.md) | 🟢 已交付 + 20/20 回归全绿 + GUI 离屏构造冒烟 OK + 真实数据懒加载链路全通（report=185 → 14 题材 → 6 标的），待主人 GUI 手测 |
+| **⭐ 题材打分逻辑 v2 改造（2026-05-28 11:45）** | 重构打分语义：①**数据层** fact_sector_daily 从单源 506 个 dc 概念扩展到 **5 源 1510 个板块**（dc 概念/行业/地域 + `moneyflow_ind_ths` 同花顺行业 + `moneyflow_cnt_ths` 同花顺概念）；30 天 backfill 28303 行 / 95 次 API ②**匹配层** matcher v2 加 `keywords/category/force/min_conf` 参数（默认 0.5→0.3）+ 同 conf dc 优先 ths；theme_store 落库前 `_ensure_sector_bound` 强制 fallback；存量 67 题材回填 **65/67 成功**（ths 概念新增后救回化肥/脑机接口/中东冲突 4 个 MISS）③**算法层** 三个 SQL 全改：题材级 D+N `stock_weighted_pct → sector_pct`；报告级 / 模板级 D+N `AVG(d) → SUM(d*\|strength\|)/SUM(\|strength\|)` 仅 strength>0；备份+清空+全量重打 30 天 447/433 题材 1280/1280 对全 OK ④**GUI 层** 评估页加 4 类角标 🐻 看空/⚪ 中性/⚠ 弱匹配 conf<0.5/🚫 字典无板块 + tooltip；CSV 加 sector_match_conf。[内容文档](../doc/design/05-28-1100-题材打分逻辑改造设计.md) / [施工方案](../doc/design/05-28-1115-题材打分逻辑改造施工方案.md) / [上线日志](../doc/updates/05-28-1145-题材打分逻辑改造上线.md) | 🟢 已交付 + test_scoring_eval 24/24（含新加 case_21~24 验证 v2 加权数学）+ test_daily_sync 8/8（含 case_06/08 适配 5 源）全绿，待主人 GUI 验收角标 |
+| **盘后页·全部板块 Tab 来源筛选（2026-05-28 11:55）** | 接 v2 改造的 5 源副作用——板块从 ~480 涨到 1489 一锅炖看不出门道。视图 ComboBox 从 2 项扩到 7 项：split / 全部 / 🔵 dc 概念 ~486 / 🔵 dc 行业 ~496 / 🔵 dc 地域 ~31 / 🟢 ths 行业 ~90 / 🟢 ths 概念 ~386；ComboBox 文案数字**按当日真实数据动态刷新**（不写死）；service `query_all_sectors` 加 `idx_type` 可选参数 + 新增 `query_sector_idx_type_counts` 返回当日 5 类命中行数；CLI `tools/query_all_sectors.py` 加 `--idx-type` 强校验 choices + `--counts` 子模式。[功能说明](../doc/features/05-28-1155-盘后页板块Tab来源筛选.md) | 🟢 已交付 + test_query_all 7/7（新加 case_06/07 验证多源筛选自洽）+ GUI 离屏冒烟通过（ComboBox 7 项 + `_mode_to_idx_type` 映射全对），待主人 GUI 手测 |
+| **盘后报告板块表 3 处 bug 修复 + 字段扩充设计 v2（2026-05-28 15:25/15:30/15:50）** | 主人查阅 20260527 报告发现 3 异常 → 紧急补丁 + 走双文档流程起草扩列。**P0 hotfix**：①「笨蛋」→「领跌」 typo；②跌幅榜分隔符对齐；③全市场主力净流入 SQL 限源 **-49730→-22115 亿**。**P1 设计稿 v1→v2 调研纠错**（15:50）：主人提示"注意聚合表数据"后辉夜深挖发现 4 个陷阱——①总市值/换手/涨跌家数 3 字段在 dc_index 接口（当前 fetcher 用的是 moneyflow_ind_dc），不是"零 API"而是 +3 次/日；②聚合表（白酒 ×6）只能取中位代表，SUM 让数值翻 6 倍变假；③同名跨源重复必然让 SUM 翻倍；④ths 源板块没这 4 字段需 dc fallback。新增 §3.4 数据陷阱专章 + 决策 5 + Q7/8/9 防 AI 误读 + 工期 ~6h。[bugfix](../doc/bugfix/05-28-1525-板块表3处修复.md) / [内容文档 v2·主人通读版](../doc/design/05-28-1530-盘后报告板块表字段扩充设计.md) | 🟢 P0 hotfix 已上线（test_daily_sync 8/8 / 重渲染 0 命中「笨蛋」）+ P1 内容文档 v2**待主人审 5 个决策点** |
+| **⭐ 板块语义聚类 + GUI 聚类视图 + split/Markdown 切换（2026-05-28 14:10/14:30 双扩充）** | 1510 个板块按【投资主题】两阶段 LLM 聚类（DeepSeek V4 Pro 单次拉满 384K）→ 1229 组 → merge-pass 826 组（平均 1.8 个/组）。① **数据层** 迁移 007 加 `dim_sector_group` 表 + `dim_sector.group_id`（软引用）② **服务层** `sector_grouping.py` 完整 CLI（cluster/merge-pass/apply/reset/stats/merge/split/export-md/dump-llm-input）+ `query_grouped_sectors_with_members` 嵌套查询（下中位 (n+1)/2 + 未聚类自成一组）③ **GUI grouped 视图** 加「🎯 聚类后 ~815 组」`QStackedWidget idx=2 = QTreeWidget`：顶层=组名 ×N + 中位涨幅 + 中位主力，子级=组内全部成员（中位代表 ★ + 斜体），搜索框对组名/成员名/ts_code 三种命中均生效 ④ **14:30 扩充**：`_read_sectors_top/_bottom` 重写走 `query_grouped_sectors_for_date`，`build()` 默认 `top_sector_n=10→30` + bottom 调用点 `10→15`，删除 v2 残留 60 行 SQL；renderer 加「成员」列 ×N + 标题改「涨幅 Top 30（聚类后）」；GUI split 分支去掉 helper 直接读 summary；leaders 匹配 key 改 `group_name or sector_name` 命中率 ~10%→~40%；sector_tree 第 0 列宽 32→64 + setIndentation(14) 修序号被展开三角挤掉的 bug；test_query_all 加 case_10b（11/11 全绿）⑤ **端到端验证**：hybrid 跑 5/27 数据「白酒 ×6 / 电力 ×4 / 影视院线 ×4 / 煤炭开采加工 ×4 / 医美概念 ×5 / 饮料制造 ×2 / 贵金属 ×4」全部 1 行替代多行 + leaders 命中如「电力」首次出现 3 只龙头；catalysts 命中率 ~30%→~70%。[上线日志](../doc/updates/05-28-1410-板块聚类与GUI聚类视图上线.md) | 🟢 已交付 + 11/11 回归绿 + 端到端 force_refresh hybrid 验证 OK |
 | [CLI 评估回测 / Agent 优化初步设计](../doc/design/05-26-2126-CLI评估回测Agent优化初步设计.md) | **候选 #2（重头）** — 把 30 天历史盘后数据用起来跑虚拟回测 | 🟡 设计已完成，**待主人决定是否开工** |
 
 ---
@@ -63,7 +91,7 @@
 |------|----------|----------|
 | [盘后数据自动化-功能说明](../doc/features/05-26-2126-盘后数据自动化功能说明.md) | **主人** — 用主人的语言讲"做了什么、为什么、长什么样" | 🟢 现行版，**已实装** |
 | [盘后数据自动化-施工方案](../doc/design/05-26-2126-盘后数据自动化施工方案.md) | 辉夜自己 — 14 张表、6 个 Phase、文件清单、§17 调用链速查 | 🟡 现行版，**M1~M5 ☑ / M0 部分 ☑**，已于 §18.1 标注真实状态 |
-| [_tushare_field_audit.md](./_tushare_field_audit.md) | 辉夜自己 — Tushare 各接口的实测字段 / 单位 / 边界 | 🟢 永久参考（字段层依据，符合白名单第 ③ 类） |
+| [_tushare_field_audit.md](./_tushare_field_audit.md) | 辉夜自己 — Tushare 各接口的实测字段 / 单位 / 边界 | 🟢 永久参考（字段层依据，符合白名单第 ③ 类）；**2026-05-28 修订**：纠正 `dc_index.level` 误判，补 §3.3·A 东财行业 3 级层级 + 31 个一级行业全名单 |
 
 历史归档（已被现行版取代）：
 
@@ -79,7 +107,7 @@
 |------|------|
 | [NewsTrading 架构方案](../doc/design/05-26-2126-NewsTrading架构方案.md) | 三段式流水线（crawl → clean → analyze）+ 模型分流（§13）+ 题材预测库（§14）+ 盘后数据模块（§15） |
 | [CLI 使用文档](../doc/guides/05-26-2126-CLI使用文档.md) | 12 个 `tools/*.py` 命令行入口的速查 — 用途、参数、示例、退出码、典型工作流 |
-| [soul.md](./soul.md) | 辉夜与主人协作的规约（角色 / 工作流 / 文档归档边界） |
+| [.cursor/rules/huiye-persona.mdc](../.cursor/rules/huiye-persona.mdc) | 辉夜与主人协作的规约（角色 / 工作流 / 文档归档边界）— 已升级为 Cursor 规则，`alwaysApply: true`；`.huiye/soul.md` 仅作旧链接兼容跳板 |
 
 ---
 
@@ -98,7 +126,7 @@
 
 ### `.huiye/` 内（白名单）
 
-- `soul.md` / `README.md` — 固定文件名
+- `soul.md` / `README.md` — 固定文件名（`soul.md` 正文已迁至 `.cursor/rules/huiye-persona.mdc`，本目录文件仅作兼容跳板）
 - `_xxx.md`（下划线前缀）— 临时 / 快照 / 调试参考 / 字段审计
 
 ### `doc/` 内（按 [doc/文档分类规范.md](../doc/文档分类规范.md)）
@@ -107,7 +135,7 @@
 - 分类靠目录（`design/` / `features/` / `guides/` / `reports/` / `updates/` / `bugfix/` / `其他/`）
 - 文件名**不写**类型前缀（如不要 `design-xxx.md`）
 
-> ⚠️ 自 2026-05-26 22:00 起 [soul.md §记忆与文档归档](./soul.md) 已收紧 `.huiye/` 白名单。  
+> ⚠️ 自 2026-05-26 22:00 起 [huiye-persona.mdc §记忆与文档归档](../.cursor/rules/huiye-persona.mdc) 已收紧 `.huiye/` 白名单。  
 > 新增文档若不符合 4 类白名单 → 直接去 `doc/{子目录}/`；不确定时找主人确认，不要往 `.huiye/` 塞。
 
 ---

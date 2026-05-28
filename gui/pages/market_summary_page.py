@@ -581,10 +581,22 @@ class MarketSummaryPage(QWidget):
         ("龙头股 Top3", 320),
         ("催化（cls/ai）", 320),
     ]
-    # 板块视图模式：(显示文案, mode key)
+    # 板块视图模式：(显示文案模板, mode key, idx_type 筛选值或 None)
+    # 文案中的 ``{n}`` 会在 ``_refresh_sector_mode_labels`` 里动态替换为
+    # 当日 fact_sector_daily 真实命中行数（每天可能微变）。
+    # mode 取值约定：
+    #   split    → 上下分屏 Top20/Bottom10（不分来源）
+    #   all      → 单表全部源合并
+    #   src_*    → 单表按 idx_type 筛选（dc 三类 + ths 两类）
     _SECTOR_MODES = [
-        ("📈 涨幅 Top 20 + 📉 跌幅 Top 10", "split"),
-        ("📋 全部 ~480 个", "all"),
+        ("📈 涨幅 Top 30 + 📉 跌幅 Top 15（聚类）", "split", None),
+        ("🎯 聚类后 ~{n} 组（点击展开成员）", "grouped", None),
+        ("📋 全部 ~{n} 个", "all", None),
+        ("🔵 dc 概念 ~{n} 个", "src_dc_concept", "概念板块"),
+        ("🔵 dc 行业 ~{n} 个", "src_dc_industry", "行业板块"),
+        ("🔵 dc 地域 ~{n} 个", "src_dc_region", "地域板块"),
+        ("🟢 ths 行业 ~{n} 个", "src_ths_industry", "同花顺行业"),
+        ("🟢 ths 概念 ~{n} 个", "src_ths_concept", "同花顺概念"),
     ]
     # high_risk 行背景色（pct_chg_5d 阈值由 GUI 自算 — 后端 high_risk 当前永远 None）
     _RISK_HIGH_BG = QColor("#FFEBEE")    # 浅红：5 日累涨 > 15%
@@ -601,9 +613,12 @@ class MarketSummaryPage(QWidget):
         toolbar.setSpacing(8)
         toolbar.addWidget(QLabel("视图:"))
         self.sector_mode_combo = QComboBox()
-        for label, mode in self._SECTOR_MODES:
-            self.sector_mode_combo.addItem(label, mode)
+        # 初始化时占位文案（{n} 暂用 0），实际数量在 _refresh_sector_mode_labels
+        # 里加载日期后更新
+        for label_tpl, mode, _idx in self._SECTOR_MODES:
+            self.sector_mode_combo.addItem(label_tpl.replace("{n}", "—"), mode)
         self.sector_mode_combo.setStyleSheet(COMBOBOX_STYLE)
+        self.sector_mode_combo.setMinimumWidth(220)
         self.sector_mode_combo.currentIndexChanged.connect(
             self._on_sector_mode_changed
         )
@@ -611,7 +626,7 @@ class MarketSummaryPage(QWidget):
 
         toolbar.addWidget(QLabel("搜索:"))
         self.sector_search = QLineEdit()
-        self.sector_search.setPlaceholderText("板块名…")
+        self.sector_search.setPlaceholderText("板块名 / 代码…")
         self.sector_search.setMaximumWidth(180)
         self.sector_search.textChanged.connect(
             self._on_sector_search_changed
@@ -650,17 +665,18 @@ class MarketSummaryPage(QWidget):
         split_layout.setContentsMargins(0, 0, 0, 0)
         splitter = QSplitter(Qt.Vertical)
 
-        top_group = QGroupBox("📈 涨幅 Top 20")
-        tg = QVBoxLayout(top_group)
+        # 标题在 _populate_sectors 里按实际行数动态刷新（split 模式下）
+        self.sector_top_group = QGroupBox("📈 涨幅 Top（聚类）")
+        tg = QVBoxLayout(self.sector_top_group)
         self.sector_table = self._make_basic_table(self._SECTOR_COLS)
         tg.addWidget(self.sector_table)
-        splitter.addWidget(top_group)
+        splitter.addWidget(self.sector_top_group)
 
-        bot_group = QGroupBox("📉 跌幅 Top 10")
-        bg = QVBoxLayout(bot_group)
+        self.sector_bot_group = QGroupBox("📉 跌幅 Top（聚类）")
+        bg = QVBoxLayout(self.sector_bot_group)
         self.sector_table_bottom = self._make_basic_table(self._SECTOR_COLS)
         bg.addWidget(self.sector_table_bottom)
-        splitter.addWidget(bot_group)
+        splitter.addWidget(self.sector_bot_group)
 
         splitter.setStretchFactor(0, 2)
         splitter.setStretchFactor(1, 1)
@@ -670,6 +686,26 @@ class MarketSummaryPage(QWidget):
         # ---- View 1: all ----
         self.sector_table_all = self._make_basic_table(self._SECTOR_COLS)
         self.sector_view_stack.addWidget(self.sector_table_all)  # idx=1
+
+        # ---- View 2: grouped (QTreeWidget，顶层=组，子级=成员) ----
+        self.sector_tree = QTreeWidget()
+        self.sector_tree.setColumnCount(len(self._SECTOR_COLS))
+        self.sector_tree.setHeaderLabels(
+            [c[0] for c in self._SECTOR_COLS]
+        )
+        for i, (_, w) in enumerate(self._SECTOR_COLS):
+            # 第 0 列（#）扩到 64：默认 32 + 展开三角(~16) + indent(12) 会
+            # 把 2 位序号挤掉；同时缩小 indentation 让子级更紧凑
+            self.sector_tree.setColumnWidth(i, 64 if i == 0 else w)
+        self.sector_tree.setIndentation(14)
+        self.sector_tree.setAlternatingRowColors(True)
+        self.sector_tree.setRootIsDecorated(True)
+        self.sector_tree.setUniformRowHeights(True)
+        self.sector_tree.setStyleSheet(TABLE_STYLE)
+        header = self.sector_tree.header()
+        if header is not None:
+            header.setStretchLastSection(True)
+        self.sector_view_stack.addWidget(self.sector_tree)  # idx=2
 
         layout.addWidget(self.sector_view_stack, 1)
         return wrap
@@ -1230,66 +1266,102 @@ class MarketSummaryPage(QWidget):
             self.meta_conflicts_label.setStyleSheet("color:#52C41A;")
 
     def _populate_sectors(self, summary: Dict[str, Any]) -> None:
-        """按当前视图模式（split / all）填充板块表。
+        """按当前视图模式填充板块表。
 
-        两种模式::
+        模式分发::
 
-            split → QStackedWidget idx=0：上 Top 20（合后端 catalysts）+ 下 Bottom 10
-            all   → QStackedWidget idx=1：单表 ~480 行；后端 Top 10 的催化按
-                    ts_code 自动注入到 all 列表里对应行（保证视觉一致）
+            split            → QStackedWidget idx=0：上 Top 20 + 下 Bottom 10
+            all              → idx=1：单表全部 5 源合并 ~1489 行
+            src_dc_concept   → idx=1：仅 dc 概念板块 ~486 行
+            src_dc_industry  → idx=1：仅 dc 行业板块 ~496 行
+            src_dc_region    → idx=1：idx=1：仅 dc 地域板块 ~31 行
+            src_ths_industry → idx=1：仅 ths 同花顺行业 ~90 行
+            src_ths_concept  → idx=1：仅 ths 同花顺概念 ~386 行
+
+        所有 single-table 模式（all + src_*）共用同一张 sector_table_all，
+        只是 query_all_sectors 时按 idx_type 过滤；后端 sectors_top 的 cls/ai
+        催化按 ts_code 注入到匹配的行（保证 dc 概念视图能继承 Top 10 催化）。
         """
-        from gui.utils.market_db_helper import (
-            query_all_sectors,
-            query_sectors_extended,
-        )
+        from gui.utils.market_db_helper import query_all_sectors
 
-        backend_top = summary.get("sectors_top") or []  # 后端 Top 10，含 cls/ai
+        # 后端 v3 聚类版：Top 30（含 cls/ai catalysts）+ Bottom 15
+        backend_top = summary.get("sectors_top") or []
         td = (
             (summary.get("meta") or {}).get("trade_date")
             or self._current_trade_date
             or ""
         )
+        # 当日 idx_type 数量分布：用于动态刷新 ComboBox label + count
+        self._refresh_sector_mode_labels(td)
+
         mode = (
             self.sector_mode_combo.currentData()
             if hasattr(self, "sector_mode_combo") else "split"
         )
 
+        if mode == "grouped":
+            # 聚类后视图：QTreeWidget，顶层 = 组（中位涨幅），子级 = 成员明细
+            from gui.utils.market_db_helper import (
+                query_grouped_sectors_tree,
+            )
+            self.sector_view_stack.setCurrentIndex(2)
+            tree_rows = query_grouped_sectors_tree(td) if td else []
+            self._fill_sector_tree(self.sector_tree, tree_rows, td)
+            if hasattr(self, "sector_count_label"):
+                total_members = sum(
+                    g["cnt_in_data"] for g in tree_rows
+                )
+                self.sector_count_label.setText(
+                    f"[聚类] {len(tree_rows)} 组 / 含 {total_members} 个板块"
+                )
+            self._apply_sector_search_filter()
+            return
+
         if mode == "split":
             self.sector_view_stack.setCurrentIndex(0)
 
-            ext = (
-                query_sectors_extended(td, top_n=20, bottom_n=10)
-                if td else {"top": [], "bottom": []}
+            # v3 聚类版：summary 已含 Top 30 + Bottom 15 聚类后数据
+            # （含 group_name/members_count/leaders/catalysts 全套）
+            backend_bottom = list(
+                (summary or {}).get("sectors_bottom") or []
             )
-            # Top 20 = 后端 sectors_top（含 cls/ai catalysts）+ helper 补 11~20
-            existing = {
-                s.get("ts_code") for s in backend_top if s.get("ts_code")
-            }
-            extras = [
-                s for s in ext["top"]
-                if s.get("ts_code") and s.get("ts_code") not in existing
-            ]
-            top20 = (list(backend_top) + extras)[:20]
-            for i, s in enumerate(top20, 1):
+            top_rows = list(backend_top)
+            for i, s in enumerate(top_rows, 1):
+                s["rank"] = i
+            bottom_rows = backend_bottom
+            for i, s in enumerate(bottom_rows, 1):
                 s["rank"] = i
 
-            bottom10 = list(ext["bottom"])
-            for i, s in enumerate(bottom10, 1):
-                s["rank"] = i
+            self._fill_sector_table(self.sector_table, top_rows, td)
+            self._fill_sector_table(self.sector_table_bottom, bottom_rows, td)
 
-            self._fill_sector_table(self.sector_table, top20, td)
-            self._fill_sector_table(self.sector_table_bottom, bottom10, td)
-
+            # 表头按实际数据行数动态刷新（之前写死 Top 20 / Bottom 10
+            # 给主人造成"还是 20"的错觉）
+            if hasattr(self, "sector_top_group"):
+                self.sector_top_group.setTitle(
+                    f"📈 涨幅 Top {len(top_rows)}（聚类）"
+                )
+            if hasattr(self, "sector_bot_group"):
+                self.sector_bot_group.setTitle(
+                    f"📉 跌幅 Top {len(bottom_rows)}（聚类）"
+                )
             if hasattr(self, "sector_count_label"):
                 self.sector_count_label.setText(
-                    f"Top {len(top20)} + Bottom {len(bottom10)}"
+                    f"Top {len(top_rows)} + Bottom {len(bottom_rows)}（聚类版）"
                 )
-        else:  # all
+        else:
+            # all + src_* 五个分来源模式共用 single-table 视图
             self.sector_view_stack.setCurrentIndex(1)
 
-            rows = query_all_sectors(td) if td else []
-            # 把后端 Top 10 的 catalysts/catalysts_source 按 ts_code 注入对应行，
-            # 修复主人发现的"全部模式催化全空"问题
+            # 解析 mode → idx_type 过滤值
+            idx_type_filter = self._mode_to_idx_type(mode)
+
+            rows = (
+                query_all_sectors(td, idx_type=idx_type_filter)
+                if td else []
+            )
+            # 后端 Top 10 的 cls/ai 催化按 ts_code 注入（修主人发现的
+            # "全部模式催化全空"问题；分来源视图同样受益）
             cat_map = {
                 s.get("ts_code"): s
                 for s in backend_top
@@ -1310,9 +1382,71 @@ class MarketSummaryPage(QWidget):
             self._fill_sector_table(self.sector_table_all, rows, td)
 
             if hasattr(self, "sector_count_label"):
-                self.sector_count_label.setText(f"共 {len(rows)} 个")
+                tag = self._mode_short_tag(mode)
+                self.sector_count_label.setText(
+                    f"{tag}共 {len(rows)} 个"
+                )
 
         self._apply_sector_search_filter()
+
+    @classmethod
+    def _mode_to_idx_type(cls, mode: str) -> Optional[str]:
+        """mode key → ``dim_sector.idx_type`` 过滤值（None=不筛选）。
+
+        非 src_* 模式（split / all）一律返回 None。
+        """
+        for _label, m, idx_type in cls._SECTOR_MODES:
+            if m == mode:
+                return idx_type
+        return None
+
+    @classmethod
+    def _mode_short_tag(cls, mode: str) -> str:
+        """mode key → count_label 前缀短标签，如 "[dc 概念] "。"""
+        if mode == "all" or mode == "split":
+            return ""
+        for label_tpl, m, _idx in cls._SECTOR_MODES:
+            if m == mode:
+                # 取文案前的图标+前缀，去掉 " ~{n} 个"
+                short = label_tpl.split(" ~{n}", 1)[0]
+                return f"[{short}] "
+        return ""
+
+    def _refresh_sector_mode_labels(self, trade_date: str) -> None:
+        """按当日 ``idx_type`` 实际命中数量刷新 ComboBox 各项的显示文案。
+
+        无数据日（周末 / 假期 / 字段缺失）所有 src_* 项显示 "~0 个"，
+        切换到对应模式仍会安全返回空表。
+        """
+        if not hasattr(self, "sector_mode_combo"):
+            return
+        try:
+            from gui.utils.market_db_helper import (
+                query_grouped_sectors_count,
+                query_sector_idx_type_counts,
+            )
+            counts = (
+                query_sector_idx_type_counts(trade_date) if trade_date else {}
+            )
+            grouped_n = (
+                query_grouped_sectors_count(trade_date) if trade_date else 0
+            )
+        except Exception:  # noqa: BLE001
+            counts = {}
+            grouped_n = 0
+
+        total = sum(counts.values())
+        for i, (label_tpl, mode, idx_type) in enumerate(self._SECTOR_MODES):
+            if mode == "split":
+                continue  # split 文案无 {n}
+            if mode == "grouped":
+                n = grouped_n
+            elif mode == "all":
+                n = total
+            else:
+                n = counts.get(idx_type or "", 0)
+            new_label = label_tpl.replace("{n}", str(n))
+            self.sector_mode_combo.setItemText(i, new_label)
 
     def _on_sector_mode_changed(self, _idx: int) -> None:
         """视图 ComboBox 切换 → 重渲染当前 summary。"""
@@ -1326,6 +1460,11 @@ class MarketSummaryPage(QWidget):
     def _apply_sector_search_filter(self) -> None:
         """按 sector_search 文本隐藏不匹配行（板块名 col=1）。
 
+        匹配范围::
+
+            显示文本（板块名 [代码]）+ col=1 的 Qt.UserRole（ts_code）
+            两路任一命中即保留行；空 kw 时全显示
+
         视图感知::
 
             split 模式 → 同时过滤 sector_table（Top 20）+ sector_table_bottom
@@ -1338,6 +1477,9 @@ class MarketSummaryPage(QWidget):
             self.sector_mode_combo.currentData()
             if hasattr(self, "sector_mode_combo") else "split"
         )
+        if mode == "grouped":
+            self._filter_sector_tree(kw)
+            return
         if mode == "split":
             tables = [self.sector_table, self.sector_table_bottom]
         else:
@@ -1350,7 +1492,46 @@ class MarketSummaryPage(QWidget):
                     continue
                 item = table.item(row, 1)
                 text = item.text().lower() if item else ""
-                table.setRowHidden(row, kw not in text)
+                code = ""
+                if item is not None:
+                    raw = item.data(Qt.UserRole)
+                    code = str(raw).lower() if raw else ""
+                hit = (kw in text) or (bool(code) and kw in code)
+                table.setRowHidden(row, not hit)
+
+    def _filter_sector_tree(self, kw: str) -> None:
+        """聚类视图搜索：组名命中 → 整组显示；
+        否则若任意成员命中 → 仅显示组 + 命中成员；都不中 → 隐藏整组。
+        """
+        if not hasattr(self, "sector_tree"):
+            return
+        tree = self.sector_tree
+        for i in range(tree.topLevelItemCount()):
+            top = tree.topLevelItem(i)
+            if top is None:
+                continue
+            top_text = top.text(1).lower()
+            top_ts = (top.data(1, Qt.UserRole) or "")
+            top_ts = str(top_ts).lower()
+            top_hit = bool(kw) and (kw in top_text or kw in top_ts)
+
+            child_any = False
+            for j in range(top.childCount()):
+                child = top.child(j)
+                if child is None:
+                    continue
+                ct = child.text(1).lower()
+                cts = str(child.data(1, Qt.UserRole) or "").lower()
+                hit = (not kw) or top_hit or (kw in ct) or (kw in cts)
+                child.setHidden(not hit)
+                child_any = child_any or hit
+
+            if not kw:
+                top.setHidden(False)
+            elif top_hit:
+                top.setHidden(False)
+            else:
+                top.setHidden(not child_any)
 
     def _fill_sector_table(
         self,
@@ -1376,11 +1557,19 @@ class MarketSummaryPage(QWidget):
             name = str(s.get("name") or "")
             ts_code = str(s.get("ts_code") or "")
             main_net = s.get("main_net_yi")
+            # v3 聚类版字段（旧 GUI 数据来源不会有这些字段，回退原渲染）
+            mc = s.get("members_count")
+            group_name = s.get("group_name")
+            sector_name = s.get("sector_name") or name
 
-            name_cell = (
-                f"{name} [{ts_code}]" if name and ts_code else
-                name or ts_code or "—"
-            )
+            if mc and mc > 1:
+                # 聚类组：显示「组名 ×N」+ tooltip 给中位代表
+                name_cell = f"{name} ×{mc}"
+            else:
+                name_cell = (
+                    f"{name} [{ts_code}]" if name and ts_code else
+                    name or ts_code or "—"
+                )
             leaders_text = self._format_sector_leaders(
                 name, trade_date, fallback=s.get("leaders") or []
             )
@@ -1403,8 +1592,19 @@ class MarketSummaryPage(QWidget):
                 if risk_bg is not None:
                     item.setBackground(QBrush(risk_bg))
 
-                if col == 1 and risk_tip:
-                    item.setToolTip(risk_tip)
+                if col == 1:
+                    item.setData(Qt.UserRole, ts_code)
+                    tooltips = []
+                    if risk_tip:
+                        tooltips.append(risk_tip)
+                    if mc and mc > 1:
+                        tooltips.append(
+                            f"聚类组：{group_name or name}（{mc} 个成员）\n"
+                            f"中位代表板块：{sector_name} [{ts_code}]\n"
+                            f"涨幅取下中位（lower_median）"
+                        )
+                    if tooltips:
+                        item.setToolTip("\n\n".join(tooltips))
 
                 if col == 2:
                     c = _pct_color(pct)
@@ -1445,6 +1645,174 @@ class MarketSummaryPage(QWidget):
                         item.setForeground(_COLOR_MUTED)
                         item.setToolTip("未命中：raw_news 中也找不到证据")
                 table.setItem(row, col, item)
+
+    def _fill_sector_tree(
+        self,
+        tree: QTreeWidget,
+        groups: list,
+        trade_date: str,
+    ) -> None:
+        """聚类后视图填充 QTreeWidget。
+
+        顶层 = 组聚合行（涨幅/主力 = 下中位代表板块的值，名字 = 组名）
+        子级 = 组内全部当日有数据成员（含中位代表自身，标 ★）
+
+        列对齐 ``_SECTOR_COLS``::
+
+            # | 板块（代码） | 涨幅 | 5日 | 涨停 | 主力(亿) | 龙头股 Top3 | 催化
+
+        组聚合行：
+          * 第 1 列：序号
+          * 第 2 列：组名 ×N（聚合显示）；保存 group_name 到 UserRole
+          * 第 3 列：中位涨幅；颜色按涨跌染
+          * 第 4 列：中位 5 日涨幅
+          * 第 5 列：当日组员数（×N，作"涨停"位置占位）
+          * 第 6 列：中位主力(亿)
+          * 第 7 列：龙头股 (取中位代表板块的)
+          * 第 8 列：催化（暂留空）
+
+        子级行：每个成员（ts_code + 原始 name）显示自己的涨幅/主力。
+        """
+        tree.clear()
+        if not groups:
+            return
+
+        for i, g in enumerate(groups, 1):
+            cnt = int(g.get("cnt_in_data") or 0)
+            display = str(g.get("display_name") or "")
+            median_pct = g.get("median_pct_chg")
+            median_5d = g.get("median_pct_chg_5d")
+            median_main = g.get("median_main_net_yi")
+            median_ts = str(g.get("median_ts_code") or "")
+            median_sector = str(g.get("median_sector_name") or "")
+            is_unclassified = g.get("group_name") is None
+
+            top_name = (
+                f"{display} ×{cnt}"
+                if cnt > 1
+                else f"{display} [{median_ts}]"
+            )
+
+            top_leaders = self._format_sector_leaders(
+                median_sector, trade_date,
+                fallback=[],
+            )
+
+            top_cells = [
+                str(i),
+                top_name,
+                _fmt_pct(median_pct),
+                _fmt_pct(median_5d),
+                f"×{cnt}" if cnt > 1 else "—",
+                _fmt_num(median_main),
+                top_leaders,
+                "—",
+            ]
+            top_item = QTreeWidgetItem(top_cells)
+            top_item.setData(1, Qt.UserRole, median_ts)
+
+            # 第二列加粗（聚合主信息）+ tooltip 显示中位代表
+            f_bold = QFont()
+            f_bold.setBold(True)
+            top_item.setFont(1, f_bold)
+            top_item.setToolTip(
+                1,
+                (
+                    f"组员数（当日有数据）= {cnt}\n"
+                    f"中位代表板块 = {median_sector} [{median_ts}]\n"
+                    f"中位定义 = lower_median（"
+                    f"ASC 排序后第 (n+1)/2 项）"
+                    + ("\n\n⚠ 该板块未聚类，自成一组" if is_unclassified else "")
+                ),
+            )
+
+            # 涨幅列染色
+            c_pct = _pct_color(median_pct)
+            if c_pct is not None:
+                top_item.setForeground(2, c_pct)
+                top_item.setFont(2, f_bold)
+            c_5d = _pct_color(median_5d)
+            if c_5d is not None:
+                top_item.setForeground(3, c_5d)
+
+            # 主力(亿)列染色
+            if median_main is not None:
+                try:
+                    f_val = float(median_main)
+                    top_item.setForeground(
+                        5,
+                        _COLOR_RED if f_val > 0 else
+                        _COLOR_GREEN if f_val < 0 else _COLOR_MUTED,
+                    )
+                except (TypeError, ValueError):
+                    pass
+
+            # 子级 = 全部成员（仅当 ×>1 时展示，单成员组无需展开）
+            if cnt > 1:
+                for m in (g.get("members") or []):
+                    m_pct = m.get("pct_chg")
+                    m_5d = m.get("pct_chg_5d")
+                    m_main = m.get("main_net_yi")
+                    m_ts = str(m.get("ts_code") or "")
+                    m_name = str(m.get("sector_name") or "")
+                    is_med = bool(m.get("is_median"))
+
+                    name_cell = (
+                        f"{'★ ' if is_med else '  '}{m_name} [{m_ts}]"
+                    )
+                    src_tag = (
+                        f"({m.get('idx_type', '')}/{m.get('src', '')})"
+                    )
+
+                    child_cells = [
+                        "",
+                        name_cell,
+                        _fmt_pct(m_pct),
+                        _fmt_pct(m_5d),
+                        "—",
+                        _fmt_num(m_main),
+                        "—",
+                        src_tag,
+                    ]
+                    child = QTreeWidgetItem(child_cells)
+                    child.setData(1, Qt.UserRole, m_ts)
+                    child.setToolTip(
+                        1,
+                        (
+                            f"原始名: {m_name}\nts_code: {m_ts}\n"
+                            f"来源: {m.get('idx_type', '')} / {m.get('src', '')}"
+                            + ("\n★ 中位代表（聚合行用此值）"
+                               if is_med else "")
+                        ),
+                    )
+
+                    # 涨幅 / 主力同样染色
+                    cc_pct = _pct_color(m_pct)
+                    if cc_pct is not None:
+                        child.setForeground(2, cc_pct)
+                    cc_5d = _pct_color(m_5d)
+                    if cc_5d is not None:
+                        child.setForeground(3, cc_5d)
+                    if m_main is not None:
+                        try:
+                            f_val = float(m_main)
+                            child.setForeground(
+                                5,
+                                _COLOR_RED if f_val > 0 else
+                                _COLOR_GREEN if f_val < 0 else _COLOR_MUTED,
+                            )
+                        except (TypeError, ValueError):
+                            pass
+
+                    # 中位行轻微高亮（第 2 列字体描边）
+                    if is_med:
+                        f_med = QFont()
+                        f_med.setItalic(True)
+                        child.setFont(1, f_med)
+
+                    top_item.addChild(child)
+
+            tree.addTopLevelItem(top_item)
 
     # ------------------------------------------------------------------
     # 全部个股：填充 / 搜索

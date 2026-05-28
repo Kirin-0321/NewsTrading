@@ -1,4 +1,4 @@
-"""模板/报告评估查询回归测试（16 用例，纯本地 SQLite，0 LLM 0 网络）。
+"""模板/报告评估查询回归测试（24 用例，纯本地 SQLite，0 LLM 0 网络）。
 
 覆盖
 ----
@@ -18,6 +18,14 @@
 14. delete_report(backtest)：级联删 theme_predictions / scores / md 文件
 15. delete_report(real, allow_real=False) → PermissionError 拒绝
 16. delete_report(dry_run=True) → 不动 db / md，但统计预估正确
+17. get_theme_eval_for_report：报告下题材级聚合（含 D+1~D+5 透视）
+18. get_theme_eval_for_report：未打分的报告返回 stocks_count 但 d* 全 None
+19. get_stock_scores_for_theme：题材下标的级 D+N 涨跌 + 命中标记透视
+20. get_stock_scores_for_theme：题材无标的 → 空列表（不抛错）
+21. **v2** 题材级 D+1 来自 sector_pct（不是 stock_weighted_pct）
+22. **v2** 报告级 d1_avg 按 |strength_score| 加权（仅看多）
+23. **v2** 模板级 d1_avg 同样按 |strength_score| 加权
+24. **v2** 全部 strength≤0 时 d1_avg = NULL（NULLIF 兜底）
 
 数据隔离
 --------
@@ -78,6 +86,21 @@ def _cleanup() -> None:
     from services.storage.database import get_project_root
     ai = get_ai_inference_db()
     with ai.connect() as conn:
+        # 先清子表（无 prompt_id 的标的层走 theme_id 关联）
+        conn.execute(
+            "DELETE FROM theme_stock_scores "
+            "WHERE theme_id IN ("
+            "  SELECT id FROM theme_predictions "
+            "  WHERE prompt_id LIKE 'TEST_EV_%'"
+            ")"
+        )
+        conn.execute(
+            "DELETE FROM theme_stocks "
+            "WHERE theme_id IN ("
+            "  SELECT id FROM theme_predictions "
+            "  WHERE prompt_id LIKE 'TEST_EV_%'"
+            ")"
+        )
         conn.execute(
             "DELETE FROM theme_prediction_scores "
             "WHERE prompt_id LIKE 'TEST_EV_%'"
@@ -200,6 +223,45 @@ def _seed_dataset() -> None:
                             now_iso,
                         ),
                     )
+
+                # R1 的第一个题材（T1）补 3 只 theme_stocks + 标的级打分，
+                # 给 case_17/19 用。其余 theme 不动（保持原 18 score 用例兼容）。
+                if idx == 1 and j == 0:
+                    stock_seed = [
+                        # (name, code, normalized, role, [(d_off, pct, hit)])
+                        ("TS_A", "600001", "600001.SH", "核心",
+                         [(1, 5.0, 1), (3, 2.0, 0), (5, 8.0, 1)]),
+                        ("TS_B", "600002", "600002.SH", "辐射",
+                         [(1, -1.0, 0), (3, -2.0, 0)]),
+                        ("TS_C", "600003", "600003.SH", "辐射",
+                         []),  # 故意 0 打分，验证退化态
+                    ]
+                    for sname, scode, sncode, srole, sscores in stock_seed:
+                        scur = conn.execute(
+                            "INSERT INTO theme_stocks "
+                            "(theme_id, stock_name, stock_code, "
+                            " normalized_code, role, reason) "
+                            "VALUES (?, ?, ?, ?, ?, ?)",
+                            (tid, sname, scode, sncode, srole, "夹具理由"),
+                        )
+                        tsid = int(scur.lastrowid)
+                        for d_off, pct, hit in sscores:
+                            sd2 = (
+                                base_dt + timedelta(days=d_off)
+                            ).strftime("%Y%m%d")
+                            conn.execute(
+                                "INSERT INTO theme_stock_scores "
+                                "(theme_stock_id, theme_id, "
+                                " normalized_code, report_date, "
+                                " score_date, days_offset, pct_chg, "
+                                " is_hit, created_at) "
+                                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                                (
+                                    tsid, tid, sncode,
+                                    rdate_dash, sd2, d_off,
+                                    pct, hit, now_iso,
+                                ),
+                            )
 
 
 # ---------------------------------------------------------------------------
@@ -743,8 +805,460 @@ def case_10_invalid_time_dim() -> None:
 
 
 # ---------------------------------------------------------------------------
+# 树形展开新增用例（2026-05-28）
+# ---------------------------------------------------------------------------
+
+
+def _find_test_report_id(prompt_id: str, version: str = "v1") -> int:
+    """工具：取一份 TEST_EV_* 的 ai_reports.id（用于树形 API 测试）。"""
+    from services.storage.ai_inference_db import get_ai_inference_db
+    adb = get_ai_inference_db()
+    with adb.connect(readonly=True) as conn:
+        row = conn.execute(
+            "SELECT id FROM ai_reports "
+            "WHERE prompt_id = ? AND prompt_version = ? "
+            "ORDER BY id ASC LIMIT 1",
+            (prompt_id, version),
+        ).fetchone()
+    return int(row["id"]) if row else 0
+
+
+def case_17_theme_in_report_basic() -> None:
+    """get_theme_eval_for_report：R1（A v1, real）下 2 个题材 + D+N 透视。
+
+    R1 在夹具里 prompt_id=TEST_EV_A v1, real，含 T1/T2 两个 theme，
+    每个 theme 各 3 个打分（D+1/D+3/D+5）。
+    断言：返回 2 行 + d1/d3/d5 = 2.0 + d2/d4 = None + scored_pairs=3。
+    R1 的 T1 还补了 3 只 theme_stocks，stocks_count 应 = 3。
+    """
+    from services.scoring.scoring_service import get_theme_eval_for_report
+    rid = _find_test_report_id("TEST_EV_A", "v1")
+    assert rid > 0, "找不到 TEST_EV_A v1 的报告，夹具异常"
+    rows = get_theme_eval_for_report(rid)
+    assert len(rows) == 2, f"R1 应 2 个题材，得到 {len(rows)}"
+
+    for r in rows:
+        assert r["scored_pairs"] == 3, (
+            f"每题材应 3 个打分，得到 {r['scored_pairs']}"
+        )
+        assert abs((r["d1"] or 0) - 2.0) < 0.01, (
+            f"d1 应 2.0，得到 {r['d1']}"
+        )
+        assert r["d2"] is None, f"d2 应 None（未打），得到 {r['d2']}"
+        assert abs((r["d3"] or 0) - 2.0) < 0.01
+        assert r["d4"] is None
+        assert abs((r["d5"] or 0) - 2.0) < 0.01
+
+    # T1 应有 3 只 stocks（夹具特意补的）；T2 应有 0 只
+    stocks_counts = sorted(r["stocks_count"] for r in rows)
+    assert stocks_counts == [0, 3], (
+        f"R1 题材的 stocks_count 应为 [0, 3]，得到 {stocks_counts}"
+    )
+
+
+def case_18_theme_in_report_no_score() -> None:
+    """get_theme_eval_for_report：未打分报告下题材 d1~d5 全 None。
+
+    复用 case_11 的思路：插一份 TEST_EV_TIR_NS 报告 + 1 个 theme + 0 打分 →
+    d1~d5 / alpha_avg / hit_rate_avg 全 None，scored_pairs=0。
+    """
+    from datetime import datetime as _dt
+    from services.scoring.scoring_service import get_theme_eval_for_report
+    from services.storage.ai_inference_db import get_ai_inference_db
+
+    adb = get_ai_inference_db()
+    now_iso = _dt.now().isoformat(timespec="seconds")
+    rdate = _yyyymmdash_back(2)
+    fp = "data/AI_analysis/TEST_EV_TIR_NS_x.md"
+
+    with adb.connect() as conn:
+        cur = conn.execute(
+            "INSERT INTO ai_reports "
+            "(report_date, file_path, provider, model, "
+            " prompt_category, prompt_id, prompt_version, "
+            " news_count, theme_extracted, is_backtest, created_at) "
+            "VALUES (?, ?, 'mock', 'mock-m', 'analysis', "
+            "        'TEST_EV_TIR_NS', 'v1', 5, 1, 0, ?)",
+            (rdate, fp, now_iso),
+        )
+        rid = int(cur.lastrowid)
+        conn.execute(
+            "INSERT INTO theme_predictions "
+            "(report_id, report_date, report_path, theme_name, "
+            " strength_score, strength_level, reason, "
+            " prompt_id, prompt_version, is_backtest, created_at) "
+            "VALUES (?, ?, ?, 'NS_T1', 30, '中性偏多', '理由', "
+            "        'TEST_EV_TIR_NS', 'v1', 0, ?)",
+            (
+                f"TEST_EV_TIR_NS_rep_{rid}",
+                rdate, fp, now_iso,
+            ),
+        )
+
+    try:
+        rows = get_theme_eval_for_report(rid)
+        assert len(rows) == 1, f"应 1 个题材，得到 {len(rows)}"
+        r = rows[0]
+        assert r["scored_pairs"] == 0
+        assert r["stocks_count"] == 0
+        for k in ("d1", "d2", "d3", "d4", "d5",
+                  "alpha_avg", "hit_rate_avg",
+                  "direction_correct_rate", "sector_pct_avg"):
+            assert r[k] is None, f"{k} 应 None，得到 {r[k]}"
+    finally:
+        with adb.connect() as conn:
+            conn.execute(
+                "DELETE FROM theme_predictions "
+                "WHERE prompt_id = 'TEST_EV_TIR_NS'"
+            )
+            conn.execute(
+                "DELETE FROM ai_reports "
+                "WHERE prompt_id = 'TEST_EV_TIR_NS'"
+            )
+
+
+def case_19_stocks_in_theme_basic() -> None:
+    """get_stock_scores_for_theme：R1.T1 下 3 只标的，D+N 涨跌 + 命中标记透视。
+
+    夹具：TS_A 有 D+1/D+3/D+5 三天打分 → scored_days=3
+          TS_B 有 D+1/D+3 两天 → scored_days=2
+          TS_C 0 天 → scored_days=0
+    """
+    from services.scoring.scoring_service import (
+        get_stock_scores_for_theme, get_theme_eval_for_report,
+    )
+    rid = _find_test_report_id("TEST_EV_A", "v1")
+    themes = get_theme_eval_for_report(rid)
+    target = next(
+        (t for t in themes if (t["stocks_count"] or 0) > 0), None,
+    )
+    assert target is not None, "夹具应至少有 1 个含标的的题材"
+    tid = target["theme_id"]
+
+    rows = get_stock_scores_for_theme(tid)
+    assert len(rows) == 3, f"应 3 只标的，得到 {len(rows)}"
+    by_name = {r["stock_name"]: r for r in rows}
+
+    # TS_A：3 天打分
+    a = by_name["TS_A"]
+    assert a["scored_days"] == 3
+    assert abs(a["d1_pct"] - 5.0) < 0.01
+    assert a["d1_hit"] == 1
+    assert a["d2_pct"] is None and a["d2_hit"] is None
+    assert abs(a["d3_pct"] - 2.0) < 0.01
+    assert a["d3_hit"] == 0
+    assert abs(a["d5_pct"] - 8.0) < 0.01
+    assert a["d5_hit"] == 1
+
+    # TS_B：2 天打分
+    b = by_name["TS_B"]
+    assert b["scored_days"] == 2
+    assert abs(b["d1_pct"] - (-1.0)) < 0.01
+    assert b["d1_hit"] == 0
+
+    # TS_C：0 天打分（退化态）
+    c = by_name["TS_C"]
+    assert c["scored_days"] == 0
+    for k in ("d1_pct", "d2_pct", "d3_pct", "d4_pct", "d5_pct",
+              "d1_hit", "d2_hit", "d3_hit", "d4_hit", "d5_hit"):
+        assert c[k] is None, (
+            f"TS_C 全未打 {k} 应 None，得到 {c[k]}"
+        )
+
+
+def case_20_stocks_in_theme_empty() -> None:
+    """get_stock_scores_for_theme：题材无标的 → 空列表。
+
+    R1 的 T2 题材没有植入 theme_stocks → 应返回 []，且不抛错。
+    """
+    from services.scoring.scoring_service import (
+        get_stock_scores_for_theme, get_theme_eval_for_report,
+    )
+    rid = _find_test_report_id("TEST_EV_A", "v1")
+    themes = get_theme_eval_for_report(rid)
+    target = next(
+        (t for t in themes if (t["stocks_count"] or 0) == 0), None,
+    )
+    assert target is not None, "夹具应至少有 1 个无标的的题材"
+    rows = get_stock_scores_for_theme(target["theme_id"])
+    assert rows == [], f"无标的题材应返回空 [], 得到 {rows}"
+
+    # 不存在的 theme_id 也应不抛错
+    rows2 = get_stock_scores_for_theme(99999999)
+    assert rows2 == [], f"不存在的 theme_id 应返回空，得到 {rows2}"
+
+
+# ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# 2026-05-28 v2 加权聚合 + sector_pct 字段切换专项用例
+# ---------------------------------------------------------------------------
+
+
+_PREFIX_W = "TEST_W_"
+
+
+def _seed_weighted_dataset() -> None:
+    """构造 v2 加权聚合验证夹具（独立 prefix TEST_W_，与主夹具隔离）。
+
+    场景：1 份报告下 4 个题材：
+        T1: strength=+80, d1=10    （强看多）
+        T2: strength=+40, d1=2     （弱看多）
+        T3: strength=-50, d1=-3    （看空，应被报告级忽略）
+        T4: strength= 0,  d1=5     （中性，应被报告级忽略）
+
+    期望（仅看多题材按 |strength| 加权）：
+        report.d1_avg = (10*80 + 2*40) / (80+40) = 880/120 = 7.333...
+        老的等权 AVG 是 (10+2-3+5)/4 = 3.5，区分度足够大不易误判。
+    """
+    from services.storage.ai_inference_db import get_ai_inference_db
+    now_iso = datetime.now().isoformat(timespec="seconds")
+    today = datetime.now()
+    rdate = (today - timedelta(days=2)).strftime("%Y%m%d")
+    sd = (today - timedelta(days=1)).strftime("%Y%m%d")
+    file_path = f"data/AI_analysis/{_PREFIX_W}r1.md"
+
+    ai = get_ai_inference_db()
+    with ai.connect() as conn:
+        cur = conn.execute(
+            "INSERT INTO ai_reports "
+            "(report_date, file_path, provider, model, "
+            " prompt_category, prompt_id, prompt_version, "
+            " news_count, theme_extracted, is_backtest, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                rdate, file_path, "mock", "mock-model",
+                "analysis", _PREFIX_W + "P", "v1", 5, 1, 0, now_iso,
+            ),
+        )
+        report_id = int(cur.lastrowid)
+
+        themes = [
+            # (theme_name, strength_score, d1_value)
+            (_PREFIX_W + "T_strong", 80, 10.0),
+            (_PREFIX_W + "T_weak", 40, 2.0),
+            (_PREFIX_W + "T_short", -50, -3.0),
+            (_PREFIX_W + "T_neutral", 0, 5.0),
+        ]
+        for tname, ss, d1v in themes:
+            tcur = conn.execute(
+                "INSERT INTO theme_predictions "
+                "(report_id, report_date, report_path, "
+                " theme_name, strength_score, strength_level, reason, "
+                " prompt_id, prompt_version, is_backtest, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    f"{_PREFIX_W}rep_{report_id}",
+                    rdate, file_path, tname, ss,
+                    "测试", "伪原因",
+                    _PREFIX_W + "P", "v1", 0, now_iso,
+                ),
+            )
+            tid = int(tcur.lastrowid)
+
+            conn.execute(
+                "INSERT INTO theme_prediction_scores "
+                "(theme_id, prompt_id, prompt_version, "
+                " report_date, score_date, days_offset, "
+                " sector_pct, stock_avg_pct, stock_weighted_pct, "
+                " hit_count, total_count, hit_rate, "
+                " benchmark_pct, alpha, direction_correct, "
+                " created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    tid, _PREFIX_W + "P", "v1",
+                    rdate, sd, 1,
+                    d1v,
+                    99.0,  # ⚠ stock_weighted_pct 故意设 99，验证不再被读
+                    99.0,
+                    1, 1, 1.0,
+                    0.0, d1v, 1,
+                    now_iso,
+                ),
+            )
+
+
+def _cleanup_weighted() -> None:
+    """清掉 TEST_W_* 夹具。"""
+    from services.storage.ai_inference_db import get_ai_inference_db
+    ai = get_ai_inference_db()
+    with ai.connect() as conn:
+        conn.execute(
+            "DELETE FROM theme_prediction_scores "
+            "WHERE prompt_id LIKE 'TEST_W_%'"
+        )
+        conn.execute(
+            "DELETE FROM theme_predictions "
+            "WHERE prompt_id LIKE 'TEST_W_%'"
+        )
+        conn.execute(
+            "DELETE FROM ai_reports WHERE prompt_id LIKE 'TEST_W_%'"
+        )
+
+
+def case_21_theme_eval_uses_sector_pct() -> None:
+    """题材级 D+1 应来自 sector_pct（v2 改造），不再读 stock_weighted_pct。
+
+    夹具刻意把 sector_pct=10 / stock_weighted_pct=99，得到 d1=10 即说明 SQL
+    切到 sector_pct 字段了。
+    """
+    _cleanup_weighted()
+    _seed_weighted_dataset()
+    try:
+        from services.storage.ai_inference_db import get_ai_inference_db
+        from services.scoring.scoring_service import (
+            get_theme_eval_for_report,
+        )
+        ai = get_ai_inference_db()
+        with ai.connect(readonly=True) as conn:
+            ar = conn.execute(
+                "SELECT id FROM ai_reports WHERE prompt_id = ? LIMIT 1",
+                (_PREFIX_W + "P",),
+            ).fetchone()
+        assert ar is not None
+        themes = get_theme_eval_for_report(int(ar["id"]))
+        # 4 个题材
+        assert len(themes) == 4, f"期望 4 个题材，得到 {len(themes)}"
+        for t in themes:
+            d1 = t.get("d1")
+            sw = t.get("sector_pct_avg")  # 也是 sector_pct 算出来
+            # T_strong=10, T_weak=2, T_short=-3, T_neutral=5
+            assert d1 is not None, f"题材 {t['theme_name']} d1 不应为 None"
+            assert d1 != 99.0, (
+                f"题材 d1={d1}，应来自 sector_pct（不是 stock_weighted_pct=99）"
+            )
+            # sector_pct_avg 也应等于 d1（单日单 score）
+            assert abs((sw or 0) - d1) < 1e-6, (
+                f"sector_pct_avg={sw} 应与 d1={d1} 一致"
+            )
+    finally:
+        _cleanup_weighted()
+
+
+def case_22_report_eval_weighted_aggregation() -> None:
+    """报告级 d1_avg 应按 |strength_score| 加权（仅看多 strength>0 参与）。
+
+    期望：(10*80 + 2*40) / (80+40) = 7.333...
+    """
+    _cleanup_weighted()
+    _seed_weighted_dataset()
+    try:
+        from services.scoring.scoring_service import get_report_eval
+        rows = get_report_eval(
+            days=10,
+            prompt_id=_PREFIX_W + "P",
+            time_dim="report_date",
+        )
+        assert len(rows) == 1, f"应有 1 份报告，得到 {len(rows)}"
+        d1 = rows[0]["d1_avg"]
+        expected = (10 * 80 + 2 * 40) / (80 + 40)  # 7.333
+        assert d1 is not None, "d1_avg 不应为 None（有看多题材）"
+        assert abs(d1 - expected) < 0.001, (
+            f"加权 d1={d1} 期望 {expected}，看空/中性应被排除"
+        )
+        # themes_count 应包括全部 4 个（含看空和中性，这是题材计数）
+        assert rows[0]["themes_count"] == 4, (
+            f"themes_count={rows[0]['themes_count']} 期望 4"
+        )
+    finally:
+        _cleanup_weighted()
+
+
+def case_23_template_eval_weighted_aggregation() -> None:
+    """模板级 d1_avg 也应按 |strength_score| 加权。"""
+    _cleanup_weighted()
+    _seed_weighted_dataset()
+    try:
+        from services.scoring.scoring_service import get_template_eval
+        rows = get_template_eval(days=10, time_dim="report_date")
+        target = [
+            r for r in rows
+            if r.get("prompt_id") == _PREFIX_W + "P"
+        ]
+        assert len(target) == 1, f"应有 1 个模板行，得到 {len(target)}"
+        d1 = target[0]["d1_avg"]
+        expected = (10 * 80 + 2 * 40) / (80 + 40)
+        assert d1 is not None
+        assert abs(d1 - expected) < 0.001, (
+            f"模板级加权 d1={d1} 期望 {expected}"
+        )
+    finally:
+        _cleanup_weighted()
+
+
+def case_24_report_eval_all_short_returns_null() -> None:
+    """全部题材 strength≤0 时报告级 d_n 应为 NULL（NULLIF 兜底）。"""
+    _cleanup_weighted()
+    from services.storage.ai_inference_db import get_ai_inference_db
+    now_iso = datetime.now().isoformat(timespec="seconds")
+    today = datetime.now()
+    rdate = (today - timedelta(days=2)).strftime("%Y%m%d")
+    sd = (today - timedelta(days=1)).strftime("%Y%m%d")
+    file_path = f"data/AI_analysis/{_PREFIX_W}r_short.md"
+
+    ai = get_ai_inference_db()
+    try:
+        with ai.connect() as conn:
+            cur = conn.execute(
+                "INSERT INTO ai_reports "
+                "(report_date, file_path, provider, model, "
+                " prompt_category, prompt_id, prompt_version, "
+                " news_count, theme_extracted, is_backtest, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (rdate, file_path, "mock", "mock-model", "analysis",
+                 _PREFIX_W + "S", "v1", 5, 1, 0, now_iso),
+            )
+            report_id = int(cur.lastrowid)
+            for ss in (-30, -50, 0):
+                tcur = conn.execute(
+                    "INSERT INTO theme_predictions "
+                    "(report_id, report_date, report_path, "
+                    " theme_name, strength_score, strength_level, reason, "
+                    " prompt_id, prompt_version, is_backtest, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        f"{_PREFIX_W}rep_short_{report_id}",
+                        rdate, file_path, _PREFIX_W + f"T_{ss}", ss,
+                        "测试看空", "伪原因",
+                        _PREFIX_W + "S", "v1", 0, now_iso,
+                    ),
+                )
+                tid = int(tcur.lastrowid)
+                conn.execute(
+                    "INSERT INTO theme_prediction_scores "
+                    "(theme_id, prompt_id, prompt_version, "
+                    " report_date, score_date, days_offset, "
+                    " sector_pct, stock_avg_pct, stock_weighted_pct, "
+                    " hit_count, total_count, hit_rate, "
+                    " benchmark_pct, alpha, direction_correct, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        tid, _PREFIX_W + "S", "v1",
+                        rdate, sd, 1,
+                        -2.0, -2.0, -2.0,
+                        0, 1, 0.0,
+                        0.0, -2.0, 1,
+                        now_iso,
+                    ),
+                )
+
+        from services.scoring.scoring_service import get_report_eval
+        rows = get_report_eval(
+            days=10,
+            prompt_id=_PREFIX_W + "S",
+            time_dim="report_date",
+        )
+        assert len(rows) == 1
+        assert rows[0]["d1_avg"] is None, (
+            f"全看空报告 d1_avg 应为 NULL，得到 {rows[0]['d1_avg']}"
+        )
+        # themes_count 仍然应为 3（题材数计数和加权聚合分别独立）
+        assert rows[0]["themes_count"] == 3
+    finally:
+        _cleanup_weighted()
 
 
 _CASES: List[Tuple[str, Callable[[], None]]] = [
@@ -766,6 +1280,19 @@ _CASES: List[Tuple[str, Callable[[], None]]] = [
     ("15_delete_real_protected", case_15_delete_real_protected),
     ("16_delete_dry_run_no_change", case_16_delete_dry_run_no_change),
     ("10_invalid_time_dim", case_10_invalid_time_dim),
+    # 树形展开新增（2026-05-28）
+    ("17_theme_in_report_basic", case_17_theme_in_report_basic),
+    ("18_theme_in_report_no_score", case_18_theme_in_report_no_score),
+    ("19_stocks_in_theme_basic", case_19_stocks_in_theme_basic),
+    ("20_stocks_in_theme_empty", case_20_stocks_in_theme_empty),
+    # 2026-05-28 v2 加权聚合 + sector_pct 切换
+    ("21_theme_eval_uses_sector_pct", case_21_theme_eval_uses_sector_pct),
+    ("22_report_eval_weighted_aggregation",
+     case_22_report_eval_weighted_aggregation),
+    ("23_template_eval_weighted_aggregation",
+     case_23_template_eval_weighted_aggregation),
+    ("24_report_eval_all_short_returns_null",
+     case_24_report_eval_all_short_returns_null),
 ]
 
 
@@ -774,7 +1301,10 @@ def main() -> int:
     print("[prep] 清理历史 TEST_EV_* 数据 + 重新植入夹具 ...")
     _cleanup()
     _seed_dataset()
-    print("[prep] 夹具就绪：4 份报告 / 6 个题材 / 18 个打分行\n")
+    print(
+        "[prep] 夹具就绪：4 份报告 / 6 个题材 / 18 个打分行 + "
+        "T1 配 3 只 theme_stocks（5 条标的级打分）\n"
+    )
 
     pass_n = fail_n = 0
     try:

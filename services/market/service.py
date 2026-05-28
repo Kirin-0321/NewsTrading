@@ -102,6 +102,20 @@ class MarketSummaryResult:
 
 
 # ---------------------------------------------------------------------------
+# 板块 Top/Bottom 数据来源（2026-05-28 v3 决策点 cluster_method=llm_only）
+# ---------------------------------------------------------------------------
+#
+# v3 起 _read_sectors_top/_bottom 直接消费
+# :func:`services.market.sector_grouping.query_grouped_sectors_for_date`，
+# 不再做 SQL 同名去重；语义聚类已在 dim_sector_group 表里固化。
+#
+# 历史：v2 曾用 _SECTOR_DEDUP_SQL_TPL 按 ``d.name + idx_group`` 同名去重保 dc，
+# 仅能合并跨源同名（白酒/酿酒概念合不上），v3 升级为 group_id 语义聚类。
+# v2 SQL 模板已删除（git 历史可查），改造日志见
+# ``doc/updates/05-28-1410-板块聚类与GUI聚类视图上线.md``。
+
+
+# ---------------------------------------------------------------------------
 # 主类
 # ---------------------------------------------------------------------------
 
@@ -183,7 +197,7 @@ class MarketSummaryService:
         trade_date: Optional[str] = None,
         *,
         mode: str = "tushare-only",
-        top_sector_n: int = 10,
+        top_sector_n: int = 30,
         force_refresh: bool = False,
         cancel_check: Optional[Callable[[], bool]] = None,
         progress_callback: Optional[Callable[[str], None]] = None,
@@ -467,8 +481,8 @@ class MarketSummaryService:
         # sectors_top
         sectors_top = self._read_sectors_top(td, top_sector_n, gaps)
 
-        # sectors_bottom（涨幅倒数 10，跌停股龙头）
-        sectors_bottom = self._read_sectors_bottom(td, 10, gaps)
+        # sectors_bottom（涨幅倒数 15，跌停股龙头；2026-05-28 v3 升级 10→15）
+        sectors_bottom = self._read_sectors_bottom(td, 15, gaps)
 
         # dragon_tiger
         dragon_tiger = self._read_dragon_tiger(td)
@@ -764,9 +778,18 @@ class MarketSummaryService:
         """北向 + 主力资金。
 
         ``main_net_yi`` 派生口径：SUM(fact_sector_daily.main_net_yi)
-        即「同花顺概念板块主力净流入合计」。注意同一只股可属多概念，
-        该数值仅作市场宏观风向参考，不等于个股层主力净流入合计。
-        ``main_net_source`` 字段标注口径以避免 AI 误解。
+        WHERE dim_sector.idx_type='概念板块' AND dim_sector.src='dc'，
+        即「东方财富概念板块主力净流入合计」(~486 行)。
+
+        2026-05-28 hotfix：v2 改造把 fact_sector_daily 扩到 5 源（dc 概念/行业/
+        地域 + ths 行业/概念，~1489 行），原 SQL 不带过滤直接 SUM 会让同一只
+        股票被算 4-5 次，导致 20260527 出现「-49730 亿」物理不可能的离谱值
+        （单日全市场总成交额仅 3.24 万亿）。锁回 v1 单源后回到正常量级。
+
+        同一只股仍可能跨多个概念板块被重复统计（dc 概念板块本身就有
+        ~486 个，大量股票分属多概念），所以这个值仅作市场宏观风向参考，
+        不等于个股层主力净流入合计。``main_net_source`` 字段标注口径以
+        避免 AI 误解。
         """
         with self.db.connect(readonly=True) as conn:
             row = conn.execute(
@@ -775,8 +798,12 @@ class MarketSummaryService:
                 (td,),
             ).fetchone()
             sec_row = conn.execute(
-                "SELECT SUM(main_net_yi) AS s, COUNT(*) AS n "
-                "FROM fact_sector_daily WHERE trade_date = ?",
+                "SELECT SUM(s.main_net_yi) AS s, COUNT(*) AS n "
+                "FROM fact_sector_daily s "
+                "JOIN dim_sector d ON d.ts_code = s.ts_code "
+                "WHERE s.trade_date = ? "
+                "  AND d.idx_type = '概念板块' "
+                "  AND d.src = 'dc'",
                 (td,),
             ).fetchone()
 
@@ -785,8 +812,8 @@ class MarketSummaryService:
         if sec_row and sec_row["n"] and sec_row["s"] is not None:
             main_net_yi = _round(sec_row["s"], 2)
             main_net_source = (
-                f"sum_sector_daily(n={int(sec_row['n'])}; "
-                "注：同股属多概念存在重复)"
+                f"sum_dc_concept_sector(n={int(sec_row['n'])}; "
+                "注：同股属多概念存在重复，仅作宏观风向)"
             )
         else:
             gaps.append({
@@ -826,27 +853,27 @@ class MarketSummaryService:
         top_n: int,
         gaps: List[Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
-        """读取当日 Top N 板块，并派生 limit_up_count / leaders 字段。
+        """读取当日聚类后 Top N 组板块，派生 limit_up_count / leaders 字段。
 
-        派生口径：
-            * limit_up_count → ``fact_limit_stock.theme LIKE '%板块名%'`` 的涨停股数
-            * leaders        → 同上过滤后按 ``cons_nums DESC, fd_amount_yi DESC``
-              取前 3 只；字段对齐 renderer._format_leader 期望的
-              ``{name, pct_chg, status}``
-        命中率受 ``kpl_list.theme``（顿号分隔的多概念串）与 dc_index 细分概念
-        名称的天然不对齐限制，典型在 30%~50%；未命中板块返回 ``None`` /空列表。
+        2026-05-28 v3 聚类版（替代 v2 同名去重）::
+
+            v2 是按 ``d.name + idx_group`` 同名去重保 dc，~21% 跨源重名直接砍
+            掉副本；v3 升级到按 ``dim_sector.group_id`` **语义聚类** 去重——
+            "白酒/酿酒概念/白酒Ⅱ/白酒Ⅲ" 4 个不同名板块也合并成 1 组，
+            涨幅取下中位（lower_median, ASC 第 (n+1)/2 项），
+            未聚类板块自成一组不丢数据。
+
+        排序：组间按 median_pct_chg DESC，前 N 组返回。
+
+        派生口径（不变）：
+            * limit_up_count → 中位代表板块名 LIKE 匹配 fact_limit_stock.theme
+            * leaders        → 同上 cons_nums/fd_amount 排序前 3
         """
-        with self.db.connect(readonly=True) as conn:
-            rows = conn.execute(
-                "SELECT s.ts_code, s.pct_chg, s.main_net_yi, s.main_elg_yi, "
-                "       s.main_lg_yi, s.pct_chg_5d, "
-                "       s.rank_today, d.name "
-                "FROM fact_sector_daily s "
-                "LEFT JOIN dim_sector d ON d.ts_code = s.ts_code "
-                "WHERE s.trade_date = ? "
-                "ORDER BY s.pct_chg DESC NULLS LAST LIMIT ?",
-                (td, top_n),
-            ).fetchall()
+        from services.market.sector_grouping import (
+            query_grouped_sectors_for_date,
+        )
+
+        rows = query_grouped_sectors_for_date(td)
         if not rows:
             gaps.append({
                 "field": "sectors_top",
@@ -854,17 +881,26 @@ class MarketSummaryService:
             })
             return []
 
+        rows = rows[:top_n]
+
         out: List[Dict[str, Any]] = []
         with self.db.connect(readonly=True) as conn:
             for i, r in enumerate(rows, 1):
-                sector_name = str(r["name"] or "")
+                sector_name = r["sector_name"]
+                # leaders 匹配优先用 group_name（更宽泛，命中率高）
+                # 比如 group="白酒" 匹配 limit_stock.theme="白酒" >>
+                # sector_name="酿酒概念" 几乎匹配不到
+                match_key = r["group_name"] or sector_name
                 limit_up_count, leaders = self._derive_sector_leaders(
-                    conn, td, sector_name
+                    conn, td, match_key
                 )
                 out.append({
                     "rank": i,
-                    "ts_code": str(r["ts_code"]),
-                    "name": sector_name,
+                    "ts_code": r["ts_code"],
+                    "name": r["display_name"],
+                    "sector_name": sector_name,        # v3 新增：原始名
+                    "group_name": r["group_name"],     # v3 新增：组名
+                    "members_count": r["cnt_in_data"],  # v3 新增：组员数
                     "pct_chg": safe_pct_chg(r["pct_chg"]),
                     "pct_chg_5d": safe_pct_chg(r["pct_chg_5d"], bound=200.0),
                     "limit_up_count": limit_up_count,
@@ -895,23 +931,16 @@ class MarketSummaryService:
         bottom_n: int,
         gaps: List[Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
-        """读取当日涨幅倒数 N 板块，派生 limit_down_count / laggards。
+        """读取当日聚类后 Bottom N 组板块，派生 limit_down_count / laggards。
 
-        ``laggards`` = 同板块 ``fact_limit_stock.theme LIKE`` 命中的 D 股
-        按 ``pct_chg ASC, fd_amount_yi DESC`` 取前 3 只。
-        和 sectors_top 对称结构，便于 renderer 复用。
+        ``laggards`` = 中位代表板块名 LIKE 命中的 D 股按 pct_chg ASC 取前 3。
+        和 :meth:`_read_sectors_top` 同走聚类视图（v3）——倒序后的 Bottom N。
         """
-        with self.db.connect(readonly=True) as conn:
-            rows = conn.execute(
-                "SELECT s.ts_code, s.pct_chg, s.main_net_yi, s.main_elg_yi, "
-                "       s.main_lg_yi, s.pct_chg_5d, "
-                "       s.rank_today, d.name "
-                "FROM fact_sector_daily s "
-                "LEFT JOIN dim_sector d ON d.ts_code = s.ts_code "
-                "WHERE s.trade_date = ? "
-                "ORDER BY s.pct_chg ASC NULLS LAST LIMIT ?",
-                (td, bottom_n),
-            ).fetchall()
+        from services.market.sector_grouping import (
+            query_grouped_sectors_for_date,
+        )
+
+        rows = query_grouped_sectors_for_date(td)
         if not rows:
             gaps.append({
                 "field": "sectors_bottom",
@@ -919,17 +948,25 @@ class MarketSummaryService:
             })
             return []
 
+        # query_grouped_sectors_for_date 已按 pct_chg DESC，
+        # 取末尾 N 行后再翻转得到"涨幅倒数前 N"
+        rows = list(reversed(rows[-bottom_n:]))
+
         out: List[Dict[str, Any]] = []
         with self.db.connect(readonly=True) as conn:
             for i, r in enumerate(rows, 1):
-                sector_name = str(r["name"] or "")
+                sector_name = r["sector_name"]
+                match_key = r["group_name"] or sector_name
                 limit_down_count, laggards = self._derive_sector_laggards(
-                    conn, td, sector_name
+                    conn, td, match_key
                 )
                 out.append({
                     "rank": i,
-                    "ts_code": str(r["ts_code"]),
-                    "name": sector_name,
+                    "ts_code": r["ts_code"],
+                    "name": r["display_name"],
+                    "sector_name": sector_name,        # v3 新增
+                    "group_name": r["group_name"],     # v3 新增
+                    "members_count": r["cnt_in_data"],  # v3 新增
                     "pct_chg": safe_pct_chg(r["pct_chg"]),
                     "pct_chg_5d": safe_pct_chg(r["pct_chg_5d"], bound=200.0),
                     "limit_down_count": limit_down_count,

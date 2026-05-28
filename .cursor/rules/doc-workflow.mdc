@@ -128,5 +128,5 @@ alwaysApply: true
 ## 与现有规约的关系
 
 - 文档命名/分类：仍遵循 [doc/文档分类规范.md](../../doc/文档分类规范.md)
-- `.huiye/` vs `doc/` 边界：仍遵循 [.huiye/soul.md §记忆与文档归档](../../.huiye/soul.md)
+- `.huiye/` vs `doc/` 边界：仍遵循 [huiye-persona.mdc §记忆与文档归档](./huiye-persona.mdc)（原 `.huiye/soul.md` 已迁移至本目录）
 - 本规则只约束**协作流程**，不重复命名规则

@@ -11,8 +11,8 @@
     # 强制重拉（先 DELETE 当天所有 fact_* 数据再 fetch）
     python tools/market_fetch.py 20260525 --force-refresh
 
-    # 板块榜单取前 20（默认 10）
-    python tools/market_fetch.py 20260525 --top-n 20
+    # 板块榜单取前 50（默认 30，对应 v3 聚类版）
+    python tools/market_fetch.py 20260525 --top-n 50
 
     # 只打印不入库（暂未实现，build 总会入库；可通过 --dry-run 改）
     python tools/market_fetch.py 20260525 --print-md
@@ -65,8 +65,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--top-n",
         type=int,
-        default=10,
-        help="板块榜单 Top N（默认 10）",
+        default=30,
+        help="板块榜单 Top N（默认 30，对应 v3 聚类版）",
     )
     parser.add_argument(
         "--force-refresh",

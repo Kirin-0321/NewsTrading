@@ -1,4 +1,4 @@
-"""模板评估 / 题材打分明细 查询 CLI（2026-05-27 评估页改造同步扩展）。
+"""模板评估 / 题材打分明细 查询 CLI（2026-05-27 评估页改造 + 2026-05-28 树形展开扩展）。
 
 业务定位
 --------
@@ -8,9 +8,11 @@ CI 比对 / 远程 SSH / 跑批后立刻校验，也是 GUI 评估页改造的"�
 对应服务层：
 * :func:`services.scoring.scoring_service.get_template_eval`（模板汇总）
 * :func:`services.scoring.scoring_service.get_report_eval`（**报告级**明细）
-* :func:`services.scoring.scoring_service.get_theme_score_detail`（单题材）
+* :func:`services.scoring.scoring_service.get_theme_eval_for_report`（**树第 2 层** 报告→题材）
+* :func:`services.scoring.scoring_service.get_stock_scores_for_theme`（**树第 3 层** 题材→标的）
+* :func:`services.scoring.scoring_service.get_theme_score_detail`（单题材逐日）
 
-三种模式
+五种模式
 --------
 ::
 
@@ -22,7 +24,13 @@ CI 比对 / 远程 SSH / 跑批后立刻校验，也是 GUI 评估页改造的"�
     python tools/query_eval.py --by report
     python tools/query_eval.py --by report --prompt-id custom_6
 
-    # 模式 3：单题材打分逐日明细
+    # 模式 3：报告下题材级明细（评估页树第 2 层对照）
+    python tools/query_eval.py --by theme_in_report --report-id 1234
+
+    # 模式 4：题材下标的级明细（评估页树第 3 层对照）
+    python tools/query_eval.py --by stocks_in_theme --theme-id 5678
+
+    # 模式 5：单题材打分逐日明细
     python tools/query_eval.py --theme-id 999971
 
 通用参数
@@ -34,6 +42,7 @@ CI 比对 / 远程 SSH / 跑批后立刻校验，也是 GUI 评估页改造的"�
     --backtest-only      仅回测（is_backtest=1）
     --real-only          仅真实（is_backtest=0）
     --keep-version       按 (prompt_id, version) 聚合（仅 template 模式）
+    --report-id ID       仅 theme_in_report 模式必填
     --json               JSON 输出
 """
 
@@ -56,7 +65,9 @@ if hasattr(sys.stdout, "reconfigure"):
 
 from services.scoring.scoring_service import (  # noqa: E402
     get_report_eval,
+    get_stock_scores_for_theme,
     get_template_eval,
+    get_theme_eval_for_report,
     get_theme_score_detail,
 )
 
@@ -157,6 +168,77 @@ def _print_report_table(rows: List[dict]) -> None:
         )
 
 
+def _print_themes_in_report(report_id: int, rows: List[dict]) -> None:
+    """评估页树第 2 层（报告→题材）的 CLI 对照打印。"""
+    print(f"\n=== report_id={report_id} 下题材级明细 ===")
+    if not rows:
+        print("  (空) 该报告下没有题材")
+        return
+    hdr = (
+        f"  {'tid':>5s} {'题材名':16s} {'等级':6s} {'分':>4s} "
+        f"{'板块代码':12s} {'股':>3s} {'打':>3s} "
+        f"{'D+1':>7s} {'D+2':>7s} {'D+3':>7s} {'D+4':>7s} {'D+5':>7s} "
+        f"{'alpha':>7s} {'命中率':>6s}"
+    )
+    print(hdr)
+    print("  " + "-" * (len(hdr) - 2))
+    for r in rows:
+        tid = r.get("theme_id") or 0
+        name = (r.get("theme_name") or "")[:16]
+        level = (r.get("strength_level") or "—")[:6]
+        score = r.get("strength_score") or 0
+        ts_code = (r.get("sector_ts_code") or "—")[:12]
+        n_stocks = r.get("stocks_count") or 0
+        scored = r.get("scored_pairs") or 0
+        print(
+            f"  {tid:5d} {name:16s} {level:6s} {score:>4d} "
+            f"{ts_code:12s} {n_stocks:3d} {scored:3d} "
+            f"{_fmt_pct(r.get('d1'))} "
+            f"{_fmt_pct(r.get('d2'))} "
+            f"{_fmt_pct(r.get('d3'))} "
+            f"{_fmt_pct(r.get('d4'))} "
+            f"{_fmt_pct(r.get('d5'))} "
+            f"{_fmt_pct(r.get('alpha_avg'))} "
+            f"{_fmt_rate(r.get('hit_rate_avg'))}"
+        )
+
+
+def _print_stocks_in_theme(theme_id: int, rows: List[dict]) -> None:
+    """评估页树第 3 层（题材→标的）的 CLI 对照打印。"""
+    print(f"\n=== theme_id={theme_id} 下标的逐日明细 ===")
+    if not rows:
+        print("  (空) 该题材下没有标的")
+        return
+
+    def _hit_mark(v) -> str:
+        if v is None:
+            return "  -"
+        return "  ✓" if int(v) == 1 else "  ✗"
+
+    hdr = (
+        f"  {'tsid':>5s} {'标的名':12s} {'代码(标准化)':14s} {'角色':4s} {'打':>3s} "
+        f"{'D+1%':>7s} {'h1':>2s} {'D+2%':>7s} {'h2':>2s} "
+        f"{'D+3%':>7s} {'h3':>2s} {'D+4%':>7s} {'h4':>2s} "
+        f"{'D+5%':>7s} {'h5':>2s}"
+    )
+    print(hdr)
+    print("  " + "-" * (len(hdr) - 2))
+    for r in rows:
+        tsid = r.get("theme_stock_id") or 0
+        name = (r.get("stock_name") or "")[:12]
+        ncode = (r.get("normalized_code") or "—")[:14]
+        role = (r.get("role") or "—")[:4]
+        scored = r.get("scored_days") or 0
+        print(
+            f"  {tsid:5d} {name:12s} {ncode:14s} {role:4s} {scored:3d} "
+            f"{_fmt_pct(r.get('d1_pct'))}{_hit_mark(r.get('d1_hit'))} "
+            f"{_fmt_pct(r.get('d2_pct'))}{_hit_mark(r.get('d2_hit'))} "
+            f"{_fmt_pct(r.get('d3_pct'))}{_hit_mark(r.get('d3_hit'))} "
+            f"{_fmt_pct(r.get('d4_pct'))}{_hit_mark(r.get('d4_hit'))} "
+            f"{_fmt_pct(r.get('d5_pct'))}{_hit_mark(r.get('d5_hit'))}"
+        )
+
+
 def _print_theme_detail(theme_id: int, rows: List[dict]) -> None:
     print(f"\n=== theme_id={theme_id} 打分明细 ===")
     if not rows:
@@ -198,8 +280,22 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         formatter_class=argparse.RawTextHelpFormatter,
     )
     p.add_argument(
-        "--by", choices=["template", "report"], default="template",
-        help="模板汇总（默认）或报告级明细",
+        "--by",
+        choices=[
+            "template", "report", "theme_in_report", "stocks_in_theme",
+        ],
+        default="template",
+        help=(
+            "查询粒度：\n"
+            "  template         模板汇总（默认）\n"
+            "  report           报告级明细\n"
+            "  theme_in_report  报告下题材级（需 --report-id）\n"
+            "  stocks_in_theme  题材下标的级（需 --theme-id）"
+        ),
+    )
+    p.add_argument(
+        "--report-id", type=int, default=None,
+        help="（仅 theme_in_report 模式）必填，指定 ai_reports.id",
     )
     p.add_argument(
         "--days", type=int, default=30,
@@ -263,7 +359,39 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = _parse_args(argv)
     bt_filter = _resolve_bt_filter(args)
 
-    # 单题材模式（最优先）
+    # 树第 3 层：报告下题材级明细
+    if args.by == "theme_in_report":
+        if args.report_id is None:
+            print(
+                "错误：--by theme_in_report 需要 --report-id ID",
+                file=sys.stderr,
+            )
+            return 2
+        rows = get_theme_eval_for_report(args.report_id)
+        if args.json:
+            print(json.dumps(rows, ensure_ascii=False, indent=2))
+            return 0
+        _print_themes_in_report(args.report_id, rows)
+        print(f"\n[共 {len(rows)} 个题材]")
+        return 0
+
+    # 树第 4 层：题材下标的级明细
+    if args.by == "stocks_in_theme":
+        if args.theme_id is None:
+            print(
+                "错误：--by stocks_in_theme 需要 --theme-id ID",
+                file=sys.stderr,
+            )
+            return 2
+        rows = get_stock_scores_for_theme(args.theme_id)
+        if args.json:
+            print(json.dumps(rows, ensure_ascii=False, indent=2))
+            return 0
+        _print_stocks_in_theme(args.theme_id, rows)
+        print(f"\n[共 {len(rows)} 只标的]")
+        return 0
+
+    # 单题材模式（--theme-id 不带 --by 时，等价 score_detail）
     if args.theme_id is not None:
         rows = get_theme_score_detail(args.theme_id)
         if args.json:

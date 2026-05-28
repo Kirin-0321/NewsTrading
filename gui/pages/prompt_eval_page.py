@@ -62,7 +62,7 @@ from PyQt5.QtWidgets import (
     QButtonGroup, QCheckBox, QComboBox, QFileDialog, QGroupBox,
     QHBoxLayout, QHeaderView, QLabel, QMessageBox, QPushButton,
     QRadioButton, QSplitter, QTableWidget, QTableWidgetItem,
-    QVBoxLayout, QWidget,
+    QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
 from gui.utils.styles import (
@@ -97,18 +97,47 @@ _TPL_COLS = [
 ]
 
 
-# 「打分」+「删除」按钮列放在「文件名」前，文件名仍是 stretch 末列
-_REPORT_COLS = [
-    ("报告日期", 100), ("真/回", 60), ("模板", 180), ("版本", 60),
-    ("#题材", 60), ("打分进度", 90),
-    ("D+1", 75), ("D+2", 75), ("D+3", 75), ("D+4", 75), ("D+5", 75),
-    ("α", 75), ("命中率", 70),
-    ("打分", 110), ("删除", 95), ("文件名", 0),
+# 报告树（QTreeWidget）共享 13 列定义（2026-05-28 树形展开重构）
+#
+# 同一列在 3 级（📄 报告 / 🎯 题材 / 📈 标的）下语义对齐：
+#   * 列 0  名称：📄报告日期+真/回 / 🎯题材名 / 📈标的名（带图标前缀）
+#   * 列 1  类型/等级/角色
+#   * 列 2  辅助：📄版本 / 🎯板块代码 / 📈标准化代码
+#   * 列 3  子项数/排名：📄题材数 / 🎯排名 / 📈—
+#   * 列 4  进度/分数：📄打分 X/Y / 🎯强度分 / 📈—
+#   * 列 5~9  D+1~D+5（单位 %，红涨绿跌染色统一）
+#   * 列 10 α / —
+#   * 列 11 命中率（📄/🎯）/ 命中标记 ✓✗（📈）
+#   * 列 12 文件名 / AI 评语 / 理由（stretch 末列，📄 行尾内嵌「打分/删除」按钮）
+_TREE_COLS = [
+    ("名称",            260),  # 0
+    ("类型/等级/角色",   100),  # 1
+    ("辅助",            100),  # 2
+    ("子项/排名",        70),  # 3
+    ("进度/分数",        80),  # 4
+    ("D+1",             75),  # 5
+    ("D+2",             75),  # 6
+    ("D+3",             75),  # 7
+    ("D+4",             75),  # 8
+    ("D+5",             75),  # 9
+    ("α",               75),  # 10
+    ("命中率",           80),  # 11
+    ("文件名/理由/按钮",   0),  # 12 stretch
 ]
-# 按钮列固定索引（c_idx），方便渲染时 setCellWidget 定位
-_COL_SCORE_BTN = 13
-_COL_DELETE_BTN = 14
-_COL_FILENAME = 15
+_COL_NAME = 0
+_COL_TYPE = 1
+_COL_AUX = 2
+_COL_COUNT = 3
+_COL_SCORE = 4
+_COL_D1, _COL_D2, _COL_D3, _COL_D4, _COL_D5 = 5, 6, 7, 8, 9
+_COL_ALPHA = 10
+_COL_HIT = 11
+_COL_TAIL = 12
+
+# 节点类型枚举（写在 QTreeWidgetItem.data(0, Qt.UserRole) 的 dict.kind 中）
+_KIND_REPORT = "report"
+_KIND_THEME = "theme"
+_KIND_STOCK = "stock"
 
 
 # 按钮三态样式（评估页打分按钮专用）
@@ -159,6 +188,44 @@ _LOW_SAMPLE_THRESHOLD = 5
 
 
 # ---------------------------------------------------------------------------
+# 树节点子类：仅顶层（报告级）参与排序，子级保持插入顺序
+# ---------------------------------------------------------------------------
+
+
+class _ReportTreeItem(QTreeWidgetItem):
+    """支持顶层排序、子级锁顺序的 QTreeWidgetItem。
+
+    设计要点：
+        * 顶层 📄 报告行：按当前 sortColumn 比较 ``Qt.UserRole + 1`` 槽里的
+          原始可比较值（int / float / str / None），NULL 永远排末尾
+        * 子级（🎯 题材 / 📈 标的）：``__lt__`` 永远返回 False，让 Qt 内部
+          排序时不动子节点（QTreeWidget 默认会递归全树）
+    """
+
+    def __lt__(self, other):  # noqa: D401
+        # 子级（parent 非空）保持插入顺序
+        if self.parent() is not None:
+            return False
+        tree = self.treeWidget()
+        if tree is None:
+            return False
+        col = tree.sortColumn()
+        a = self.data(col, Qt.UserRole + 1)
+        b = other.data(col, Qt.UserRole + 1) if other is not None else None
+        # NULL 末尾（升序时排后；降序时 Qt 自动反转，依然在末尾）
+        if a is None and b is None:
+            return False
+        if a is None:
+            return False
+        if b is None:
+            return True
+        try:
+            return a < b
+        except TypeError:
+            return str(a) < str(b)
+
+
+# ---------------------------------------------------------------------------
 # 主页面
 # ---------------------------------------------------------------------------
 
@@ -177,6 +244,9 @@ class PromptEvalPage(QWidget):
         self._selected_prompt_id: Optional[str] = None
         self._rescore_worker: Optional[RescoreWorker] = None
         self._delete_worker: Optional[DeleteReportWorker] = None
+        # 树形展开缓存：{ai_reports.id: List[theme_dict]}, {theme_id: List[stock_dict]}
+        self._theme_cache: Dict[int, List[Dict]] = {}
+        self._stock_cache: Dict[int, List[Dict]] = {}
         self.init_ui()
         self.refresh()
 
@@ -324,30 +394,35 @@ class PromptEvalPage(QWidget):
 
     def _build_report_group(self) -> QGroupBox:
         group = QGroupBox(
-            "📄 选中模板的报告明细　(双击行 → 跳「题材预测」页)"
+            "📄 报告 / 🎯 题材 / 📈 标的　"
+            "(点 ▶ 逐级展开｜双击 📄 跳「题材预测」页｜点击表头排序)"
         )
         layout = QVBoxLayout(group)
 
-        self.report_table = QTableWidget(0, len(_REPORT_COLS))
-        self.report_table.setHorizontalHeaderLabels(
-            [c[0] for c in _REPORT_COLS]
-        )
-        self.report_table.setStyleSheet(TABLE_STYLE)
-        self.report_table.setEditTriggers(QTableWidget.NoEditTriggers)
-        self.report_table.setSelectionBehavior(QTableWidget.SelectRows)
-        self.report_table.setSelectionMode(QTableWidget.SingleSelection)
-        self.report_table.verticalHeader().setVisible(False)
-        for i, (_, w) in enumerate(_REPORT_COLS):
+        self.report_tree = QTreeWidget()
+        self.report_tree.setColumnCount(len(_TREE_COLS))
+        self.report_tree.setHeaderLabels([c[0] for c in _TREE_COLS])
+        self.report_tree.setStyleSheet(TABLE_STYLE)
+        self.report_tree.setUniformRowHeights(True)
+        self.report_tree.setRootIsDecorated(True)
+        self.report_tree.setAlternatingRowColors(True)
+        self.report_tree.setSelectionMode(QTreeWidget.SingleSelection)
+        self.report_tree.setSortingEnabled(True)
+        # 默认按报告日期降序（_COL_NAME 列存日期作为可比较值）
+        self.report_tree.sortByColumn(_COL_NAME, Qt.DescendingOrder)
+
+        for i, (_, w) in enumerate(_TREE_COLS):
             if w > 0:
-                self.report_table.setColumnWidth(i, w)
-        # 文件名列 stretch
-        self.report_table.horizontalHeader().setSectionResizeMode(
-            len(_REPORT_COLS) - 1, QHeaderView.Stretch
+                self.report_tree.setColumnWidth(i, w)
+        self.report_tree.header().setSectionResizeMode(
+            _COL_TAIL, QHeaderView.Stretch
         )
-        self.report_table.itemDoubleClicked.connect(
-            self._on_report_double_clicked
+
+        self.report_tree.itemExpanded.connect(self._on_item_expanded)
+        self.report_tree.itemDoubleClicked.connect(
+            self._on_tree_double_clicked
         )
-        layout.addWidget(self.report_table)
+        layout.addWidget(self.report_tree)
 
         self.report_stats_label = QLabel("")
         self.report_stats_label.setStyleSheet("color: #8c8c8c;")
@@ -407,7 +482,7 @@ class PromptEvalPage(QWidget):
         )
 
     def _reload_report_table(self):
-        """根据当前选中的模板重查下表。"""
+        """根据当前选中的模板重查报告树（顶层 📄 节点）。"""
         try:
             f = self._current_filters()
             from services.scoring.scoring_service import get_report_eval
@@ -424,7 +499,10 @@ class PromptEvalPage(QWidget):
             return
 
         self._report_rows = rep_rows
-        self._render_report_table(rep_rows)
+        # 树重建会丢失展开状态 + 缓存可能过期，整体清缓存（点 ▶ 时按需重拉）
+        self._theme_cache.clear()
+        self._stock_cache.clear()
+        self._render_tree_top_level(rep_rows)
         prompt_tag = (
             f"prompt_id={self._selected_prompt_id}"
             if self._selected_prompt_id
@@ -496,9 +574,14 @@ class PromptEvalPage(QWidget):
                     item.setToolTip("等 Phase 7 AI 评分员（ai_scorer.py）落地")
                 self.tpl_table.setItem(r_idx, c_idx, item)
 
-    def _render_report_table(self, rows: List[Dict]) -> None:
-        self.report_table.setRowCount(len(rows))
-        for r_idx, data in enumerate(rows):
+    def _render_tree_top_level(self, rows: List[Dict]) -> None:
+        """渲染顶层 📄 报告节点；每个节点挂一个 placeholder 让 ▶ 出现。"""
+        # 排序时短暂关闭（一次性 fill 完再开）→ 防止边填边触发排序
+        self.report_tree.setSortingEnabled(False)
+        self.report_tree.clear()
+
+        from gui.utils.prompt_name_helper import friendly_prompt_name
+        for data in rows:
             bt = int(data.get("is_backtest") or 0)
             fp = data.get("file_path") or ""
             fname = Path(fp).name if fp else "-"
@@ -506,13 +589,28 @@ class PromptEvalPage(QWidget):
             scored_n = int(data.get("scored_pairs") or 0)
             expected_n = int(data.get("expected_pairs") or 0)
             status = data.get("score_status") or "none"
-            cells = [
-                format_yyyymmdd_to_dash(data.get("report_date") or "—"),
-                "回测" if bt == 1 else "真实",
-                str(data.get("prompt_id") or "—"),
-                str(data.get("prompt_version") or "—"),
-                str(themes_n),
-                f"{scored_n}/{expected_n}" if expected_n else "0/0",
+            pid_display = friendly_prompt_name(
+                data.get("prompt_id") or "",
+                fallback=data.get("prompt_id") or "—",
+            )
+
+            name_text = (
+                f"📄 {format_yyyymmdd_to_dash(data.get('report_date') or '—')}"
+                + ("　[回]" if bt == 1 else "　[真]")
+            )
+            type_text = pid_display
+            aux_text = str(data.get("prompt_version") or "—")
+            count_text = str(themes_n)
+            score_text = (
+                f"{scored_n}/{expected_n}" if expected_n else "0/0"
+            )
+
+            item = _ReportTreeItem([
+                name_text,
+                type_text,
+                aux_text,
+                count_text,
+                score_text,
                 _fmt_pct(data.get("d1_avg")),
                 _fmt_pct(data.get("d2_avg")),
                 _fmt_pct(data.get("d3_avg")),
@@ -520,51 +618,311 @@ class PromptEvalPage(QWidget):
                 _fmt_pct(data.get("d5_avg")),
                 _fmt_pct(data.get("alpha_avg")),
                 _fmt_rate(data.get("hit_rate_avg")),
-                # 「打分」按钮列 (_COL_SCORE_BTN=13) 用 setCellWidget 填
-                "",
-                # 「删除」按钮列 (_COL_DELETE_BTN=14) 用 setCellWidget 填
-                "",
-                fname,
-            ]
-            for c_idx, text in enumerate(cells):
-                if c_idx in (_COL_SCORE_BTN, _COL_DELETE_BTN):
-                    # 按钮列：跳过 setItem，下面 setCellWidget
-                    continue
-                item = QTableWidgetItem(text)
-                item.setToolTip(text)
-                # 把 report_date + prompt_id 塞第 0 列 UserRole 给双击用
-                if c_idx == 0:
-                    item.setData(Qt.UserRole, {
-                        "report_date": data.get("report_date"),
-                        "prompt_id": data.get("prompt_id"),
-                        "file_path": fp,
-                    })
-                # 回测标记染色
-                if c_idx == 1 and bt == 1:
-                    item.setForeground(QColor("#c80"))
-                # 打分进度列染色
-                if c_idx == 5:
-                    if status == "none":
-                        item.setForeground(QColor("#cf1322"))
-                    elif status == "partial":
-                        item.setForeground(QColor("#d48806"))
-                    elif status == "full":
-                        item.setForeground(QColor("#389e0d"))
-                # D+N / α 列染色（c_idx 6~11）
-                if c_idx in (6, 7, 8, 9, 10, 11):
-                    self._colorize_pct(item, data, c_idx, "d_or_alpha")
-                self.report_table.setItem(r_idx, c_idx, item)
+                "",  # 尾列由 setItemWidget 装按钮容器
+            ])
+            # 节点元数据（懒加载用）
+            item.setData(_COL_NAME, Qt.UserRole, {
+                "kind": _KIND_REPORT,
+                "loaded": False,
+                "data": data,
+            })
+            # 排序辅助槽（UserRole+1 存可比较的原始值）
+            item.setData(_COL_NAME, Qt.UserRole + 1,
+                         data.get("report_date") or "")
+            item.setData(_COL_TYPE, Qt.UserRole + 1, pid_display)
+            item.setData(_COL_COUNT, Qt.UserRole + 1, themes_n)
+            item.setData(_COL_SCORE, Qt.UserRole + 1, scored_n)
+            for c_idx, key in zip(
+                (_COL_D1, _COL_D2, _COL_D3, _COL_D4, _COL_D5, _COL_ALPHA),
+                ("d1_avg", "d2_avg", "d3_avg", "d4_avg",
+                 "d5_avg", "alpha_avg"),
+            ):
+                v = data.get(key)
+                item.setData(c_idx, Qt.UserRole + 1,
+                             None if v is None else float(v))
+            item.setData(
+                _COL_HIT, Qt.UserRole + 1,
+                None if data.get("hit_rate_avg") is None
+                else float(data.get("hit_rate_avg")),
+            )
 
-            # 「打分」按钮列
-            self.report_table.setCellWidget(
-                r_idx, _COL_SCORE_BTN,
-                self._build_score_button(data, status, themes_n),
+            # 染色
+            if status == "none":
+                item.setForeground(_COL_SCORE, QColor("#cf1322"))
+            elif status == "partial":
+                item.setForeground(_COL_SCORE, QColor("#d48806"))
+            elif status == "full":
+                item.setForeground(_COL_SCORE, QColor("#389e0d"))
+            if bt == 1:
+                item.setForeground(_COL_NAME, QColor("#c80"))
+            for c_idx, key in zip(
+                (_COL_D1, _COL_D2, _COL_D3, _COL_D4, _COL_D5, _COL_ALPHA),
+                ("d1_avg", "d2_avg", "d3_avg", "d4_avg",
+                 "d5_avg", "alpha_avg"),
+            ):
+                self._paint_pct_cell(item, c_idx, data.get(key))
+
+            # placeholder 子项（让 ▶ 可见）
+            placeholder = QTreeWidgetItem(["  (展开加载中...)"])
+            placeholder.setForeground(0, QColor("#bfbfbf"))
+            item.addChild(placeholder)
+
+            self.report_tree.addTopLevelItem(item)
+            # setItemWidget 必须在 addTopLevelItem 后调用
+            self.report_tree.setItemWidget(
+                item, _COL_TAIL,
+                self._build_report_tail_widget(data, status, themes_n, fname),
             )
-            # 「删除」按钮列
-            self.report_table.setCellWidget(
-                r_idx, _COL_DELETE_BTN,
-                self._build_delete_button(data),
+
+        self.report_tree.setSortingEnabled(True)
+
+    def _build_report_tail_widget(
+        self, data: Dict, status: str, themes_n: int, fname: str,
+    ) -> QWidget:
+        """报告父行尾列容器：[⚡ 打分][🗑 删除]　文件名 label。"""
+        wrap = QWidget()
+        h = QHBoxLayout(wrap)
+        h.setContentsMargins(2, 2, 2, 2)
+        h.setSpacing(4)
+        h.addWidget(self._build_score_button(data, status, themes_n))
+        h.addWidget(self._build_delete_button(data))
+        lbl = QLabel(fname)
+        lbl.setToolTip(data.get("file_path") or "")
+        lbl.setStyleSheet("color: #595959;")
+        h.addWidget(lbl, 1)
+        return wrap
+
+    # --- 懒加载触发：itemExpanded 信号 ---
+
+    def _on_item_expanded(self, item: QTreeWidgetItem):
+        payload = item.data(_COL_NAME, Qt.UserRole) or {}
+        if payload.get("loaded"):
+            return
+        kind = payload.get("kind")
+        if kind == _KIND_REPORT:
+            self._lazy_load_themes(item, payload.get("data") or {})
+        elif kind == _KIND_THEME:
+            self._lazy_load_stocks(item, payload.get("data") or {})
+        payload["loaded"] = True
+        item.setData(_COL_NAME, Qt.UserRole, payload)
+
+    def _lazy_load_themes(self, parent: QTreeWidgetItem, data: Dict) -> None:
+        """点 📄 ▶ 时拉该报告下所有题材填子节点。"""
+        report_id = int(data.get("report_id") or 0)
+        # 清空 placeholder
+        parent.takeChildren()
+        if report_id <= 0:
+            self._add_empty_child(parent, "（缺 report_id）")
+            return
+
+        try:
+            if report_id in self._theme_cache:
+                themes = self._theme_cache[report_id]
+            else:
+                from services.scoring.scoring_service import (
+                    get_theme_eval_for_report,
+                )
+                themes = get_theme_eval_for_report(report_id)
+                self._theme_cache[report_id] = themes
+        except Exception as exc:  # noqa: BLE001
+            self._add_empty_child(
+                parent, f"题材加载失败：{exc}", color="#c00"
             )
+            return
+
+        if not themes:
+            self._add_empty_child(parent, "（该报告下无题材）")
+            return
+
+        for t in themes:
+            self._append_theme_child(parent, t)
+
+    def _append_theme_child(
+        self, parent: QTreeWidgetItem, t: Dict,
+    ) -> None:
+        theme_id = int(t.get("theme_id") or 0)
+        scored_pairs = int(t.get("scored_pairs") or 0)
+        stocks_n = int(t.get("stocks_count") or 0)
+        rank = t.get("priority_rank")
+        score = t.get("strength_score")
+        sector_code = t.get("sector_ts_code")
+        match_conf = t.get("sector_match_conf")
+
+        # 2026-05-28 v2 角标：让主人一眼看出这条题材是否参与报告级加权
+        # 以及板块匹配是否可靠
+        prefix_badges: List[str] = ["🎯"]
+        tooltip_lines: List[str] = []
+
+        # ① 报告级聚合参与状态：strength_score 决定
+        if score is None:
+            tooltip_lines.append("⚠ 无 strength_score（不参与报告级加权）")
+            prefix_badges.append("❓")
+        elif score < 0:
+            tooltip_lines.append(
+                f"🐻 看空题材 strength={score}（不参与报告级加权）"
+            )
+            prefix_badges.append("🐻")
+        elif score == 0:
+            tooltip_lines.append("⚪ 中性 strength=0（不参与报告级加权）")
+            prefix_badges.append("⚪")
+
+        # ② 板块绑定状态：sector_ts_code + sector_match_conf
+        if not sector_code:
+            tooltip_lines.append("🚫 字典无板块（D+N 永远空，请补 dim_sector）")
+            prefix_badges.append("🚫")
+            sector_cell = "🚫 未绑板块"
+        elif match_conf is not None and float(match_conf) < 0.5:
+            tooltip_lines.append(
+                f"⚠ 弱匹配 conf={match_conf:.2f}（D+N 仅供参考）"
+            )
+            prefix_badges.append("⚠")
+            sector_cell = f"⚠ {sector_code} ({match_conf:.2f})"
+        else:
+            sector_cell = sector_code
+
+        cells = [
+            f"{''.join(prefix_badges)} {t.get('theme_name') or '—'}",
+            str(t.get("strength_level") or "—"),
+            sector_cell,
+            str(rank) if rank is not None else "—",
+            str(score) if score is not None else "—",
+            _fmt_pct(t.get("d1")),
+            _fmt_pct(t.get("d2")),
+            _fmt_pct(t.get("d3")),
+            _fmt_pct(t.get("d4")),
+            _fmt_pct(t.get("d5")),
+            _fmt_pct(t.get("alpha_avg")),
+            _fmt_rate(t.get("hit_rate_avg")),
+            (
+                f"标的 {stocks_n} / 已打 {scored_pairs}"
+                if stocks_n or scored_pairs
+                else "（未打分）"
+            ),
+        ]
+        item = _ReportTreeItem(cells)
+        item.setData(_COL_NAME, Qt.UserRole, {
+            "kind": _KIND_THEME,
+            "loaded": False,
+            "data": t,
+        })
+        # 角标 tooltip：题材名列 + 板块列都挂
+        if tooltip_lines:
+            tip = "\n".join(tooltip_lines)
+            item.setToolTip(_COL_NAME, tip)
+            item.setToolTip(_COL_AUX, tip)
+        # 题材级染色
+        for c_idx, key in zip(
+            (_COL_D1, _COL_D2, _COL_D3, _COL_D4, _COL_D5, _COL_ALPHA),
+            ("d1", "d2", "d3", "d4", "d5", "alpha_avg"),
+        ):
+            self._paint_pct_cell(item, c_idx, t.get(key))
+        # 标的层 placeholder
+        if stocks_n > 0:
+            ph = QTreeWidgetItem(["  (展开加载标的...)"])
+            ph.setForeground(0, QColor("#bfbfbf"))
+            item.addChild(ph)
+        parent.addChild(item)
+
+    def _lazy_load_stocks(self, parent: QTreeWidgetItem, data: Dict) -> None:
+        """点 🎯 ▶ 时拉该题材下所有标的填孙节点。"""
+        theme_id = int(data.get("theme_id") or 0)
+        parent.takeChildren()
+        if theme_id <= 0:
+            self._add_empty_child(parent, "（缺 theme_id）")
+            return
+
+        try:
+            if theme_id in self._stock_cache:
+                stocks = self._stock_cache[theme_id]
+            else:
+                from services.scoring.scoring_service import (
+                    get_stock_scores_for_theme,
+                )
+                stocks = get_stock_scores_for_theme(theme_id)
+                self._stock_cache[theme_id] = stocks
+        except Exception as exc:  # noqa: BLE001
+            self._add_empty_child(
+                parent, f"标的加载失败：{exc}", color="#c00"
+            )
+            return
+
+        if not stocks:
+            self._add_empty_child(parent, "（该题材下未抽到标的）")
+            return
+
+        for s in stocks:
+            self._append_stock_child(parent, s)
+
+    def _append_stock_child(
+        self, parent: QTreeWidgetItem, s: Dict,
+    ) -> None:
+        # 列 11（命中率/命中）改用"汇总命中率"（命中天数 / 已打分天数）
+        scored_days = int(s.get("scored_days") or 0)
+        hits = sum(
+            1 for k in ("d1_hit", "d2_hit", "d3_hit", "d4_hit", "d5_hit")
+            if (s.get(k) or 0) == 1
+        )
+        hit_text = (
+            f"{hits}/{scored_days}" if scored_days else "—"
+        )
+        cells = [
+            f"📈 {s.get('stock_name') or '—'}",
+            str(s.get("role") or "—"),
+            str(s.get("normalized_code") or "—"),
+            "—",  # 排名列对标的不适用
+            "—",  # 强度分对标的不适用
+            _fmt_pct(s.get("d1_pct")),
+            _fmt_pct(s.get("d2_pct")),
+            _fmt_pct(s.get("d3_pct")),
+            _fmt_pct(s.get("d4_pct")),
+            _fmt_pct(s.get("d5_pct")),
+            "—",
+            hit_text,
+            (s.get("reason") or "")[:120],
+        ]
+        item = _ReportTreeItem(cells)
+        item.setData(_COL_NAME, Qt.UserRole, {
+            "kind": _KIND_STOCK,
+            "loaded": True,  # 叶子节点不再展开
+            "data": s,
+        })
+        # 标的级 D+N 染色
+        for c_idx, key in zip(
+            (_COL_D1, _COL_D2, _COL_D3, _COL_D4, _COL_D5),
+            ("d1_pct", "d2_pct", "d3_pct", "d4_pct", "d5_pct"),
+        ):
+            self._paint_pct_cell(item, c_idx, s.get(key))
+        # 命中标记列底色
+        if scored_days > 0:
+            if hits == scored_days:
+                item.setBackground(_COL_HIT, QColor("#fff1f0"))  # 全命中浅红
+            elif hits == 0:
+                item.setBackground(_COL_HIT, QColor("#f6ffed"))  # 全未命中浅绿
+        parent.addChild(item)
+
+    @staticmethod
+    def _add_empty_child(
+        parent: QTreeWidgetItem, text: str, color: str = "#8c8c8c",
+    ) -> None:
+        ph = QTreeWidgetItem([text])
+        ph.setForeground(0, QColor(color))
+        parent.addChild(ph)
+
+    @staticmethod
+    def _paint_pct_cell(
+        item: QTreeWidgetItem, col: int, val,
+    ) -> None:
+        if val is None:
+            item.setForeground(col, QColor("#bfbfbf"))
+            return
+        try:
+            v = float(val)
+        except (TypeError, ValueError):
+            return
+        if v > 0:
+            item.setForeground(col, QColor("#c62828"))
+        elif v < 0:
+            item.setForeground(col, QColor("#2e7d32"))
 
     def _build_score_button(
         self, data: Dict, status: str, themes_n: int,
@@ -670,16 +1028,18 @@ class PromptEvalPage(QWidget):
             )
         self._reload_report_table()
 
-    def _on_report_double_clicked(self, item: QTableWidgetItem):
-        first = self.report_table.item(item.row(), 0)
-        if not first:
+    def _on_tree_double_clicked(self, item: QTreeWidgetItem, _col: int):
+        """双击 📄 报告父行 → emit 跳「题材预测」页；子行无效。"""
+        if item is None:
             return
-        payload = first.data(Qt.UserRole) or {}
-        rd = payload.get("report_date") or ""
-        pid = payload.get("prompt_id") or ""
+        payload = item.data(_COL_NAME, Qt.UserRole) or {}
+        if payload.get("kind") != _KIND_REPORT:
+            return
+        data = payload.get("data") or {}
+        rd = data.get("report_date") or ""
+        pid = data.get("prompt_id") or ""
         if not rd:
             return
-        # emit 给 main_window；main_window 切到题材页 + 预选筛选器
         self.theme_drilldown_requested.emit(rd, pid)
 
     def _on_delete_clicked(
@@ -965,30 +1325,116 @@ class PromptEvalPage(QWidget):
                     ])
                 # 空行
                 writer.writerow([])
-                # Section 2: 报告明细
-                writer.writerow(["[报告明细]"])
-                writer.writerow([c[0] for c in _REPORT_COLS])
+                # Section 2: 报告级
+                writer.writerow(["[报告级]"])
+                writer.writerow([
+                    "report_id", "report_date", "is_backtest",
+                    "prompt_id", "prompt_version",
+                    "themes_count", "scored_pairs", "expected_pairs",
+                    "score_status",
+                    "d1_avg", "d2_avg", "d3_avg", "d4_avg", "d5_avg",
+                    "alpha_avg", "hit_rate_avg", "direction_correct_rate",
+                    "file_path",
+                ])
                 for r in self._report_rows:
-                    scored = r.get("scored_pairs") or 0
-                    expected = r.get("expected_pairs") or 0
                     writer.writerow([
+                        r.get("report_id"),
                         format_yyyymmdd_to_dash(r.get("report_date") or ""),
-                        "回测" if int(r.get("is_backtest") or 0) else "真实",
+                        int(r.get("is_backtest") or 0),
                         r.get("prompt_id") or "",
                         r.get("prompt_version") or "",
                         r.get("themes_count") or 0,
-                        f"{scored}/{expected}",
+                        r.get("scored_pairs") or 0,
+                        r.get("expected_pairs") or 0,
+                        r.get("score_status") or "none",
                         r.get("d1_avg"), r.get("d2_avg"),
                         r.get("d3_avg"), r.get("d4_avg"),
                         r.get("d5_avg"),
                         r.get("alpha_avg"),
                         r.get("hit_rate_avg"),
-                        # 「打分」列：导出 score_status 文本（按钮无法 CSV）
-                        r.get("score_status") or "none",
-                        # 「删除」列：CSV 占位
-                        f"id={r.get('report_id')}",
+                        r.get("direction_correct_rate"),
                         r.get("file_path") or "",
                     ])
+
+                # Section 3 + 4: 题材级 + 标的级（全量加载，含未展开的）
+                writer.writerow([])
+                writer.writerow(["[题材级]"])
+                # 2026-05-28 v2：d1~d5 现在来自板块行情 sector_pct，
+                # sector_match_conf 标记板块匹配置信度（< 0.5 算弱匹配）
+                writer.writerow([
+                    "report_id", "theme_id", "theme_name",
+                    "strength_level", "strength_score",
+                    "sector_ts_code", "sector_match_conf",
+                    "stocks_count", "scored_pairs",
+                    "d1", "d2", "d3", "d4", "d5",
+                    "alpha_avg", "hit_rate_avg", "direction_correct_rate",
+                    "sector_pct_avg",
+                ])
+                writer.writerow([])
+                stock_rows_section = [["[标的级]"], [
+                    "theme_id", "theme_stock_id", "stock_name",
+                    "normalized_code", "role", "scored_days",
+                    "d1_pct", "d2_pct", "d3_pct", "d4_pct", "d5_pct",
+                    "d1_hit", "d2_hit", "d3_hit", "d4_hit", "d5_hit",
+                ]]
+
+                from services.scoring.scoring_service import (
+                    get_stock_scores_for_theme,
+                    get_theme_eval_for_report,
+                )
+                for r in self._report_rows:
+                    rid = int(r.get("report_id") or 0)
+                    if rid <= 0:
+                        continue
+                    themes = self._theme_cache.get(rid)
+                    if themes is None:
+                        themes = get_theme_eval_for_report(rid)
+                        self._theme_cache[rid] = themes
+                    for t in themes:
+                        writer.writerow([
+                            rid,
+                            t.get("theme_id"),
+                            t.get("theme_name") or "",
+                            t.get("strength_level") or "",
+                            t.get("strength_score"),
+                            t.get("sector_ts_code") or "",
+                            t.get("sector_match_conf"),
+                            t.get("stocks_count") or 0,
+                            t.get("scored_pairs") or 0,
+                            t.get("d1"), t.get("d2"),
+                            t.get("d3"), t.get("d4"),
+                            t.get("d5"),
+                            t.get("alpha_avg"),
+                            t.get("hit_rate_avg"),
+                            t.get("direction_correct_rate"),
+                            t.get("sector_pct_avg"),
+                        ])
+                        # 标的级（拼到 stock_rows_section 末尾批量写）
+                        tid = int(t.get("theme_id") or 0)
+                        if tid <= 0 or not (t.get("stocks_count") or 0):
+                            continue
+                        stocks = self._stock_cache.get(tid)
+                        if stocks is None:
+                            stocks = get_stock_scores_for_theme(tid)
+                            self._stock_cache[tid] = stocks
+                        for s in stocks:
+                            stock_rows_section.append([
+                                tid,
+                                s.get("theme_stock_id"),
+                                s.get("stock_name") or "",
+                                s.get("normalized_code") or "",
+                                s.get("role") or "",
+                                s.get("scored_days") or 0,
+                                s.get("d1_pct"), s.get("d2_pct"),
+                                s.get("d3_pct"), s.get("d4_pct"),
+                                s.get("d5_pct"),
+                                s.get("d1_hit"), s.get("d2_hit"),
+                                s.get("d3_hit"), s.get("d4_hit"),
+                                s.get("d5_hit"),
+                            ])
+
+                for row in stock_rows_section:
+                    writer.writerow(row)
             QMessageBox.information(self, "成功", f"已导出: {path}")
         except Exception as exc:  # noqa: BLE001
             QMessageBox.critical(self, "导出失败", str(exc))

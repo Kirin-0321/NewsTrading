@@ -78,11 +78,24 @@ def sync_sector_daily(
                 rows_written=existing, skipped=True,
                 elapsed_ms=int((time.perf_counter() - start) * 1000),
             )
+    else:
+        # force=True：先清当日 fact_sector_daily，否则 fetcher 内
+        # _table_has_data 早退会跳过（2026-05-28 多源改造后，fetcher 已不
+        # 自动清空 fact 表，需调用方先 DELETE）
+        with db.connect() as conn:
+            conn.execute(
+                "DELETE FROM fact_sector_daily WHERE trade_date = ?",
+                (trade_date,),
+            )
 
-    # 2. 复用 fetcher 单步
+    # 2. 复用 fetcher 单步（多源拉取：dc 概念/行业/地域 + ths）
     client = client or TushareClient()
     fetcher = TushareMarketFetcher(client, db)
-    result = FetchResult(trade_date=trade_date, prev_trade_date="")
+    result = FetchResult(
+        trade_date=trade_date,
+        prev_trade_date="",
+        force_refresh=force,
+    )
     api0 = client.call_count
     try:
         fetcher._fetch_sector_moneyflow(result)  # noqa: SLF001
@@ -90,7 +103,7 @@ def sync_sector_daily(
         return DailySyncResult(
             ok=False, trade_date=trade_date,
             api_calls=client.call_count - api0,
-            error=f"moneyflow_ind_dc({trade_date}) 调用失败: {exc}",
+            error=f"moneyflow_ind_dc/ths({trade_date}) 调用失败: {exc}",
             elapsed_ms=int((time.perf_counter() - start) * 1000),
         )
     api_calls = client.call_count - api0
