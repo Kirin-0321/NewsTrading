@@ -108,6 +108,8 @@ _BACKTEST_FILTERS = [
 
 
 # 2026-05-28 22:00：上方表 D+N 列直接改为 α+N（α+N = D+N - 中证1000 当日 pct）
+# 元组第二个值原为像素宽度，2026-05-28 22:30 起列宽改为 ResizeToContents 自适应，
+# 数值仅作历史参考保留（实际未被读取，仅 c[0] 列名仍在用）
 _TPL_COLS = [
     ("模板", 220), ("版本", 60), ("真/回测", 70),
     ("题材", 50), ("已打", 50),
@@ -149,6 +151,9 @@ _TPL_COL_LAST_DATE = 15
 #   * 列 11 α-1（D+2~D+5 题材综合涨幅减中证1000 的 4 天均值，2026-05-28 18:40 加入）
 #   * 列 12 命中率（📄/🎯）/ 命中标记 ✓✗（📈）
 #   * 列 13 文件名 / AI 评语 / 理由（stretch 末列，📄 行尾内嵌「打分/删除」按钮）
+#
+# 元组第二个值原为像素宽度，2026-05-28 22:30 起改为 ResizeToContents 自适应
+# （末列 _COL_TAIL 仍是 Stretch），数值仅作历史参考保留
 _TREE_COLS = [
     ("名称",            260),  # 0
     ("类型/等级/角色",   100),  # 1
@@ -489,12 +494,17 @@ class PromptEvalPage(QWidget):
         self.tpl_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.tpl_table.setSelectionMode(QTableWidget.SingleSelection)
         self.tpl_table.verticalHeader().setVisible(False)
-        for i, (_, w) in enumerate(_TPL_COLS):
-            if w > 0:
-                self.tpl_table.setColumnWidth(i, w)
-        self.tpl_table.horizontalHeader().setSectionResizeMode(
-            0, QHeaderView.Stretch
-        )
+        # 列宽策略：第 0 列（模板名）填满剩余宽度，其余列按内容自适应
+        # 2026-05-28 22:30：从「写死 _TPL_COLS 宽度」改为 ResizeToContents，
+        # 避免 α±N 列双值 / 长百分比被截断
+        tpl_header = self.tpl_table.horizontalHeader()
+        for i in range(len(_TPL_COLS)):
+            if i == 0:
+                tpl_header.setSectionResizeMode(i, QHeaderView.Stretch)
+            else:
+                tpl_header.setSectionResizeMode(
+                    i, QHeaderView.ResizeToContents
+                )
         # 启用列头排序（每列原始可比较值塞到 UserRole+1，由 _TplTableItem 读取）
         self.tpl_table.setSortingEnabled(True)
         self.tpl_table.horizontalHeader().setSortIndicatorShown(True)
@@ -529,12 +539,17 @@ class PromptEvalPage(QWidget):
         # 默认按报告日期降序（_COL_NAME 列存日期作为可比较值）
         self.report_tree.sortByColumn(_COL_NAME, Qt.DescendingOrder)
 
-        for i, (_, w) in enumerate(_TREE_COLS):
-            if w > 0:
-                self.report_tree.setColumnWidth(i, w)
-        self.report_tree.header().setSectionResizeMode(
-            _COL_TAIL, QHeaderView.Stretch
-        )
+        # 列宽策略：尾列（文件名/理由/按钮）填满剩余宽度，其余列按内容自适应
+        # 2026-05-28 22:30：从「写死 _TREE_COLS 宽度」改为 ResizeToContents，
+        # 避免 D/α+N 双值列被截断
+        tree_header = self.report_tree.header()
+        for i in range(len(_TREE_COLS)):
+            if i == _COL_TAIL:
+                tree_header.setSectionResizeMode(i, QHeaderView.Stretch)
+            else:
+                tree_header.setSectionResizeMode(
+                    i, QHeaderView.ResizeToContents
+                )
 
         self.report_tree.itemExpanded.connect(self._on_item_expanded)
         self.report_tree.itemDoubleClicked.connect(
