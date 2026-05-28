@@ -76,21 +76,41 @@ alwaysApply: true
    - ⚪ 不在清单的文件 → 一律放着不管
 6. （命中豁免？是 → 跳过并在回复里说一声「无改动 / 全是他人改动，跳过提交」）
 7. git add <按清单交集的文件>          # ⚠️ 禁止 git add . / -A / -u
-8. git commit -m "..."                 # 用 HEREDOC 传 message，见下方模板
+8. git commit -m "..."  或  -F <临时文件>   # 按 PowerShell 写法二选一，见下方模板
 9. git status                          # 验证提交成功；剩余红色是他人改动，属正常
 10. 把 commit 的 hash + 简述 写进给主人的最终回复
 ```
 
 ## commit message 模板（中文，仿现有风格）
 
-参考本仓库现有 commit 风格：**开头动词 + 主要变更 + 目的 / 影响**，详尽但不啰嗦。
+> ⛔ **PowerShell 用户警告（主人环境是 Windows + PowerShell，不是 bash）**：
+>
+> - **禁止使用 bash heredoc 语法** `git commit -m "$(cat <<'EOF' ... EOF)"`——PowerShell 不认这套，会直接报语法错（`<<` 是重定向操作符，`EOF` 会被当成命令）。
+> - **禁止用 `\`（反斜杠）做命令续行**——PowerShell 续行符是反引号 `` ` ``，但根本没必要折行。
+> - **禁止在 Shell 工具里塞多行 `-m` 字符串硬怼**——换行 + 中文双引号会被 PowerShell 嚼烂。
+> - 之前每轮被 PowerShell 吐回来再改临时文件，是因为这个模板段一直没修。**现在改了，照下面的写。**
+
+参考本仓库现有 commit 风格：**开头动词 + 主要变更 + 目的 / 影响**，详尽但不啰嗦。本仓库历史 commit 大多是「一行长句」，单行 `-m` 完全够用。
+
+### 写法 A · 单行 `-m`（**首选**，95% 场景用这个）
+
+适用于：单行 message（哪怕这一行很长）、message 里没有英文双引号 `"`。
+
+```powershell
+git commit -m "新增 xxx 功能，xxx 影响。"
+```
+
+### 写法 B · 临时文件 + `-F`（多段 message / message 含双引号 时用）
+
+PowerShell 没有 heredoc，需要多行/含特殊字符 message 时，用 `Write` 工具落临时文件，再 `git commit -F` 读，最后 `Delete` 删掉：
 
 ```
-git commit -m "$(cat <<'EOF'
-<动词>+<主对象>+<核心变更>。<附带影响 / 关联文件 / 设计意图>。
-EOF
-)"
+1. Write 工具 → .huiye/_commit_msg.txt    # 文件名带 _ 前缀符合 .huiye/ 临时草稿白名单
+2. git commit -F .huiye/_commit_msg.txt   # 一行命令，PowerShell 直接执行
+3. Delete 工具 → .huiye/_commit_msg.txt   # 用完即删，不留垃圾
 ```
+
+> 临时文件**必须**放 `.huiye/_commit_msg.txt`，不要放仓库根（根目录会被 `git status` 看见、有可能被误 add）。`.huiye/` 不在追踪盲区也无所谓，下游 Delete 会清掉。
 
 开头动词词表：`新增 / 更新 / 修复 / 重构 / 优化 / 删除 / 文档`
 
