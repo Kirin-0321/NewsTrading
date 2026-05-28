@@ -257,10 +257,11 @@ def case_05_sync_stock_daily_force() -> None:
 def case_06_sync_sector_daily_basic() -> None:
     """sync_sector_daily 多源调用：dc 三类 + ths 行业 + ths 概念，合计 580 行。
 
-    2026-05-28 5 源改造后：
+    2026-05-28 5 源改造后 + dc_index 4 字段扩充：
       - dc 概念 200 + dc 行业 200 + dc 地域 50
         + ths 行业 50 + ths 概念 80 = 580 行
-      - 5 次 API 调用（每个子源 1 次）
+      - 8 次 API 调用：moneyflow_ind_dc ×3 + moneyflow_ind_ths +
+        moneyflow_cnt_ths + dc_index ×3（拉总市值/换手率/涨跌家数）
 
     注意：不能在此清 99990506 数据，case_07 还要用。
     """
@@ -282,6 +283,26 @@ def case_06_sync_sector_daily_basic() -> None:
                 "buy_elg_amount": 5e7,
                 "buy_lg_amount": 3e7,
                 "rank": i + 1,
+            }
+            for i in range(count)
+        ]
+
+    def dc_index_mock(params: dict) -> List[dict]:
+        """模拟 dc_index 接口：按 idx_type 区分，提供 total_mv 等 4 字段。"""
+        idx = params.get("idx_type", "")
+        # 与 dc_mock 同 ts_code，能 UPDATE 同 (trade_date, ts_code) 行
+        prefix_map = {"概念板块": "C", "行业板块": "I", "地域板块": "R"}
+        count_map = {"概念板块": 200, "行业板块": 200, "地域板块": 50}
+        prefix = prefix_map.get(idx, "X")
+        count = count_map.get(idx, 0)
+        return [
+            {
+                "ts_code": f"TEST_{prefix}{i:04d}.DC",
+                "name": f"测试{idx}{i}",
+                "total_mv": 1e8 + i * 1e6,        # 万元
+                "turnover_rate": 1.5 + (i % 10) * 0.1,
+                "up_num": 10 + (i % 5),
+                "down_num": 3 + (i % 4),
             }
             for i in range(count)
         ]
@@ -315,27 +336,38 @@ def case_06_sync_sector_daily_basic() -> None:
         "moneyflow_ind_dc": dc_mock,
         "moneyflow_ind_ths": ths_industry_mock,
         "moneyflow_cnt_ths": ths_concept_mock,
+        "dc_index": dc_index_mock,
     })
 
     res = sync_sector_daily(td, client=client)
     assert res.ok, f"sector sync 失败: {res.error}"
     assert res.rows_written == 580, (
-        f"sector rows_written 期望 580（200+200+50+50+80），得到 {res.rows_written}"
+        f"sector rows_written 期望 580（200+200+50+50+80），"
+        f"得到 {res.rows_written}"
     )
-    assert res.api_calls == 5, (
-        f"api_calls 期望 5（dc 三类 + ths 行业 + ths 概念）, 得到 {res.api_calls}"
+    assert res.api_calls == 8, (
+        f"api_calls 期望 8（dc 三类 + ths×2 + dc_index 三类）, "
+        f"得到 {res.api_calls}"
     )
     from services.market.market_db import get_market_db
     db = get_market_db()
     with db.connect(readonly=True) as conn:
         sample = conn.execute(
-            "SELECT pct_chg FROM fact_sector_daily "
-            "WHERE trade_date=? LIMIT 1",
+            "SELECT pct_chg, total_mv, turnover_rate, up_num, down_num "
+            "FROM fact_sector_daily "
+            "WHERE trade_date=? AND ts_code LIKE 'TEST_C%' LIMIT 1",
             (td,),
         ).fetchone()
     assert sample is not None and sample["pct_chg"] is not None, (
         f"pct_chg 入库为空: {dict(sample) if sample else None}"
     )
+    # 新增 4 字段也要 UPDATE 成功（dc 源）
+    assert sample["total_mv"] is not None, (
+        "dc_index merge 失败：total_mv 应非空"
+    )
+    assert sample["turnover_rate"] is not None, "turnover_rate 应非空"
+    assert sample["up_num"] is not None, "up_num 应非空"
+    assert sample["down_num"] is not None, "down_num 应非空"
 
 
 def case_08_sector_dual_source_idx_type() -> None:

@@ -365,7 +365,9 @@ def query_all_sectors(
             sql = (
                 "SELECT s.ts_code, s.pct_chg, s.main_net_yi, "
                 "       s.main_elg_yi, s.main_lg_yi, s.pct_chg_5d, "
-                "       s.rank_today, d.name "
+                "       s.rank_today, "
+                "       s.total_mv, s.turnover_rate, s.up_num, s.down_num, "
+                "       d.name "
                 "FROM fact_sector_daily s "
                 "LEFT JOIN dim_sector d ON d.ts_code = s.ts_code "
                 "WHERE s.trade_date = ? "
@@ -391,6 +393,10 @@ def query_all_sectors(
                     "main_net_yi": r["main_net_yi"],
                     "main_elg_yi": r["main_elg_yi"],
                     "main_lg_yi": r["main_lg_yi"],
+                    "total_mv": r["total_mv"],
+                    "turnover_rate": r["turnover_rate"],
+                    "up_num": r["up_num"],
+                    "down_num": r["down_num"],
                     "leaders": leaders,
                     "catalysts": [],
                     "catalysts_source": "none",

@@ -232,24 +232,41 @@ class MarketSummaryRenderer:
         top: Sequence[Dict[str, Any]],
         bottom: Sequence[Dict[str, Any]],
     ) -> str:
-        """板块强弱榜：Top N 涨幅 + Bottom N 跌幅 一节内分两表。"""
+        """板块强弱榜：Top N 涨幅 + Bottom N 跌幅 一节内分两表。
+
+        2026-05-28 扩列（关联设计 05-28-1530 / 施工 05-28-1550）：
+            * 两表加 4 列：换手% / 总市值(亿) / 超大单(亿) / 涨/跌
+            * 跌幅榜加催化列（决策 3）
+            * 表上方加"聚合语义注脚"——AI 读 ×N 不再误解为合计
+        """
         lines: List[str] = ["## 四、板块强弱榜", ""]
 
+        # 聚合语义注脚：v3 聚类版的关键说明，让 AI / 主人都不会误读
+        lines.append(
+            "> 说明：「成员 ×N」表示该行是 N 个同义板块组成的聚类组，"
+            "表内数值（涨幅 / 换手 / 总市值 / 涨停 等）均来自该组的"
+            "**中位代表板块**，不是 N 个板块的合计或平均。"
+            "换手率和总市值不能简单相加（成分股有重叠）。"
+        )
+        lines.append("")
+
         # ---- Top ----
-        # v3 聚类版：service 已按 top_sector_n（默认 30）切好，
-        # renderer 不再做 [:N] 二次切片，全量渲染
         cap_top = len(top)
         lines.append(f"### 涨幅 Top {cap_top}（聚类后）")
         if not top:
             lines.append("（无数据）")
         else:
+            # 13 列：# / 板块 / 成员 / 涨幅 / 5日 / 换手% / 总市值(亿) /
+            # 超大单(亿) / 主力净流入(亿) / 涨/跌 / 涨停数 / 龙头 / 催化
             lines.append(
                 "| # | 板块 | 成员 | 涨幅 | 5日累计 | "
-                "主力净流入(亿) | 涨停数 | 龙头 | 催化 |"
+                "换手% | 总市值(亿) | 超大单(亿) | 主力净流入(亿) | "
+                "涨/跌 | 涨停数 | 龙头 | 催化 |"
             )
             lines.append(
                 "|---|------|------|------|--------|"
-                "--------------|------|------|------|"
+                "------|----------|----------|--------------|"
+                "------|------|------|------|"
             )
             for s in top:
                 leaders = s.get("leaders") or []
@@ -261,53 +278,71 @@ class MarketSummaryRenderer:
                     str(c.get("text") if isinstance(c, dict) else c)
                     for c in catalysts[:2]
                 ) or EMPTY
-                # 聚类组员数：×N（N>1 才显示）
                 mc = s.get("members_count") or 1
                 mc_str = f"×{mc}" if mc > 1 else "—"
+                ud = _format_up_down(s.get("up_num"), s.get("down_num"))
                 lines.append(
                     f"| {_v(s.get('rank'))} "
                     f"| {_v(s.get('name'))} "
                     f"| {mc_str} "
                     f"| {_fmt_pct(s.get('pct_chg'))} "
                     f"| {_fmt_pct(s.get('pct_chg_5d'))} "
+                    f"| {_fmt_turnover(s.get('turnover_rate'))} "
+                    f"| {_fmt_num(s.get('total_mv'))} "
+                    f"| {_fmt_num(s.get('main_elg_yi'))} "
                     f"| {_fmt_num(s.get('main_net_yi'))} "
+                    f"| {ud} "
                     f"| {_v(s.get('limit_up_count'))} "
                     f"| {leader_str} "
                     f"| {catalyst_str} |"
                 )
 
         # ---- Bottom ----
-        # v3 同 Top，service 切好（默认 15）
         cap_bot = len(bottom)
         lines.append("")
         lines.append(f"### 跌幅 Bottom {cap_bot}（聚类后）")
         if not bottom:
             lines.append("（无数据）")
         else:
+            # 13 列：# / 板块 / 成员 / 跌幅 / 5日 / 换手% / 总市值(亿) /
+            # 超大单(亿) / 主力净流出(亿) / 涨/跌 / 跌停数 / 领跌 / 催化
             lines.append(
                 "| # | 板块 | 成员 | 跌幅 | 5日累计 | "
-                "主力净流出(亿) | 跌停数 | 领跌 |"
+                "换手% | 总市值(亿) | 超大单(亿) | 主力净流出(亿) | "
+                "涨/跌 | 跌停数 | 领跌 | 催化 |"
             )
             lines.append(
                 "|---|------|------|------|--------|"
-                "--------------|------|------|"
+                "------|----------|----------|--------------|"
+                "------|------|------|------|"
             )
             for s in bottom:
                 laggards = s.get("laggards") or []
                 laggard_str = "／".join(
                     _format_leader(le) for le in laggards[:3]
                 ) or EMPTY
+                catalysts = s.get("catalysts") or []
+                catalyst_str = "；".join(
+                    str(c.get("text") if isinstance(c, dict) else c)
+                    for c in catalysts[:2]
+                ) or EMPTY
                 mc = s.get("members_count") or 1
                 mc_str = f"×{mc}" if mc > 1 else "—"
+                ud = _format_up_down(s.get("up_num"), s.get("down_num"))
                 lines.append(
                     f"| {_v(s.get('rank'))} "
                     f"| {_v(s.get('name'))} "
                     f"| {mc_str} "
                     f"| {_fmt_pct(s.get('pct_chg'))} "
                     f"| {_fmt_pct(s.get('pct_chg_5d'))} "
+                    f"| {_fmt_turnover(s.get('turnover_rate'))} "
+                    f"| {_fmt_num(s.get('total_mv'))} "
+                    f"| {_fmt_num(s.get('main_elg_yi'))} "
                     f"| {_fmt_num(s.get('main_net_yi'))} "
+                    f"| {ud} "
                     f"| {_v(s.get('limit_down_count'))} "
-                    f"| {laggard_str} |"
+                    f"| {laggard_str} "
+                    f"| {catalyst_str} |"
                 )
 
         return "\n".join(lines)
@@ -573,6 +608,29 @@ def _fmt_pct_ratio(value: Any) -> str:
     if f is None:
         return EMPTY
     return f"{f * 100:.1f}%"
+
+
+def _format_up_down(up: Any, down: Any) -> str:
+    """涨跌家数渲染成 ``"26/17"``。任一为 None 时返回 EMPTY。
+
+    2026-05-28 新增（板块表 4 字段扩充）。
+    """
+    if up is None and down is None:
+        return EMPTY
+    u = up if up is not None else "—"
+    d = down if down is not None else "—"
+    return f"{u}/{d}"
+
+
+def _fmt_turnover(value: Any) -> str:
+    """换手率：单位已经是 %，渲染成 ``1.95%``（不带正负号）。
+
+    2026-05-28 新增——区别于 _fmt_pct 的 ``+1.95%`` 涨跌幅格式。
+    """
+    f = _to_float(value)
+    if f is None:
+        return EMPTY
+    return f"{f:.2f}%"
 
 
 def _fmt_elapsed(ms: Any) -> str:

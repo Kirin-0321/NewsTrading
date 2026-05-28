@@ -66,8 +66,15 @@ class MarketSummaryMerger:
         ai_patch: Optional[AIEnrichPatch],
         stats: MergeStats,
     ) -> None:
-        sectors = summary.get("sectors_top") or []
-        if not isinstance(sectors, list):
+        # 决策 3（2026-05-28）：跌幅榜（sectors_bottom）也注入催化。
+        # bottom 不参与 AI patch（prompt 只发 top），所以只用 cls 通道。
+        sectors_top = summary.get("sectors_top") or []
+        sectors_bottom = summary.get("sectors_bottom") or []
+        if not isinstance(sectors_top, list):
+            sectors_top = []
+        if not isinstance(sectors_bottom, list):
+            sectors_bottom = []
+        if not sectors_top and not sectors_bottom:
             return
 
         cls_by_sector: Dict[str, List[str]] = {}
@@ -89,8 +96,14 @@ class MarketSummaryMerger:
         sector_sources: Dict[str, str] = (
             field_sources.setdefault("sectors_top.catalysts", {})
         )
+        # 跌幅榜独立记 source map（field_sources 字典支持任意子键）
+        sector_bottom_sources: Dict[str, str] = (
+            field_sources.setdefault("sectors_bottom.catalysts", {})
+        )
         conflicts: List[Dict[str, Any]] = summary["conflicts"]
 
+        # 先处理 top（保持原行为：AI 可参与 + 冲突计数）
+        sectors = sectors_top
         for sector in sectors:
             if not isinstance(sector, dict):
                 continue
@@ -130,6 +143,22 @@ class MarketSummaryMerger:
             if source == "cls":
                 sector["catalysts_match"] = cls_sources.get(name, "exact")
             sector_sources[name] = source
+
+        # 决策 3（2026-05-28）：bottom 走简化通道——只 cls，不 AI、不计冲突
+        for sector in sectors_bottom:
+            if not isinstance(sector, dict):
+                continue
+            name = str(sector.get("name") or "").strip()
+            if not name:
+                continue
+            cls_cats = cls_by_sector.get(name) or []
+            chosen: List[str] = list(cls_cats) if cls_cats else []
+            source = "cls" if chosen else "none"
+            sector["catalysts"] = chosen
+            sector["catalysts_source"] = source
+            if source == "cls":
+                sector["catalysts_match"] = cls_sources.get(name, "exact")
+            sector_bottom_sources[name] = source
 
     # ------------------------------------------------------------------
     # market_shock 时间线（cls_market_shock）

@@ -78,6 +78,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help="只输出当日各 idx_type 命中行数（不返回明细）",
     )
     p.add_argument(
+        "--show-extra", action="store_true",
+        help="表格输出时多显示 4 列：换手% / 总市值(亿) / 涨/跌 / 超大单(亿)"
+             "（2026-05-28 新增；JSON 模式始终含全部字段）",
+    )
+    p.add_argument(
         "--json", dest="as_json", action="store_true",
         help="输出 JSON 数组到 stdout",
     )
@@ -132,10 +137,17 @@ def main(argv: list[str] | None = None) -> int:
         sys.stdout.write("\n")
     else:
         print(f"trade_date={td}  rows={len(rows)}")
-        print(
-            f"{'#':>3} {'板块':<14} {'涨幅':>8} {'5日':>8} "
-            f"{'涨停':>4} {'主力(亿)':>10} {'龙头股 Top3'}"
-        )
+        if args.show_extra:
+            print(
+                f"{'#':>3} {'板块':<14} {'涨幅':>8} {'5日':>8} "
+                f"{'换手%':>7} {'总市值(亿)':>11} {'超大单(亿)':>11} "
+                f"{'涨/跌':>8} {'涨停':>4} {'主力(亿)':>10} {'龙头股 Top3'}"
+            )
+        else:
+            print(
+                f"{'#':>3} {'板块':<14} {'涨幅':>8} {'5日':>8} "
+                f"{'涨停':>4} {'主力(亿)':>10} {'龙头股 Top3'}"
+            )
         for r in rows:
             pct = (
                 f"{r['pct_chg']:+.2f}%" if r["pct_chg"] is not None else "—"
@@ -156,10 +168,34 @@ def main(argv: list[str] | None = None) -> int:
                 f"{ld['name']}({ld.get('status') or ''})"
                 for ld in (r.get("leaders") or [])[:3]
             ) or "—"
-            print(
-                f"{r['rank']:>3} {r['name']:<14} {pct:>8} {pct5:>8} "
-                f"{lu:>4} {mn:>10} {leaders}"
-            )
+            if args.show_extra:
+                to = (
+                    f"{r['turnover_rate']:.2f}%"
+                    if r.get("turnover_rate") is not None else "—"
+                )
+                mv = (
+                    f"{r['total_mv']:,.1f}"
+                    if r.get("total_mv") is not None else "—"
+                )
+                elg = (
+                    f"{r['main_elg_yi']:,.2f}"
+                    if r.get("main_elg_yi") is not None else "—"
+                )
+                ud = (
+                    f"{r['up_num']}/{r['down_num']}"
+                    if (r.get("up_num") is not None
+                        and r.get("down_num") is not None) else "—"
+                )
+                print(
+                    f"{r['rank']:>3} {r['name']:<14} {pct:>8} {pct5:>8} "
+                    f"{to:>7} {mv:>11} {elg:>11} {ud:>8} "
+                    f"{lu:>4} {mn:>10} {leaders}"
+                )
+            else:
+                print(
+                    f"{r['rank']:>3} {r['name']:<14} {pct:>8} {pct5:>8} "
+                    f"{lu:>4} {mn:>10} {leaders}"
+                )
     return 0
 
 

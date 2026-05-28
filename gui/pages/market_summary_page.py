@@ -571,15 +571,23 @@ class MarketSummaryPage(QWidget):
     # Tab 2: 全部板块（支持 Top20 / Bottom10 / 全部 三种视图）
     # ------------------------------------------------------------------
 
+    # 2026-05-28 扩列（关联 008 迁移 / dc_index 4 字段）：
+    # 在 5日 后插入 4 列（换手% / 总市值 / 超大单 / 涨跌家数），
+    # 让 GUI 与 markdown 报告对齐（共 12 列；# 列加上后 markdown 是 13）。
+    # 列序锁定：染色 col 索引（涨幅 2 / 5日 3 / 超大单 6 / 主力 9）请勿改。
     _SECTOR_COLS = [
         ("#", 32),
         ("板块（代码）", 200),
         ("涨幅", 70),
         ("5日", 70),
+        ("换手%", 65),         # ← 新（dc_index.turnover_rate；ths 经 dc fallback 兜底）
+        ("总市值(亿)", 95),    # ← 新（dc_index.total_mv / 1e4）
+        ("超大单(亿)", 90),    # ← 新（fact_sector_daily.main_elg_yi）
+        ("涨/跌", 65),         # ← 新（dc_index.up_num/down_num）
         ("涨停", 50),
         ("主力(亿)", 90),
-        ("龙头股 Top3", 320),
-        ("催化（cls/ai）", 320),
+        ("龙头股 Top3", 280),
+        ("催化（cls/ai）", 280),
     ]
     # 板块视图模式：(显示文案模板, mode key, idx_type 筛选值或 None)
     # 文案中的 ``{n}`` 会在 ``_refresh_sector_mode_labels`` 里动态替换为
@@ -1575,11 +1583,27 @@ class MarketSummaryPage(QWidget):
             )
             risk_level, risk_bg, risk_tip = self._compute_high_risk(pct_5d)
 
+            # 2026-05-28 扩列：12 列对齐 _SECTOR_COLS
+            # 染色 col 索引：涨幅 2 / 5日 3 / 超大单 6 / 主力 9
+            turnover = s.get("turnover_rate")
+            total_mv = s.get("total_mv")
+            main_elg = s.get("main_elg_yi")
+            up_n = s.get("up_num")
+            dn_n = s.get("down_num")
+            ud_txt = (
+                f"{up_n}/{dn_n}" if up_n is not None and dn_n is not None
+                else "—"
+            )
             cells = [
                 str(s.get("rank") or row + 1),
                 name_cell,
                 _fmt_pct(pct),
                 _fmt_pct(pct_5d),
+                (f"{float(turnover):.2f}%"
+                 if turnover is not None else "—"),
+                _fmt_num(total_mv, 1) if total_mv is not None else "—",
+                _fmt_num(main_elg) if main_elg is not None else "—",
+                ud_txt,
                 _fmt_int(s.get("limit_up_count")),
                 _fmt_num(main_net),
                 leaders_text,
@@ -1621,7 +1645,17 @@ class MarketSummaryPage(QWidget):
                         f = QFont()
                         f.setBold(True)
                         item.setFont(f)
-                elif col == 5 and main_net is not None:
+                elif col == 6 and main_elg is not None:
+                    # 超大单红绿染色（与主力同款）
+                    try:
+                        f_val = float(main_elg)
+                        item.setForeground(
+                            _COLOR_RED if f_val > 0 else
+                            _COLOR_GREEN if f_val < 0 else _COLOR_MUTED
+                        )
+                    except (TypeError, ValueError):
+                        pass
+                elif col == 9 and main_net is not None:
                     try:
                         f_val = float(main_net)
                         item.setForeground(
@@ -1683,6 +1717,11 @@ class MarketSummaryPage(QWidget):
             median_pct = g.get("median_pct_chg")
             median_5d = g.get("median_pct_chg_5d")
             median_main = g.get("median_main_net_yi")
+            median_elg = g.get("median_main_elg_yi")
+            median_mv = g.get("median_total_mv")
+            median_to = g.get("median_turnover_rate")
+            median_up = g.get("median_up_num")
+            median_dn = g.get("median_down_num")
             median_ts = str(g.get("median_ts_code") or "")
             median_sector = str(g.get("median_sector_name") or "")
             is_unclassified = g.get("group_name") is None
@@ -1698,11 +1737,21 @@ class MarketSummaryPage(QWidget):
                 fallback=[],
             )
 
+            # 2026-05-28 扩列：12 列对齐 _SECTOR_COLS
+            ud_txt = (
+                f"{median_up}/{median_dn}"
+                if median_up is not None and median_dn is not None else "—"
+            )
             top_cells = [
                 str(i),
                 top_name,
                 _fmt_pct(median_pct),
                 _fmt_pct(median_5d),
+                (f"{float(median_to):.2f}%"
+                 if median_to is not None else "—"),
+                _fmt_num(median_mv, 1) if median_mv is not None else "—",
+                _fmt_num(median_elg) if median_elg is not None else "—",
+                ud_txt,
                 f"×{cnt}" if cnt > 1 else "—",
                 _fmt_num(median_main),
                 top_leaders,
@@ -1726,7 +1775,7 @@ class MarketSummaryPage(QWidget):
                 ),
             )
 
-            # 涨幅列染色
+            # 染色 col 索引：涨幅 2 / 5日 3 / 超大单 6 / 主力 9
             c_pct = _pct_color(median_pct)
             if c_pct is not None:
                 top_item.setForeground(2, c_pct)
@@ -1735,12 +1784,21 @@ class MarketSummaryPage(QWidget):
             if c_5d is not None:
                 top_item.setForeground(3, c_5d)
 
-            # 主力(亿)列染色
+            if median_elg is not None:
+                try:
+                    f_val = float(median_elg)
+                    top_item.setForeground(
+                        6,
+                        _COLOR_RED if f_val > 0 else
+                        _COLOR_GREEN if f_val < 0 else _COLOR_MUTED,
+                    )
+                except (TypeError, ValueError):
+                    pass
             if median_main is not None:
                 try:
                     f_val = float(median_main)
                     top_item.setForeground(
-                        5,
+                        9,
                         _COLOR_RED if f_val > 0 else
                         _COLOR_GREEN if f_val < 0 else _COLOR_MUTED,
                     )
@@ -1753,6 +1811,11 @@ class MarketSummaryPage(QWidget):
                     m_pct = m.get("pct_chg")
                     m_5d = m.get("pct_chg_5d")
                     m_main = m.get("main_net_yi")
+                    m_elg = m.get("main_elg_yi")
+                    m_mv = m.get("total_mv")
+                    m_to = m.get("turnover_rate")
+                    m_up = m.get("up_num")
+                    m_dn = m.get("down_num")
                     m_ts = str(m.get("ts_code") or "")
                     m_name = str(m.get("sector_name") or "")
                     is_med = bool(m.get("is_median"))
@@ -1764,11 +1827,21 @@ class MarketSummaryPage(QWidget):
                         f"({m.get('idx_type', '')}/{m.get('src', '')})"
                     )
 
+                    # 2026-05-28 扩列：12 列对齐
+                    m_ud = (
+                        f"{m_up}/{m_dn}"
+                        if m_up is not None and m_dn is not None else "—"
+                    )
                     child_cells = [
                         "",
                         name_cell,
                         _fmt_pct(m_pct),
                         _fmt_pct(m_5d),
+                        (f"{float(m_to):.2f}%"
+                         if m_to is not None else "—"),
+                        _fmt_num(m_mv, 1) if m_mv is not None else "—",
+                        _fmt_num(m_elg) if m_elg is not None else "—",
+                        m_ud,
                         "—",
                         _fmt_num(m_main),
                         "—",
@@ -1786,18 +1859,27 @@ class MarketSummaryPage(QWidget):
                         ),
                     )
 
-                    # 涨幅 / 主力同样染色
                     cc_pct = _pct_color(m_pct)
                     if cc_pct is not None:
                         child.setForeground(2, cc_pct)
                     cc_5d = _pct_color(m_5d)
                     if cc_5d is not None:
                         child.setForeground(3, cc_5d)
+                    if m_elg is not None:
+                        try:
+                            f_val = float(m_elg)
+                            child.setForeground(
+                                6,
+                                _COLOR_RED if f_val > 0 else
+                                _COLOR_GREEN if f_val < 0 else _COLOR_MUTED,
+                            )
+                        except (TypeError, ValueError):
+                            pass
                     if m_main is not None:
                         try:
                             f_val = float(m_main)
                             child.setForeground(
-                                5,
+                                9,
                                 _COLOR_RED if f_val > 0 else
                                 _COLOR_GREEN if f_val < 0 else _COLOR_MUTED,
                             )

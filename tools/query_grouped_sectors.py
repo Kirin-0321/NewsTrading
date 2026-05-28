@@ -73,6 +73,11 @@ def main(argv: list[str] | None = None) -> int:
         help="只输出当日组数",
     )
     p.add_argument(
+        "--show-extra", action="store_true",
+        help="平面 / 树形输出多显示 4 列：换手% / 总市值(亿) / 涨/跌 / "
+             "超大单(亿)（2026-05-28 新增；JSON 模式始终全字段）",
+    )
+    p.add_argument(
         "--json", dest="as_json", action="store_true",
         help="JSON 结构化输出（便于 jq / 后端集成）",
     )
@@ -142,18 +147,54 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[INFO] {td} 无数据")
         return 1
     print(f"=== 聚类视图 {td} · {len(rows)} 组（平面） ===")
-    print(f"{'组名':14s} ×N   涨幅      5日       主力(亿)    代表板块")
-    print("-" * 80)
+    if args.show_extra:
+        print(
+            f"{'组名':14s} ×N   涨幅      5日       "
+            f"换手%   总市值(亿)  涨/跌    超大单(亿)  主力(亿)    代表"
+        )
+        print("-" * 110)
+    else:
+        print(f"{'组名':14s} ×N   涨幅      5日       主力(亿)    代表板块")
+        print("-" * 80)
     for r in rows:
         tag = "[未聚类]" if r["group_name"] is None else ""
-        print(
-            f"{r['display_name'][:14]:14s} "
-            f"×{r['cnt_in_data']:<2d}  "
-            f"{_fmt_pct(r['pct_chg']):>7s}  "
-            f"{_fmt_pct(r['pct_chg_5d']):>7s}  "
-            f"{_fmt_yi(r['main_net_yi']):>10s}  "
-            f"{r['ts_code']}{tag}"
-        )
+        if args.show_extra:
+            to = (
+                f"{r['turnover_rate']:.2f}%"
+                if r.get("turnover_rate") is not None else "—"
+            )
+            mv = (
+                f"{r['total_mv']:,.1f}"
+                if r.get("total_mv") is not None else "—"
+            )
+            elg = (
+                f"{r['main_elg_yi']:+.2f}亿"
+                if r.get("main_elg_yi") is not None else "—"
+            )
+            up_n = r.get("up_num")
+            dn_n = r.get("down_num")
+            ud = (
+                f"{up_n}/{dn_n}" if up_n is not None and dn_n is not None
+                else "—"
+            )
+            print(
+                f"{r['display_name'][:14]:14s} "
+                f"×{r['cnt_in_data']:<2d}  "
+                f"{_fmt_pct(r['pct_chg']):>7s}  "
+                f"{_fmt_pct(r['pct_chg_5d']):>7s}  "
+                f"{to:>6s}  {mv:>10s}  {ud:>6s}  {elg:>10s}  "
+                f"{_fmt_yi(r['main_net_yi']):>10s}  "
+                f"{r['ts_code']}{tag}"
+            )
+        else:
+            print(
+                f"{r['display_name'][:14]:14s} "
+                f"×{r['cnt_in_data']:<2d}  "
+                f"{_fmt_pct(r['pct_chg']):>7s}  "
+                f"{_fmt_pct(r['pct_chg_5d']):>7s}  "
+                f"{_fmt_yi(r['main_net_yi']):>10s}  "
+                f"{r['ts_code']}{tag}"
+            )
     return 0
 
 

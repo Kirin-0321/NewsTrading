@@ -315,9 +315,13 @@ class MarketSummaryService:
             ai_patch: Optional[AIEnrichPatch] = None
             if mode == "hybrid":
                 progress("CLS 数据匹配…")
-                cls_result = self.cls_enricher.enrich(
-                    td, summary.get("sectors_top") or []
-                )
+                # 决策 3（2026-05-28）：跌幅榜也跑 cls 催化匹配。
+                # cls_enricher.enrich 按 sector.name 匹配，对来源无感知，
+                # 把 top + bottom 拼起来喂一次即可；后续 merger 会按 list
+                # 分别注入 catalysts 字段。
+                _top = summary.get("sectors_top") or []
+                _bot = summary.get("sectors_bottom") or []
+                cls_result = self.cls_enricher.enrich(td, list(_top) + list(_bot))
 
                 if _maybe_cancelled(cancel_check, result):
                     return _finalize(result, t0)
@@ -907,6 +911,11 @@ class MarketSummaryService:
                     "main_net_yi": _round(r["main_net_yi"], 2),
                     "main_elg_yi": _round(r["main_elg_yi"], 2),
                     "main_lg_yi": _round(r["main_lg_yi"], 2),
+                    # 2026-05-28 新增（关联 008/dc_index/dc fallback）
+                    "total_mv": _round(r.get("total_mv"), 1),
+                    "turnover_rate": _round(r.get("turnover_rate"), 2),
+                    "up_num": r.get("up_num"),
+                    "down_num": r.get("down_num"),
                     "leaders": leaders,
                     "catalysts": [],        # cls/ai enricher 之后注入
                     "high_risk": None,
@@ -973,7 +982,13 @@ class MarketSummaryService:
                     "main_net_yi": _round(r["main_net_yi"], 2),
                     "main_elg_yi": _round(r["main_elg_yi"], 2),
                     "main_lg_yi": _round(r["main_lg_yi"], 2),
+                    # 2026-05-28 新增（关联 008/dc_index/dc fallback）
+                    "total_mv": _round(r.get("total_mv"), 1),
+                    "turnover_rate": _round(r.get("turnover_rate"), 2),
+                    "up_num": r.get("up_num"),
+                    "down_num": r.get("down_num"),
                     "laggards": laggards,
+                    "catalysts": [],        # 决策 3：跌幅榜也加催化
                     "field_sources": {
                         "pct_chg": "tushare",
                         "main_net_yi": "tushare",

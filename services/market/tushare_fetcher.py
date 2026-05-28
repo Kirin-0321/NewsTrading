@@ -1,6 +1,6 @@
 """Tushare 行情数据取数 + 入库（Phase M1b）。
 
-接口调用清单（与 ``_tushare_field_audit.md §7.1`` 对齐）::
+接口调用清单（与 ``doc/reports/05-26-2126-Tushare接口字段审计.md §7.1`` 对齐）::
 
     1.  index_daily       × 7 大指数      → fact_index_daily
     2.  dc_index          (idx_type=概念) → dim_sector upsert
@@ -25,7 +25,7 @@
 * **缓存**：默认检测 ``fact_index_daily`` 有当天数据则跳过 ingest，``force_refresh``
   开关一开就先 DELETE 当天全部 fact_* 再重拉。
 * **金额单位**：所有 ``*_yi`` 后缀字段统一为「亿元」浮点；详见
-  ``_tushare_field_audit.md §4 单位速查表``。
+  ``doc/reports/05-26-2126-Tushare接口字段审计.md §4 单位速查表``。
 * **失败容忍**：单个接口异常不抛出，写入 ``warnings``，继续后续步骤。
   对端到端流程而言"丢一个 fact 表"比"全盘失败"友好得多。
 """
@@ -492,6 +492,31 @@ class TushareMarketFetcher:
 
         result.ingested["fact_sector_daily"] = total
 
+        # --- 3c. dc_index 三类（补总市值 / 换手率 / 涨跌家数 4 列）---
+        # 2026-05-28 新增（关联 008 迁移）：moneyflow_ind_dc 拉的是资金流
+        # 不含 total_mv/turnover_rate/up_num/down_num，这 4 字段在 dc_index
+        # 接口里。这里跑在 moneyflow_ind_dc 之后，UPDATE 同 ts_code 的行。
+        # ths 源板块（.TI）由于 dc_index 不会返回这些 ts_code，自然不会被
+        # 更新，4 列保持 NULL；聚合层有 dc fallback 做兜底（决策 5）。
+        dc_index_total = 0
+        for content_type, idx_type in self._DC_SECTOR_VARIANTS:
+            try:
+                rows_dc = self.client.call(
+                    "dc_index",
+                    params={
+                        "trade_date": result.trade_date,
+                        "idx_type": idx_type,
+                    },
+                )
+            except TushareError as exc:
+                result.warnings.append(f"dc_index({idx_type}): {exc}")
+                continue
+            dc_index_total += self._merge_dc_index_to_fact_sector_daily(
+                rows_dc, result.trade_date,
+            )
+        if dc_index_total:
+            result.ingested["fact_sector_daily.dc_index"] = dc_index_total
+
     # 兼容老调用方（sector_daily_sync 复用了 _fetch_sector_moneyflow）
     def _ingest_sector_daily(
         self, rows: Sequence[dict], trade_date: str
@@ -566,6 +591,69 @@ class TushareMarketFetcher:
                 payload,
             )
         return len(payload)
+
+    def _merge_dc_index_to_fact_sector_daily(
+        self,
+        rows: Sequence[dict],
+        trade_date: str,
+    ) -> int:
+        """把 dc_index 接口拿到的 4 字段 UPDATE 到 fact_sector_daily 已有行。
+
+        关联：008 迁移 / 决策 5 dc fallback。
+
+        Args:
+            rows: dc_index 返回行（idx_type 不在此参数，由调用方区分）
+            trade_date: YYYYMMDD
+
+        Returns:
+            int: 成功 UPDATE 的行数。
+
+        约定:
+            * 期望 moneyflow_ind_dc 路径已先 INSERT 同 (trade_date, ts_code) 行，
+              这里只做 UPDATE。若 ts_code 在 fact_sector_daily 不存在，
+              SQLite UPDATE 自然不会动任何行（影响行数 = 0），不报错。
+            * total_mv 单位换算：dc_index.total_mv 是万元，落库前 ÷ 1e4 转亿元。
+            * up_num / down_num 直接 INT 落库；turnover_rate 保持 %。
+        """
+        if not rows:
+            return 0
+        payload: List[tuple] = []
+        for r in rows:
+            ts_code = r.get("ts_code")
+            if not ts_code:
+                continue
+            payload.append(
+                (
+                    _safe_div(r.get("total_mv"), 1e4),  # 万元 → 亿元
+                    _to_float(r.get("turnover_rate")),
+                    _to_int(r.get("up_num")),
+                    _to_int(r.get("down_num")),
+                    trade_date,
+                    ts_code,
+                )
+            )
+        if not payload:
+            return 0
+        with self.db.connect() as conn:
+            cursor = conn.executemany(
+                "UPDATE fact_sector_daily SET "
+                " total_mv = ?, turnover_rate = ?, "
+                " up_num = ?, down_num = ? "
+                "WHERE trade_date = ? AND ts_code = ?",
+                payload,
+            )
+            # SQLite executemany 的 rowcount 在某些版本不可靠，再 SELECT
+            # 一次拿真实数：今日 dc 源板块且 4 字段都非 NULL 的行数
+            confirmed = conn.execute(
+                "SELECT COUNT(*) FROM fact_sector_daily "
+                "WHERE trade_date = ? "
+                "  AND total_mv IS NOT NULL "
+                "  AND turnover_rate IS NOT NULL",
+                (trade_date,),
+            ).fetchone()[0]
+        # 取较大值作为返回（兼容 rowcount 不可靠的环境）
+        attempted = cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else 0
+        return max(attempted, confirmed)
 
     def _ingest_sector_daily_ths(
         self,

@@ -112,6 +112,7 @@ _SECTOR_GROUPED_MEDIAN_SQL = """
 WITH base AS (
     SELECT s.ts_code, s.pct_chg, s.main_net_yi, s.main_elg_yi,
            s.main_lg_yi, s.pct_chg_5d, s.rank_today,
+           s.total_mv, s.turnover_rate, s.up_num, s.down_num,
            d.name AS sector_name, d.idx_type, d.src,
            d.group_id,
            g.name AS group_name,
@@ -132,16 +133,32 @@ WITH base AS (
            ) AS rn,
            COUNT(*) OVER (PARTITION BY gkey) AS cnt_in_data
     FROM keyed
+), dc_fallback AS (
+    -- 决策 5：每组从组内 dc 源板块取 4 字段
+    -- （ths 源板块不提供 total_mv/turnover_rate/up_num/down_num，
+    --  中位代表恰为 ths 时用此 fallback 补值；整组只有 ths 时仍 NULL）
+    SELECT gkey,
+           MAX(CASE WHEN src='dc' THEN total_mv      END) AS dc_total_mv,
+           MAX(CASE WHEN src='dc' THEN turnover_rate END) AS dc_turnover_rate,
+           MAX(CASE WHEN src='dc' THEN up_num        END) AS dc_up_num,
+           MAX(CASE WHEN src='dc' THEN down_num      END) AS dc_down_num
+    FROM keyed
+    GROUP BY gkey
 )
-SELECT ts_code, pct_chg, main_net_yi, main_elg_yi,
-       main_lg_yi, pct_chg_5d, rank_today,
-       sector_name, group_name,
-       COALESCE(group_name, sector_name) AS display_name,
-       cnt_in_data,
-       members_count
-FROM ranked
-WHERE rn = (cnt_in_data + 1) / 2
-ORDER BY pct_chg DESC NULLS LAST
+SELECT r.ts_code, r.pct_chg, r.main_net_yi, r.main_elg_yi,
+       r.main_lg_yi, r.pct_chg_5d, r.rank_today,
+       r.sector_name, r.group_name,
+       COALESCE(r.group_name, r.sector_name) AS display_name,
+       r.cnt_in_data,
+       r.members_count,
+       COALESCE(r.total_mv,      f.dc_total_mv)      AS total_mv,
+       COALESCE(r.turnover_rate, f.dc_turnover_rate) AS turnover_rate,
+       COALESCE(r.up_num,        f.dc_up_num)        AS up_num,
+       COALESCE(r.down_num,      f.dc_down_num)      AS down_num
+FROM ranked r
+LEFT JOIN dc_fallback f USING (gkey)
+WHERE r.rn = (r.cnt_in_data + 1) / 2
+ORDER BY r.pct_chg DESC NULLS LAST
 """
 
 
@@ -167,6 +184,9 @@ def query_grouped_sectors_for_date(
 
           - ts_code, pct_chg, main_net_yi, main_elg_yi, main_lg_yi
           - pct_chg_5d, rank_today
+          - **total_mv** (亿元，2026-05-28 新增；中位 ths 时由 dc fallback 补)
+          - **turnover_rate** (%，同上)
+          - **up_num / down_num** (int，同上)
           - sector_name (中位代表板块原始名)
           - group_name (NULL 表示未聚类)
           - display_name (优先 group_name，NULL 时用 sector_name)
@@ -208,6 +228,19 @@ def query_grouped_sectors_for_date(
                 int(r["rank_today"])
                 if r["rank_today"] is not None else None
             ),
+            "total_mv": (
+                float(r["total_mv"]) if r["total_mv"] is not None else None
+            ),
+            "turnover_rate": (
+                float(r["turnover_rate"])
+                if r["turnover_rate"] is not None else None
+            ),
+            "up_num": (
+                int(r["up_num"]) if r["up_num"] is not None else None
+            ),
+            "down_num": (
+                int(r["down_num"]) if r["down_num"] is not None else None
+            ),
             "sector_name": str(r["sector_name"] or ""),
             "group_name": (
                 str(r["group_name"]) if r["group_name"] else None
@@ -227,6 +260,7 @@ def query_grouped_sectors_for_date(
 _SECTOR_GROUPED_FULL_SQL = """
 SELECT s.ts_code, s.pct_chg, s.main_net_yi, s.main_elg_yi,
        s.main_lg_yi, s.pct_chg_5d, s.rank_today,
+       s.total_mv, s.turnover_rate, s.up_num, s.down_num,
        d.name AS sector_name, d.idx_type, d.src,
        d.group_id,
        g.name AS group_name,
@@ -328,6 +362,19 @@ def query_grouped_sectors_with_members(
                 float(r["main_lg_yi"])
                 if r["main_lg_yi"] is not None else None
             ),
+            "total_mv": (
+                float(r["total_mv"]) if r["total_mv"] is not None else None
+            ),
+            "turnover_rate": (
+                float(r["turnover_rate"])
+                if r["turnover_rate"] is not None else None
+            ),
+            "up_num": (
+                int(r["up_num"]) if r["up_num"] is not None else None
+            ),
+            "down_num": (
+                int(r["down_num"]) if r["down_num"] is not None else None
+            ),
             "rank_today": (
                 int(r["rank_today"])
                 if r["rank_today"] is not None else None
@@ -378,6 +425,20 @@ def query_grouped_sectors_with_members(
         display_name = (
             meta["group_name"] or median["sector_name"]
         )
+        # 决策 5（2026-05-28）：dc fallback —— 中位代表是 ths 源时，
+        # 4 字段全 NULL，用组内任一 dc 源板块的 4 字段顶替；整组只有 ths
+        # 时仍为 NULL（GUI 显示 "—"）。
+        dc_fallback = next(
+            (mm for mm in members if mm.get("src") == "dc"),
+            None,
+        )
+
+        def _coalesce(field: str) -> Any:
+            v = median.get(field)
+            if v is not None:
+                return v
+            return dc_fallback.get(field) if dc_fallback else None
+
         out.append({
             "group_id": meta["group_id"],
             "group_name": meta["group_name"],
@@ -391,6 +452,10 @@ def query_grouped_sectors_with_members(
             "median_main_net_yi": median["main_net_yi"],
             "median_main_elg_yi": median["main_elg_yi"],
             "median_main_lg_yi": median["main_lg_yi"],
+            "median_total_mv": _coalesce("total_mv"),
+            "median_turnover_rate": _coalesce("turnover_rate"),
+            "median_up_num": _coalesce("up_num"),
+            "median_down_num": _coalesce("down_num"),
             "median_rank_today": median["rank_today"],
             "members": members_for_display,
         })
