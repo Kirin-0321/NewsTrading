@@ -20,13 +20,17 @@ data/AI_analysis/
 分析数据/盘后总结/
 !data/**/.gitkeep
 
-# 数据库（主库 news.db 纳入版本管理，其余仍忽略）
+# 数据库（news.db / ai_inference.db 纳入版本管理，market.db 太大每天增长不追踪）
 *.db
 *.db-shm
 *.db-wal
 *.sqlite
 *.sqlite3
 !data/news.db
+!data/ai_inference.db
+
+# 数据库备份目录：迁移钩子 / 手动备份产生的 .bak 都在这里，体积大且每次迁移会新增，不追踪
+data/backups/
 
 # 日志
 logs/*.log
