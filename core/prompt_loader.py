@@ -360,14 +360,32 @@ class PromptLoader:
             return tmpl
 
     def list_category(self, category: str) -> List[PromptTemplate]:
-        """列出某 category 下所有 prompt。"""
+        """列出某 category 下所有 prompt。
+
+        排序规则（2026-05-28 起）：按文件 **创建时间升序**——先创建的排前面，
+        新建的追加到末尾。Windows 下 ``Path.stat().st_ctime`` 即真实创建时间；
+        若两个文件创建时间完全一致（如批量迁移生成），用文件名作 tie-break，
+        保证顺序稳定不抖动。
+        """
         cat_dir = self.root / category
         if not cat_dir.is_dir():
             return []
+
+        md_files = [
+            p for p in cat_dir.glob("*.md") if not p.name.startswith("_")
+        ]
+
+        def _sort_key(p: Path) -> Tuple[float, str]:
+            try:
+                ctime = p.stat().st_ctime
+            except OSError:
+                ctime = float("inf")
+            return (ctime, p.name)
+
+        md_files.sort(key=_sort_key)
+
         results: List[PromptTemplate] = []
-        for md_file in sorted(cat_dir.glob("*.md")):
-            if md_file.name.startswith("_"):
-                continue
+        for md_file in md_files:
             try:
                 results.append(self.get(category, md_file.stem))
             except PromptError as e:
