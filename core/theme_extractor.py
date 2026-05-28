@@ -433,8 +433,12 @@ class ThemeExtractor:
             "temperature": self.temperature,
             "stream": True,
         }
-        # 与主分析器一致：V4 默认 thinking，分类抽取必须关闭，否则长时间无 content 易触发读超时
-        if self.provider == "deepseek" and str(self.model).startswith("deepseek-v4"):
+        # 2026-05-28 19:30 hotfix：deepseek-v4-flash 不支持 thinking 参数，
+        # 误传 {"thinking":{"type":"disabled"}} 后服务端 200 OK 但 SSE 流死寂
+        # （不送 content / 不送 keepalive，TCP keepalive 让 httpx read timeout 失灵）。
+        # 收紧判定：只对带 thinking 能力的 deepseek-v4-pro 显式关闭，flash 不传。
+        # 详见 doc/bugfix/05-28-1930-题材抽取thinking误发flash致SSE死寂.md
+        if self.provider == "deepseek" and str(self.model).startswith("deepseek-v4-pro"):
             create_kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
 
         response = client.chat.completions.create(**create_kwargs)
