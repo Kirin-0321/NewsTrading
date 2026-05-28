@@ -895,9 +895,31 @@ class MarketSummaryService:
                 # 比如 group="白酒" 匹配 limit_stock.theme="白酒" >>
                 # sector_name="酿酒概念" 几乎匹配不到
                 match_key = r["group_name"] or sector_name
-                limit_up_count, leaders = self._derive_sector_leaders(
-                    conn, td, match_key
+                # limit_up_count 仍走 fact_limit_stock LIKE（涨停股口径）
+                limit_up_count, _legacy_leaders = (
+                    self._derive_sector_leaders(conn, td, match_key)
                 )
+                # 2026-05-28 v2：领涨股改用 dim_sector_stock JOIN
+                # fact_stock_daily（板块成员当日涨幅 Top3）。
+                # ths 板块走 resolve_dc_sector_ts_code 做 dc fallback。
+                from services.market.sector_grouping import (
+                    compute_sector_leaders,
+                    compute_sector_limit_count,
+                    resolve_dc_sector_ts_code,
+                )
+                dc_ts = resolve_dc_sector_ts_code(conn, r["ts_code"])
+                leaders = (
+                    compute_sector_leaders(conn, dc_ts, td, limit=3)
+                    if dc_ts else []
+                )
+                if not leaders and _legacy_leaders:
+                    leaders = _legacy_leaders
+                # 2026-05-28 v2b：涨停数改走真成员表 JOIN（更准）；
+                # dim_sector_stock 命中时覆盖旧 LIKE 口径
+                if dc_ts:
+                    limit_up_count = compute_sector_limit_count(
+                        conn, dc_ts, td, limit_type="U",
+                    )
                 out.append({
                     "rank": i,
                     "ts_code": r["ts_code"],
@@ -966,9 +988,30 @@ class MarketSummaryService:
             for i, r in enumerate(rows, 1):
                 sector_name = r["sector_name"]
                 match_key = r["group_name"] or sector_name
-                limit_down_count, laggards = self._derive_sector_laggards(
-                    conn, td, match_key
+                limit_down_count, _legacy_laggards = (
+                    self._derive_sector_laggards(conn, td, match_key)
                 )
+                # 2026-05-28 v2：领跌股改用 dim_sector_stock JOIN
+                # fact_stock_daily（板块成员当日涨幅 Bottom3）。
+                from services.market.sector_grouping import (
+                    compute_sector_leaders,
+                    compute_sector_limit_count,
+                    resolve_dc_sector_ts_code,
+                )
+                dc_ts = resolve_dc_sector_ts_code(conn, r["ts_code"])
+                laggards = (
+                    compute_sector_leaders(
+                        conn, dc_ts, td, limit=3, ascending=True,
+                    )
+                    if dc_ts else []
+                )
+                if not laggards and _legacy_laggards:
+                    laggards = _legacy_laggards
+                # 2026-05-28 v2b：跌停数改走真成员表 JOIN
+                if dc_ts:
+                    limit_down_count = compute_sector_limit_count(
+                        conn, dc_ts, td, limit_type="D",
+                    )
                 out.append({
                     "rank": i,
                     "ts_code": r["ts_code"],

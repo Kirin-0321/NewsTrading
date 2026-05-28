@@ -586,7 +586,7 @@ class MarketSummaryPage(QWidget):
         ("涨/跌", 65),         # ← 新（dc_index.up_num/down_num）
         ("涨停", 50),
         ("主力(亿)", 90),
-        ("龙头股 Top3", 280),
+        ("领涨股", 280),
         ("催化（cls/ai）", 280),
     ]
     # 板块视图模式：(显示文案模板, mode key, idx_type 筛选值或 None)
@@ -676,13 +676,19 @@ class MarketSummaryPage(QWidget):
         # 标题在 _populate_sectors 里按实际行数动态刷新（split 模式下）
         self.sector_top_group = QGroupBox("📈 涨幅 Top（聚类）")
         tg = QVBoxLayout(self.sector_top_group)
-        self.sector_table = self._make_basic_table(self._SECTOR_COLS)
+        self.sector_table = self._make_basic_tree(self._SECTOR_COLS)
+        self.sector_table.itemExpanded.connect(
+            self._on_sector_item_expanded
+        )
         tg.addWidget(self.sector_table)
         splitter.addWidget(self.sector_top_group)
 
         self.sector_bot_group = QGroupBox("📉 跌幅 Top（聚类）")
         bg = QVBoxLayout(self.sector_bot_group)
-        self.sector_table_bottom = self._make_basic_table(self._SECTOR_COLS)
+        self.sector_table_bottom = self._make_basic_tree(self._SECTOR_COLS)
+        self.sector_table_bottom.itemExpanded.connect(
+            self._on_sector_item_expanded
+        )
         bg.addWidget(self.sector_table_bottom)
         splitter.addWidget(self.sector_bot_group)
 
@@ -975,6 +981,28 @@ class MarketSummaryPage(QWidget):
         tbl.setEditTriggers(QAbstractItemView.NoEditTriggers)
         tbl.setStyleSheet(TABLE_STYLE)
         return tbl
+
+    def _make_basic_tree(self, cols: list) -> QTreeWidget:
+        """统一构造 QTreeWidget（split 模式板块表用，支持点击展开看成员）。
+
+        2026-05-28 新增（v2 领涨股 + GUI 展开）。
+        视觉与 _make_basic_table 一致，但允许子级行——展开看该板块成员股。
+        """
+        tree = QTreeWidget()
+        tree.setColumnCount(len(cols))
+        tree.setHeaderLabels([c[0] for c in cols])
+        for i, (_, w) in enumerate(cols):
+            tree.setColumnWidth(i, w)
+        header = tree.header()
+        if header is not None:
+            header.setStretchLastSection(True)
+        tree.setAlternatingRowColors(True)
+        tree.setRootIsDecorated(True)
+        tree.setUniformRowHeights(False)  # 子级可能稍高
+        tree.setIndentation(14)
+        tree.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        tree.setStyleSheet(TABLE_STYLE)
+        return tree
 
     # ------------------------------------------------------------------
     # Tab 5: 异动时间线
@@ -1489,23 +1517,40 @@ class MarketSummaryPage(QWidget):
             self._filter_sector_tree(kw)
             return
         if mode == "split":
-            tables = [self.sector_table, self.sector_table_bottom]
+            widgets = [self.sector_table, self.sector_table_bottom]
         else:
-            tables = [self.sector_table_all]
+            widgets = [self.sector_table_all]
 
-        for table in tables:
-            for row in range(table.rowCount()):
+        for w in widgets:
+            # 2026-05-28 v2：split 模式的 sector_table / sector_table_bottom
+            # 已升级为 QTreeWidget，需走 topLevelItem / setHidden 路径；
+            # all 模式仍是 QTableWidget，走旧 rowCount / setRowHidden 路径
+            if isinstance(w, QTreeWidget):
+                for i in range(w.topLevelItemCount()):
+                    top = w.topLevelItem(i)
+                    if top is None:
+                        continue
+                    if not kw:
+                        top.setHidden(False)
+                        continue
+                    text = top.text(1).lower()
+                    raw = top.data(1, Qt.UserRole)
+                    code = str(raw).lower() if raw else ""
+                    hit = (kw in text) or (bool(code) and kw in code)
+                    top.setHidden(not hit)
+                continue
+            for row in range(w.rowCount()):
                 if not kw:
-                    table.setRowHidden(row, False)
+                    w.setRowHidden(row, False)
                     continue
-                item = table.item(row, 1)
+                item = w.item(row, 1)
                 text = item.text().lower() if item else ""
                 code = ""
                 if item is not None:
                     raw = item.data(Qt.UserRole)
                     code = str(raw).lower() if raw else ""
                 hit = (kw in text) or (bool(code) and kw in code)
-                table.setRowHidden(row, not hit)
+                w.setRowHidden(row, not hit)
 
     def _filter_sector_tree(self, kw: str) -> None:
         """聚类视图搜索：组名命中 → 整组显示；
@@ -1543,18 +1588,25 @@ class MarketSummaryPage(QWidget):
 
     def _fill_sector_table(
         self,
-        table: QTableWidget,
+        table,
         sectors: list,
         trade_date: str,
     ) -> None:
-        """通用板块表填充。
+        """通用板块表填充（兼容 QTableWidget / QTreeWidget）。
+
+        2026-05-28 v2：split 模式的 sector_table / sector_table_bottom
+        升级为 QTreeWidget 支持点击展开成员；all 模式仍是 QTableWidget。
+        本函数自动分发，外部调用无需改。
 
         输入:
-            table       目标 QTableWidget（Top 20 表 或 Bottom 10 表）
+            table       QTableWidget（all 模式）或 QTreeWidget（split 模式）
             sectors     sectors_top[] 同结构 list
             trade_date  YYYYMMDD（传给 _format_sector_leaders 调 helper）
         输出: 无（原地 mutate table）
         """
+        if isinstance(table, QTreeWidget):
+            self._fill_sector_tree_split(table, sectors, trade_date)
+            return
         table.setRowCount(len(sectors))
         for row, s in enumerate(sectors):
             pct = s.get("pct_chg")
@@ -1679,6 +1731,227 @@ class MarketSummaryPage(QWidget):
                         item.setForeground(_COLOR_MUTED)
                         item.setToolTip("未命中：raw_news 中也找不到证据")
                 table.setItem(row, col, item)
+
+    def _fill_sector_tree_split(
+        self,
+        tree: QTreeWidget,
+        sectors: list,
+        trade_date: str,
+    ) -> None:
+        """split 模式板块表填充（QTreeWidget；点击行展开看成员）。
+
+        2026-05-28 v2 新增。每个板块作为顶层 item，下面预占一个 dummy 子级
+        让展开三角能显示；用户首次展开时 _on_sector_item_expanded 懒加载
+        真正的成员股清单。
+        """
+        tree.clear()
+        # 把当前交易日放在 tree 上，便于懒加载槽函数取到（不污染外部签名）
+        tree.setProperty("_trade_date", trade_date)
+        for row, s in enumerate(sectors):
+            pct = s.get("pct_chg")
+            pct_5d = s.get("pct_chg_5d")
+            cats = s.get("catalysts") or []
+            src = (s.get("catalysts_source") or "none").lower()
+            match = s.get("catalysts_match") or ""
+            name = str(s.get("name") or "")
+            ts_code = str(s.get("ts_code") or "")
+            main_net = s.get("main_net_yi")
+            mc = s.get("members_count")
+            group_name = s.get("group_name")
+            sector_name = s.get("sector_name") or name
+
+            if mc and mc > 1:
+                name_cell = f"{name} ×{mc}"
+            else:
+                name_cell = (
+                    f"{name} [{ts_code}]" if name and ts_code else
+                    name or ts_code or "—"
+                )
+            leaders_text = self._format_sector_leaders(
+                name, trade_date, fallback=s.get("leaders") or []
+            )
+            risk_level, risk_bg, risk_tip = self._compute_high_risk(pct_5d)
+
+            turnover = s.get("turnover_rate")
+            total_mv = s.get("total_mv")
+            main_elg = s.get("main_elg_yi")
+            up_n = s.get("up_num")
+            dn_n = s.get("down_num")
+            ud_txt = (
+                f"{up_n}/{dn_n}" if up_n is not None and dn_n is not None
+                else "—"
+            )
+            # 跌幅榜没 limit_up_count 字段，用 limit_down_count 兜底
+            lu = s.get("limit_up_count")
+            ld = s.get("limit_down_count")
+            limit_txt = _fmt_int(lu if lu is not None else ld)
+            cells = [
+                str(s.get("rank") or row + 1),
+                name_cell,
+                _fmt_pct(pct),
+                _fmt_pct(pct_5d),
+                (f"{float(turnover):.2f}%"
+                 if turnover is not None else "—"),
+                _fmt_num(total_mv, 1) if total_mv is not None else "—",
+                _fmt_num(main_elg) if main_elg is not None else "—",
+                ud_txt,
+                limit_txt,
+                _fmt_num(main_net),
+                leaders_text,
+                "  ·  ".join(cats) if cats else "—",
+            ]
+            top_item = QTreeWidgetItem(cells)
+
+            # 第 1 列存 ts_code（用 UserRole），并把"板块名+组名"打包到
+            # UserRole+1 给懒加载用
+            top_item.setData(1, Qt.UserRole, ts_code)
+            # 第 0 列存 group_name（懒加载查 dim_sector_stock 用）
+            top_item.setData(
+                0, Qt.UserRole, group_name or sector_name or name,
+            )
+            tooltips = []
+            if risk_tip:
+                tooltips.append(risk_tip)
+            if mc and mc > 1:
+                tooltips.append(
+                    f"聚类组：{group_name or name}（{mc} 个成员）\n"
+                    f"中位代表板块：{sector_name} [{ts_code}]\n"
+                    f"涨幅取下中位（lower_median）"
+                )
+            tooltips.append("👆 点击 ▶ 展开看板块成员股")
+            top_item.setToolTip(1, "\n\n".join(tooltips))
+
+            if risk_bg is not None:
+                for c in range(len(cells)):
+                    top_item.setBackground(c, QBrush(risk_bg))
+
+            # 染色 col 索引（与 _fill_sector_table 保持一致）
+            cpct = _pct_color(pct)
+            if cpct is not None:
+                top_item.setForeground(2, cpct)
+                fbold = QFont()
+                fbold.setBold(True)
+                top_item.setFont(2, fbold)
+            c5 = _pct_color(pct_5d)
+            if c5 is not None:
+                top_item.setForeground(3, c5)
+                if risk_level == "高":
+                    fbold = QFont()
+                    fbold.setBold(True)
+                    top_item.setFont(3, fbold)
+            if main_elg is not None:
+                try:
+                    f_val = float(main_elg)
+                    top_item.setForeground(
+                        6,
+                        _COLOR_RED if f_val > 0 else
+                        _COLOR_GREEN if f_val < 0 else _COLOR_MUTED,
+                    )
+                except (TypeError, ValueError):
+                    pass
+            if main_net is not None:
+                try:
+                    f_val = float(main_net)
+                    top_item.setForeground(
+                        9,
+                        _COLOR_RED if f_val > 0 else
+                        _COLOR_GREEN if f_val < 0 else _COLOR_MUTED,
+                    )
+                except (TypeError, ValueError):
+                    pass
+
+            # 催化列着色
+            last_col = len(cells) - 1
+            if src == "cls":
+                top_item.setBackground(last_col, QBrush(_COLOR_CLS))
+                top_item.setToolTip(
+                    last_col, f"来源: CLS（匹配方式: {match or 'exact'}）",
+                )
+            elif src == "ai":
+                top_item.setBackground(last_col, QBrush(_COLOR_AI))
+                top_item.setToolTip(last_col, "来源: AI 兜底")
+            else:
+                top_item.setBackground(last_col, QBrush(_COLOR_NONE))
+                top_item.setForeground(last_col, _COLOR_MUTED)
+
+            # 占位子级 → 触发 ▶ 显示；首次展开时懒加载真正成员
+            placeholder = QTreeWidgetItem(["", "(加载中…)", "", "", "",
+                                            "", "", "", "", "", "", ""])
+            placeholder.setData(0, Qt.UserRole + 1, "_placeholder")
+            top_item.addChild(placeholder)
+
+            tree.addTopLevelItem(top_item)
+
+    def _on_sector_item_expanded(self, item) -> None:
+        """sector_table / sector_table_bottom 行展开槽 — 懒加载成员股。
+
+        2026-05-28 v2 新增。子级数据通过 ``query_sector_members(ts_code,
+        trade_date)`` 取，按当日涨幅 DESC 排（领涨在上）。
+        """
+        if item is None or item.childCount() == 0:
+            return
+        # 只处理"含 placeholder"的首次展开
+        first = item.child(0)
+        if first is None:
+            return
+        if first.data(0, Qt.UserRole + 1) != "_placeholder":
+            return  # 已经懒加载过
+
+        ts_code = str(item.data(1, Qt.UserRole) or "")
+        # 从 tree 顶取 trade_date（由 _fill_sector_tree_split setProperty 写入）
+        tree = item.treeWidget()
+        trade_date = (
+            str(tree.property("_trade_date"))
+            if tree is not None else ""
+        )
+        if not ts_code or not trade_date:
+            item.removeChild(first)
+            no = QTreeWidgetItem(["", "(数据缺失)", "", "", "",
+                                   "", "", "", "", "", "", ""])
+            item.addChild(no)
+            return
+
+        try:
+            from gui.utils.market_db_helper import query_sector_members
+            members = query_sector_members(ts_code, trade_date)
+        except Exception:  # noqa: BLE001
+            members = []
+
+        item.removeChild(first)
+        if not members:
+            no = QTreeWidgetItem(["", "(无成员数据，可能是 ths 源板块)",
+                                  "", "", "", "", "", "", "", "", "", ""])
+            no.setForeground(1, _COLOR_MUTED)
+            item.addChild(no)
+            return
+
+        # 子级单行（12 列）：col 1 = 名称[代码] / col 2 = 涨幅 / col 9 = 收盘 /
+        # col 8 = 涨停状态。其他列空（与 _SECTOR_COLS 保持视觉对齐）
+        for m in members:
+            m_name = str(m.get("name") or "")
+            m_code = str(m.get("ts_code") or "")
+            m_pct = m.get("pct_chg")
+            m_close = m.get("close")
+            m_status = str(m.get("limit_status") or "")
+            child_cells = [
+                "",
+                f"{m_name} [{m_code}]",
+                _fmt_pct(m_pct),
+                "", "", "", "", "",
+                m_status or "",
+                _fmt_num(m_close, 2) if m_close is not None else "—",
+                "", "",
+            ]
+            child = QTreeWidgetItem(child_cells)
+            child.setData(1, Qt.UserRole, m_code)
+            c = _pct_color(m_pct)
+            if c is not None:
+                child.setForeground(2, c)
+            if m_status in ("U", "Z"):
+                child.setBackground(8, QBrush(QColor("#fee2e2")))
+            elif m_status == "D":
+                child.setBackground(8, QBrush(QColor("#dcfce7")))
+            item.addChild(child)
 
     def _fill_sector_tree(
         self,

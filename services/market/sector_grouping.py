@@ -470,6 +470,145 @@ def query_grouped_sectors_with_members(
     return out
 
 
+def resolve_dc_sector_ts_code(
+    conn: Any, sector_ts_code: str,
+) -> Optional[str]:
+    """把任意板块 ts_code 解析为「同组内的 dc 板块 ts_code」。
+
+    用法场景（关联：v2 领涨股 Top3 / 决策 5 dc fallback）：
+        * 输入 dc 板块（.DC 后缀）→ 直接返回自身
+        * 输入 ths 板块（.TI 后缀）→ 查 dim_sector.group_id，找同组的
+          dc 板块 ts_code 作为兜底；同组无 dc 时返回 None
+        * 输入未知 / 该 ts_code 不在 dim_sector → 返回 None
+
+    Args:
+        conn: sqlite3.Connection（调用方负责生命周期）
+        sector_ts_code: 板块代码
+
+    Returns:
+        可用于 dim_sector_stock 查询的 dc 板块 ts_code；查不到时 None
+    """
+    if not sector_ts_code:
+        return None
+    if sector_ts_code.endswith(".DC"):
+        return sector_ts_code
+    row = conn.execute(
+        "SELECT group_id FROM dim_sector WHERE ts_code = ?",
+        (sector_ts_code,),
+    ).fetchone()
+    if not row or row["group_id"] is None:
+        return None
+    fallback = conn.execute(
+        "SELECT ts_code FROM dim_sector "
+        "WHERE group_id = ? AND src = 'dc' LIMIT 1",
+        (row["group_id"],),
+    ).fetchone()
+    return str(fallback["ts_code"]) if fallback else None
+
+
+def compute_sector_leaders(
+    conn: Any,
+    sector_ts_code: str,
+    trade_date: str,
+    *,
+    limit: int = 3,
+    ascending: bool = False,
+) -> List[Dict[str, Any]]:
+    """查板块成员当日涨幅 Top/Bottom N（领涨股 / 领跌股）。
+
+    数据源 JOIN：
+        * `dim_sector_stock`（009 迁移，dc_member 接口入库）
+        * `fact_stock_daily`（当日 pct_chg / close）
+
+    Args:
+        conn: 已打开的 sqlite3.Connection
+        sector_ts_code: 板块代码；非 dc 源时调用方先用
+            :func:`resolve_dc_sector_ts_code` 解析
+        trade_date: YYYYMMDD
+        limit: Top/Bottom N，默认 3
+        ascending: True=领跌（ASC by pct_chg）/ False=领涨（DESC by pct_chg）
+
+    Returns:
+        list[dict] 每行包含::
+
+            {
+              "ts_code":  成员股代码,
+              "name":     成员股名,
+              "pct_chg":  当日涨跌幅（% 单位）,
+              "close":    收盘价,
+            }
+
+        sector_ts_code 不在 dim_sector_stock / 当日无成员行情 → 返回 []。
+    """
+    if not sector_ts_code or not trade_date:
+        return []
+    direction = "ASC" if ascending else "DESC"
+    sql = (
+        "SELECT d.stock_ts_code, d.stock_name, s.pct_chg, s.close "
+        "FROM dim_sector_stock d "
+        "JOIN fact_stock_daily s "
+        "  ON s.ts_code = d.stock_ts_code "
+        "  AND s.trade_date = ? "
+        "WHERE d.sector_ts_code = ? "
+        "  AND s.pct_chg IS NOT NULL "
+        f"ORDER BY s.pct_chg {direction}, d.stock_ts_code "
+        "LIMIT ?"
+    )
+    rows = conn.execute(
+        sql, (trade_date, sector_ts_code, int(limit))
+    ).fetchall()
+    return [
+        {
+            "ts_code": str(r["stock_ts_code"]),
+            "name": str(r["stock_name"] or ""),
+            "pct_chg": (
+                float(r["pct_chg"]) if r["pct_chg"] is not None else None
+            ),
+            "close": (
+                float(r["close"]) if r["close"] is not None else None
+            ),
+        }
+        for r in rows
+    ]
+
+
+def compute_sector_limit_count(
+    conn: Any,
+    sector_ts_code: str,
+    trade_date: str,
+    *,
+    limit_type: str = "U",
+) -> int:
+    """统计板块当日涨停 / 跌停股数（真口径：成员表 JOIN）。
+
+    与旧 `_derive_sector_leaders` 中 fact_limit_stock.theme LIKE 模糊匹配
+    口径相比，本函数走 dim_sector_stock 真成员表，能避免「白酒板块用
+    LIKE '%白酒%' 命中酒厂分析师概念股」之类的偏差。
+
+    Args:
+        conn: 已打开的 sqlite3.Connection（调用方负责生命周期）
+        sector_ts_code: 板块代码；非 dc 源调用方应先用
+            :func:`resolve_dc_sector_ts_code` 解析
+        trade_date: YYYYMMDD
+        limit_type: ``'U'`` 涨停 / ``'D'`` 跌停 / ``'Z'`` 炸板
+
+    Returns:
+        命中行数；板块无成员或当日无涨跌停股 → 0
+    """
+    if not sector_ts_code or not trade_date:
+        return 0
+    row = conn.execute(
+        "SELECT COUNT(*) FROM dim_sector_stock d "
+        "JOIN fact_limit_stock l "
+        "  ON l.ts_code = d.stock_ts_code "
+        "  AND l.trade_date = ? "
+        "  AND l.limit_type = ? "
+        "WHERE d.sector_ts_code = ?",
+        (trade_date, limit_type, sector_ts_code),
+    ).fetchone()
+    return int(row[0]) if row else 0
+
+
 def count_grouped_sectors_for_date(trade_date: str) -> int:
     """统计某交易日聚类后剩多少行（GUI ComboBox 标签用）。
 
@@ -2333,6 +2472,9 @@ __all__ = [
     "query_grouped_sectors_for_date",
     "query_grouped_sectors_with_members",
     "count_grouped_sectors_for_date",
+    "resolve_dc_sector_ts_code",
+    "compute_sector_leaders",
+    "compute_sector_limit_count",
     "merge_groups",
     "split_member",
 ]

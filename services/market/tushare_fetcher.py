@@ -652,7 +652,10 @@ class TushareMarketFetcher:
                 (trade_date,),
             ).fetchone()[0]
         # 取较大值作为返回（兼容 rowcount 不可靠的环境）
-        attempted = cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else 0
+        attempted = (
+            cursor.rowcount
+            if cursor.rowcount and cursor.rowcount > 0 else 0
+        )
         return max(attempted, confirmed)
 
     def _ingest_sector_daily_ths(
@@ -1703,6 +1706,102 @@ class TushareMarketFetcher:
                 payload,
             )
         return len(payload)
+
+    def fetch_dim_sector_stock_full(
+        self,
+        trade_date: str,
+        *,
+        idx_type: Optional[str] = None,
+        progress: Optional[Callable[[int, int, str], None]] = None,
+    ) -> Dict[str, int]:
+        """全量同步板块 ↔ 成员股关联（dc_member 接口逐板块拉）。
+
+        关联设计：``doc/design/05-28-1625-板块领涨股与GUI展开施工方案.md``
+
+        Args:
+            trade_date: 必传 YYYYMMDD（dc_member 按当日成员快照返回）。
+                同步策略：成员变化慢，dim_sector_stock 只存最新覆盖。
+            idx_type: 限定 dim_sector.idx_type，None=三类全部
+                （概念板块/行业板块/地域板块）；ths 板块 dc_member 不返回数据，
+                这里自动跳过。
+            progress: 可选回调 (done, total, current_sector_name) — 每个板块
+                完成后调一次，便于 CLI 打进度条。
+
+        Returns:
+            ``{"sectors_total": N, "sectors_ok": M, "sectors_failed": K,
+              "rows_written": R, "api_calls": A}``
+
+        约定：
+            * 单板块 dc_member 失败不阻塞，落 warnings；CLI 可选 retry。
+            * 写入策略：先 DELETE 该 sector_ts_code 旧行再 INSERT —— 保证
+              同步后该板块的成员是 dc_member 当前快照（处理"退出该板块的股票"）。
+        """
+        from datetime import datetime
+        with self.db.connect(readonly=True) as conn:
+            sql = (
+                "SELECT ts_code, name, idx_type FROM dim_sector "
+                "WHERE src = 'dc'"
+            )
+            params: List[Any] = []
+            if idx_type:
+                sql += " AND idx_type = ?"
+                params.append(idx_type)
+            sql += " ORDER BY ts_code"
+            sectors = conn.execute(sql, params).fetchall()
+
+        total = len(sectors)
+        out = {
+            "sectors_total": total,
+            "sectors_ok": 0,
+            "sectors_failed": 0,
+            "rows_written": 0,
+            "api_calls": 0,
+        }
+        now_iso = datetime.now().isoformat(timespec="seconds")
+
+        for i, s in enumerate(sectors, 1):
+            ts_code = str(s["ts_code"])
+            name = str(s["name"] or "")
+            try:
+                rows = self.client.call(
+                    "dc_member",
+                    params={"ts_code": ts_code, "trade_date": trade_date},
+                )
+                out["api_calls"] += 1
+            except TushareError as exc:
+                _log.warning("dc_member(%s) 失败: %s", ts_code, exc)
+                out["sectors_failed"] += 1
+                if progress:
+                    progress(i, total, name + " [FAIL]")
+                continue
+
+            payload: List[tuple] = []
+            for r in rows:
+                con_code = r.get("con_code")
+                con_name = r.get("name")
+                if not con_code:
+                    continue
+                payload.append((ts_code, str(con_code), con_name, now_iso))
+
+            with self.db.connect() as conn:
+                conn.execute(
+                    "DELETE FROM dim_sector_stock WHERE sector_ts_code = ?",
+                    (ts_code,),
+                )
+                if payload:
+                    conn.executemany(
+                        "INSERT INTO dim_sector_stock "
+                        "(sector_ts_code, stock_ts_code, stock_name, "
+                        " updated_at) "
+                        "VALUES (?, ?, ?, ?)",
+                        payload,
+                    )
+            out["rows_written"] += len(payload)
+            out["sectors_ok"] += 1
+            if progress:
+                progress(i, total, name)
+
+        return out
 
 
 # ---------------------------------------------------------------------------

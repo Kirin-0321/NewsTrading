@@ -177,7 +177,9 @@ def query_sectors_extended(
                 out = []
                 for i, r in enumerate(rows, 1):
                     name = str(r["name"] or "")
-                    lu, leaders = _derive_sector_leaders(conn, trade_date, name)
+                    lu, leaders = _derive_sector_leaders(
+                        conn, trade_date, name
+                    )
                     out.append({
                         "rank": i,
                         "ts_code": str(r["ts_code"] or ""),
@@ -379,13 +381,43 @@ def query_all_sectors(
             sql += "ORDER BY s.pct_chg DESC NULLS LAST"
             rows = conn.execute(sql, params).fetchall()
 
+            # 2026-05-28 v2b：领涨股 + 涨停数走真成员表 JOIN，
+            # 旧 fact_limit_stock.theme LIKE 口径仅作 fallback
+            try:
+                from services.market.sector_grouping import (
+                    compute_sector_leaders as _csl,
+                    compute_sector_limit_count as _cslc,
+                    resolve_dc_sector_ts_code as _rdc,
+                )
+            except Exception:  # noqa: BLE001
+                _csl = None  # type: ignore[assignment]
+                _cslc = None  # type: ignore[assignment]
+                _rdc = None  # type: ignore[assignment]
+
             out: List[Dict[str, Any]] = []
             for i, r in enumerate(rows, 1):
                 name = str(r["name"] or "")
-                lu, leaders = _derive_sector_leaders(conn, trade_date, name)
+                ts_code = str(r["ts_code"] or "")
+                leaders: List[Dict[str, Any]] = []
+                lu: int = 0
+                if _csl and _cslc and _rdc:
+                    dc_ts = _rdc(conn, ts_code)
+                    if dc_ts:
+                        leaders = _csl(conn, dc_ts, trade_date, limit=3)
+                        lu = _cslc(
+                            conn, dc_ts, trade_date, limit_type="U",
+                        )
+                if not leaders or not lu:
+                    fb_lu, fb_leaders = _derive_sector_leaders(
+                        conn, trade_date, name
+                    )
+                    if not leaders:
+                        leaders = fb_leaders
+                    if not lu:
+                        lu = fb_lu
                 out.append({
                     "rank": i,
-                    "ts_code": str(r["ts_code"] or ""),
+                    "ts_code": ts_code,
                     "name": name,
                     "pct_chg": r["pct_chg"],
                     "pct_chg_5d": r["pct_chg_5d"],
@@ -405,6 +437,91 @@ def query_all_sectors(
             return out
     except Exception as exc:  # noqa: BLE001
         _log.warning("query_all_sectors 失败 td=%s: %s", trade_date, exc)
+        return []
+
+
+def query_sector_members(
+    sector_ts_code: str,
+    trade_date: str,
+    *,
+    limit: int = 200,
+) -> List[Dict[str, Any]]:
+    """查板块成员股当日行情（GUI sector_table 点击展开懒加载用）。
+
+    数据源 JOIN：
+        * ``dim_sector_stock``（009 迁移，dc_member 接口入库）
+        * ``fact_stock_daily``（当日 pct_chg / close）
+        * ``fact_limit_stock``（limit_type U/Z/D 给状态标记）
+
+    Args:
+        sector_ts_code: 板块代码；非 dc 源时调用方应先用
+            :func:`services.market.sector_grouping.resolve_dc_sector_ts_code`
+            解析为同组 dc 板块代码
+        trade_date: YYYYMMDD
+        limit: 最多返回成员数，默认 200（白酒板块 ~47 个，足够）
+
+    Returns:
+        list[dict] 每行包含::
+
+            {"ts_code", "name", "pct_chg", "close", "limit_status"}
+
+        按 pct_chg DESC 排序（领涨股在前）；缺少成员关联或当日无行情 → []。
+        ``limit_status`` 取值：``"U"`` 涨停 / ``"Z"`` 炸板 /
+        ``"D"`` 跌停 / ``""`` 无标记。
+    """
+    if not sector_ts_code or not trade_date:
+        return []
+    # ths 板块走 dc fallback（与 service 同口径）
+    try:
+        from services.market.sector_grouping import (
+            resolve_dc_sector_ts_code,
+        )
+    except Exception:  # noqa: BLE001
+        resolve_dc_sector_ts_code = None  # type: ignore[assignment]
+
+    db = get_market_db()
+    try:
+        with db.connect(readonly=True) as conn:
+            dc_ts = sector_ts_code
+            if (
+                resolve_dc_sector_ts_code is not None
+                and not sector_ts_code.endswith(".DC")
+            ):
+                resolved = resolve_dc_sector_ts_code(conn, sector_ts_code)
+                if resolved:
+                    dc_ts = resolved
+            rows = conn.execute(
+                "SELECT d.stock_ts_code AS ts_code, "
+                "       d.stock_name AS name, "
+                "       s.pct_chg, s.close, "
+                "       l.limit_type AS limit_status "
+                "FROM dim_sector_stock d "
+                "LEFT JOIN fact_stock_daily s "
+                "  ON s.ts_code = d.stock_ts_code "
+                "  AND s.trade_date = ? "
+                "LEFT JOIN fact_limit_stock l "
+                "  ON l.ts_code = d.stock_ts_code "
+                "  AND l.trade_date = ? "
+                "WHERE d.sector_ts_code = ? "
+                "ORDER BY s.pct_chg DESC NULLS LAST, d.stock_ts_code "
+                "LIMIT ?",
+                (trade_date, trade_date, dc_ts, int(limit)),
+            ).fetchall()
+            return [
+                {
+                    "ts_code": str(r["ts_code"] or ""),
+                    "name": str(r["name"] or ""),
+                    "pct_chg": r["pct_chg"],
+                    "close": r["close"],
+                    "limit_status": str(r["limit_status"] or ""),
+                }
+                for r in rows
+            ]
+    except Exception as exc:  # noqa: BLE001
+        _log.warning(
+            "query_sector_members 失败 sector=%s td=%s: %s",
+            sector_ts_code, trade_date, exc,
+        )
         return []
 
 

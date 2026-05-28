@@ -241,14 +241,22 @@ class MarketSummaryRenderer:
         """
         lines: List[str] = ["## 四、板块强弱榜", ""]
 
-        # 聚合语义注脚：v3 聚类版的关键说明，让 AI / 主人都不会误读
+        # 聚合语义注脚：v3 聚类版关键说明（×N 后缀挂在板块名后，2026-05-28 v2b）
         lines.append(
-            "> 说明：「成员 ×N」表示该行是 N 个同义板块组成的聚类组，"
+            "> 说明：板块名后的「×N」表示该行是 N 个同义板块组成的聚类组，"
             "表内数值（涨幅 / 换手 / 总市值 / 涨停 等）均来自该组的"
             "**中位代表板块**，不是 N 个板块的合计或平均。"
             "换手率和总市值不能简单相加（成分股有重叠）。"
+            "涨停数 / 跌停数 / 领涨股 / 领跌股 走板块真成员表 JOIN（dim_sector_stock）。"
         )
         lines.append("")
+
+        def _name_with_mc(s: Dict[str, Any]) -> str:
+            name = str(s.get("name") or "")
+            mc = s.get("members_count") or 1
+            if mc and mc > 1:
+                return f"{name} ×{mc}"
+            return name
 
         # ---- Top ----
         cap_top = len(top)
@@ -256,15 +264,15 @@ class MarketSummaryRenderer:
         if not top:
             lines.append("（无数据）")
         else:
-            # 13 列：# / 板块 / 成员 / 涨幅 / 5日 / 换手% / 总市值(亿) /
-            # 超大单(亿) / 主力净流入(亿) / 涨/跌 / 涨停数 / 龙头 / 催化
+            # 12 列：# / 板块(×N) / 涨幅 / 5日 / 换手% / 总市值(亿) /
+            # 超大单(亿) / 主力净流入(亿) / 涨/跌 / 涨停数 / 领涨股 / 催化
             lines.append(
-                "| # | 板块 | 成员 | 涨幅 | 5日累计 | "
+                "| # | 板块 | 涨幅 | 5日累计 | "
                 "换手% | 总市值(亿) | 超大单(亿) | 主力净流入(亿) | "
-                "涨/跌 | 涨停数 | 龙头 | 催化 |"
+                "涨/跌 | 涨停数 | 领涨股 | 催化 |"
             )
             lines.append(
-                "|---|------|------|------|--------|"
+                "|---|------|------|--------|"
                 "------|----------|----------|--------------|"
                 "------|------|------|------|"
             )
@@ -278,13 +286,10 @@ class MarketSummaryRenderer:
                     str(c.get("text") if isinstance(c, dict) else c)
                     for c in catalysts[:2]
                 ) or EMPTY
-                mc = s.get("members_count") or 1
-                mc_str = f"×{mc}" if mc > 1 else "—"
                 ud = _format_up_down(s.get("up_num"), s.get("down_num"))
                 lines.append(
                     f"| {_v(s.get('rank'))} "
-                    f"| {_v(s.get('name'))} "
-                    f"| {mc_str} "
+                    f"| {_name_with_mc(s)} "
                     f"| {_fmt_pct(s.get('pct_chg'))} "
                     f"| {_fmt_pct(s.get('pct_chg_5d'))} "
                     f"| {_fmt_turnover(s.get('turnover_rate'))} "
@@ -304,15 +309,15 @@ class MarketSummaryRenderer:
         if not bottom:
             lines.append("（无数据）")
         else:
-            # 13 列：# / 板块 / 成员 / 跌幅 / 5日 / 换手% / 总市值(亿) /
-            # 超大单(亿) / 主力净流出(亿) / 涨/跌 / 跌停数 / 领跌 / 催化
+            # 12 列：# / 板块(×N) / 跌幅 / 5日 / 换手% / 总市值(亿) /
+            # 超大单(亿) / 主力净流出(亿) / 涨/跌 / 跌停数 / 领跌股 / 催化
             lines.append(
-                "| # | 板块 | 成员 | 跌幅 | 5日累计 | "
+                "| # | 板块 | 跌幅 | 5日累计 | "
                 "换手% | 总市值(亿) | 超大单(亿) | 主力净流出(亿) | "
-                "涨/跌 | 跌停数 | 领跌 | 催化 |"
+                "涨/跌 | 跌停数 | 领跌股 | 催化 |"
             )
             lines.append(
-                "|---|------|------|------|--------|"
+                "|---|------|------|--------|"
                 "------|----------|----------|--------------|"
                 "------|------|------|------|"
             )
@@ -326,13 +331,10 @@ class MarketSummaryRenderer:
                     str(c.get("text") if isinstance(c, dict) else c)
                     for c in catalysts[:2]
                 ) or EMPTY
-                mc = s.get("members_count") or 1
-                mc_str = f"×{mc}" if mc > 1 else "—"
                 ud = _format_up_down(s.get("up_num"), s.get("down_num"))
                 lines.append(
                     f"| {_v(s.get('rank'))} "
-                    f"| {_v(s.get('name'))} "
-                    f"| {mc_str} "
+                    f"| {_name_with_mc(s)} "
                     f"| {_fmt_pct(s.get('pct_chg'))} "
                     f"| {_fmt_pct(s.get('pct_chg_5d'))} "
                     f"| {_fmt_turnover(s.get('turnover_rate'))} "
