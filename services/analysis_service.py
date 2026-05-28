@@ -134,13 +134,27 @@ class AnalysisService:
                 "end": max(times) if times else "",
             }
 
-            # 回测命名时间：模拟交易日 00:00（前缀显示该日期，便于人辨识）
-            # 回测产物附加 _backtest_{template_id}_{HHMMSS} 后缀：
-            #   - {template_id} 避免同日多模板互相覆盖
-            #   - {HHMMSS} 真实生成时间，避免同日同模板多次跑互相覆盖
+            # 文件名后缀策略（2026-05-28 23:15 hotfix · 修批量并发同分钟互覆 bug）
+            # -----------------------------------------------------------------
+            # 旧 bug：批量分析时 save_report 文件名只到「分钟」精度，同分钟内
+            # 并发完成的多个模板生成同名 md → file_path UNIQUE 拒绝入库 → 12
+            # 任务最终只剩 3 条记录。
+            #
+            # 修复：所有路径都加 ``{template_id}_{HHMMSS}`` 后缀：
+            #   - 真实生成（simulated_trade_date=None）：
+            #       ``5月28日_23时07分_盘后总结分析报告_custom_6_230751.md``
+            #   - 回测产物（simulated_trade_date 给定）：
+            #       ``5月22日_0时00分_盘后总结分析报告_backtest_custom_6_195810.md``
+            #   - {template_id} 避免同日同分钟多模板互覆
+            #   - {HHMMSS}     避免同模板同分钟多次跑互覆
             naming_dt: Optional[datetime] = None
             backtest_suffix = False
-            extra_suffix = ""
+            sanitized_tpl = self._sanitize_template_id(template_id)
+            run_stamp = datetime.now().strftime("%H%M%S")
+            extra_suffix = (
+                f"{sanitized_tpl}_{run_stamp}"
+                if sanitized_tpl else run_stamp
+            )
             if simulated_trade_date:
                 if not (
                     len(simulated_trade_date) == 8
@@ -155,13 +169,6 @@ class AnalysisService:
                     simulated_trade_date + "0000", "%Y%m%d%H%M"
                 )
                 backtest_suffix = True
-                sanitized_tpl = self._sanitize_template_id(template_id)
-                run_stamp = datetime.now().strftime("%H%M%S")
-                # 拼装规则：tpl 为空时只保留 HHMMSS；都有时下划线连接
-                extra_suffix = (
-                    f"{sanitized_tpl}_{run_stamp}"
-                    if sanitized_tpl else run_stamp
-                )
 
             temp_path = self._write_temp_json(news_list, source)
             try:
