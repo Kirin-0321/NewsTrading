@@ -79,6 +79,8 @@
     "model": "deepseek-v4-pro",
     "temperature": 0.2,
     "max_tokens": 65536,
+    "stream_idle_timeout": 60,
+    "max_attempts": 3,
     "timeout": 1200
   },
   "market_fetch": {

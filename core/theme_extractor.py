@@ -17,12 +17,21 @@
     - 4 级 JSON 容错：直接 loads → 正则提 {} → 截断修复 → 字符级救援
     - Phase M0 起 prompt 从 prompts/theme_extraction/extract_themes.md 加载，
       不再硬编码常量
+
+自动重试（2026-05-28 hotfix）:
+    - httpx ``read`` timeout 改为 ``stream_idle_timeout``（默认 60s）作为
+      "相邻 chunk 间最大等待秒数"——主人的"卡住"语义就是流式静默超阈值
+    - ``extract_from_text`` 包重试循环，最多 ``max_attempts`` 次（默认 3）
+    - 重试场景：流式静默超时 / SSE 断流 / 5xx / 连接异常 / JSON 完全解析失败
+    - 不重试场景：鉴权/400 客户端错误、已救出部分题材的"部分成功"
+    - 指数退避：2s → 4s → 8s（封顶 8s），失败信息通过 progress_callback 通知 UI
 """
 
 import json
 import logging
 import os
 import re
+import time
 from datetime import datetime
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -109,10 +118,28 @@ class ThemeExtractor:
         self.model = model or ext_cfg.get("model") or "deepseek-v4-pro"
         self.temperature = ext_cfg.get("temperature", temperature)
         self.max_tokens = int(ext_cfg.get("max_tokens", max_tokens))
+        # stream_idle_timeout：流式 chunk 间最大静默秒数（httpx read timeout）。
+        # 默认 60s——正常 LLM chunk 间隔 < 5s，超过 60s 视为断流/假死，触发重试。
+        # 旧字段 ``timeout`` 已废弃（向后兼容仍读，但仅作兜底）。
         try:
-            self.timeout = float(ext_cfg.get("timeout", 1200))
+            self.stream_idle_timeout = float(
+                ext_cfg.get("stream_idle_timeout", 60)
+            )
         except (TypeError, ValueError):
-            self.timeout = 1200.0
+            self.stream_idle_timeout = 60.0
+        # 兼容旧配置：用户只配了 timeout 没配 stream_idle_timeout → 取 min(老值, 60)
+        if "stream_idle_timeout" not in ext_cfg and "timeout" in ext_cfg:
+            try:
+                self.stream_idle_timeout = min(
+                    float(ext_cfg["timeout"]), self.stream_idle_timeout
+                )
+            except (TypeError, ValueError):
+                pass
+        # max_attempts：含首次的最大尝试次数（默认 3 = 首次 + 2 次重试）
+        try:
+            self.max_attempts = max(1, int(ext_cfg.get("max_attempts", 3)))
+        except (TypeError, ValueError):
+            self.max_attempts = 3
         self._last_finish_reason: Optional[str] = None
         self._last_raw_response: Optional[str] = None
 
@@ -153,45 +180,172 @@ class ThemeExtractor:
         report_text: str,
         progress_callback: Optional[Callable] = None,
     ) -> Tuple[List[Dict], Optional[str]]:
-        """对已读入的文本抽题材。"""
-        try:
-            raw_response = self._call_llm(report_text, progress_callback)
-        except Exception as e:
-            err = str(e)
-            if "timed out" in err.lower():
-                return [], (
-                    f"调用 LLM 失败: {err}。"
-                    f"（读超时约 {int(self.timeout)}s；可在 config/ai_config.json 调高 "
-                    f"theme_extraction.timeout，或降低 theme_extraction.max_tokens）"
+        """对已读入的文本抽题材（带自动重试）。
+
+        自动重试机制（2026-05-28 hotfix）：
+            * 触发：httpx 流式 chunk 静默超 ``stream_idle_timeout`` 秒，httpx
+              抛 ``ReadTimeout`` → 本方法捕获并重试
+            * 涵盖范围：网络超时 / SSE 断流 / provider 5xx / 限流
+              / 4 级 JSON 容错全部失败（视为完全无效响应）
+            * 不重试：鉴权失败 / 400 客户端错误 / 已救出部分题材的"部分成功"
+              （部分成功直接返回，避免重复入库浪费 token）
+            * 退避：第 1/2/3 次重试间隔 2s/4s/8s（封顶 8s）
+            * UI 反馈：每次重试前通过 ``progress_callback`` 推一行提示
+        """
+        last_err_msg: Optional[str] = None
+
+        for attempt in range(1, self.max_attempts + 1):
+            if attempt > 1 and progress_callback:
+                try:
+                    progress_callback(
+                        f"⏳ 题材抽取第 {attempt}/{self.max_attempts} 次尝试"
+                        f"（上次失败：{last_err_msg}）"
+                    )
+                except Exception:
+                    pass  # UI 回调异常不影响重试主流程
+
+            # 每轮清状态，避免上次结果污染
+            self._last_finish_reason = None
+            self._last_raw_response = None
+
+            try:
+                raw_response = self._call_llm(report_text, progress_callback)
+            except Exception as e:  # noqa: BLE001
+                err_text = str(e)
+                last_err_msg = f"{type(e).__name__}: {err_text}"
+
+                if self._is_retryable_error(e) and attempt < self.max_attempts:
+                    wait = min(2 ** attempt, 8)
+                    if progress_callback:
+                        try:
+                            progress_callback(
+                                f"⚠️ 题材抽取 LLM 调用失败（{last_err_msg}），"
+                                f"{wait}s 后重试..."
+                            )
+                        except Exception:
+                            pass
+                    time.sleep(wait)
+                    continue
+
+                # 不可重试 / 重试用尽
+                err_lower = err_text.lower()
+                if "timed out" in err_lower or "timeout" in err_lower:
+                    return [], (
+                        f"调用 LLM 失败: {err_text}。"
+                        f"（chunk 静默超 {int(self.stream_idle_timeout)}s；"
+                        f"已尝试 {attempt} 次；可在 config/ai_config.json 调高 "
+                        f"theme_extraction.stream_idle_timeout 或 max_attempts，"
+                        f"或降低 theme_extraction.max_tokens）"
+                    )
+                return [], f"调用 LLM 失败（已尝试 {attempt} 次）: {err_text}"
+
+            # 拿到响应，开始解析
+            self._last_raw_response = raw_response
+            themes, parse_err = self._parse_response(raw_response)
+
+            # 截断时即使解析失败也尽量救出前面的题材
+            if self._last_finish_reason == "length":
+                hint = (
+                    f"⚠️ AI 输出被截断（finish_reason=length，max_tokens={self.max_tokens}）。"
+                    "已尝试修复 JSON 取出前面的题材。建议主人调大 config/ai_config.json 的 "
+                    "theme_extraction.max_tokens。"
                 )
-            return [], f"调用 LLM 失败: {e}"
+                parse_err = f"{hint} | 原解析消息: {parse_err}" if parse_err else hint
 
-        self._last_raw_response = raw_response
-        themes, err = self._parse_response(raw_response)
+            # 4 级容错都救不出题材 → 视为故障，可重试
+            if not themes:
+                last_err_msg = parse_err or "LLM 返回为空"
+                if attempt < self.max_attempts:
+                    wait = min(2 ** attempt, 8)
+                    if progress_callback:
+                        try:
+                            progress_callback(
+                                f"⚠️ 题材解析失败（{last_err_msg}），{wait}s 后重试..."
+                            )
+                        except Exception:
+                            pass
+                    time.sleep(wait)
+                    continue
 
-        # 截断时即使解析失败也尽量救出前面的题材
-        if self._last_finish_reason == "length":
-            hint = (
-                f"⚠️ AI 输出被截断（finish_reason=length，max_tokens={self.max_tokens}）。"
-                "已尝试修复 JSON 取出前面的题材。建议主人调大 config/ai_config.json 的 "
-                "theme_extraction.max_tokens。"
-            )
-            err = f"{hint} | 原解析消息: {err}" if err else hint
+                # 重试用尽 → 落盘失败上下文供事后排查
+                self._dump_failure(report_text, raw_response, parse_err or "")
+                return [], parse_err or "重试用尽：未抽出任何题材"
 
-        if err and not themes:
-            self._dump_failure(report_text, raw_response, err)
-            return [], err
-
-        # 接入 matcher：补板块代码 + 标的标准化代码（v4 新增）
-        # 失败不抛异常，保留原数据
-        if themes:
+            # 成功（部分或全部）→ matcher 富化后返回
+            # 失败不抛异常，保留原数据
             try:
                 from services.scoring.matcher import enrich_themes_with_matcher
                 enrich_themes_with_matcher(themes)
             except Exception as e:
                 logger.warning("matcher 富化失败，沿用原数据: %s", e)
 
-        return themes, err  # 部分成功时也带 warning 出去
+            return themes, parse_err  # 部分成功时也带 warning 出去
+
+        # 兜底（理论走不到 —— for 循环里所有分支都 return 或 continue）
+        return [], f"重试 {self.max_attempts} 次均未成功: {last_err_msg}"
+
+    @staticmethod
+    def _is_retryable_error(exc: Exception) -> bool:
+        """判定异常是否可重试。
+
+        可重试（典型场景）：
+            * httpx 超时/连接错误：ReadTimeout / ConnectTimeout / ConnectError
+            * SSE 断流：RemoteProtocolError / ReadError / ChunkedEncodingError
+            * provider 5xx：InternalServerError / BadGateway / ServiceUnavailable
+            * 限流：RateLimitError（OpenAI/DeepSeek 偶发 429）
+            * 流式静默后底层抛的 TimeoutError（含原生 socket / asyncio 形态）
+
+        不可重试：
+            * 配置缺失：ValueError（未配置 API Key）
+            * 鉴权失败：AuthenticationError / PermissionDeniedError（401/403）
+            * 客户端错误：BadRequestError / NotFoundError（400/404，重试也是错）
+            * 模型不存在 / 参数非法 等
+
+        判定不严格依赖 import openai/httpx 具体异常类——用类名 + 错误消息
+        关键词覆盖三家 SDK（openai/zhipuai/httpx 内核），更稳健。
+        """
+        if isinstance(exc, ValueError):
+            return False
+
+        name_l = type(exc).__name__.lower()
+        msg_l = str(exc).lower()
+
+        # 明确不重试：鉴权 / 客户端错误
+        non_retryable_names = (
+            "authentication", "permissiondenied", "badrequest",
+            "notfound", "unprocessable", "conflicterror",
+        )
+        if any(k in name_l for k in non_retryable_names):
+            return False
+        if any(k in msg_l for k in (
+            "unauthorized", "forbidden", " 401", " 403", " 404", " 400",
+        )):
+            return False
+
+        # 明确可重试：超时 / 连接 / SSE 断流 / 5xx / 限流
+        retryable_names = (
+            "timeout", "timeouterror",
+            "connecterror", "connectionerror", "apiconnectionerror",
+            "remoteprotocolerror", "readerror", "writeerror",
+            "chunkedencodingerror",
+            "internalserver", "serviceunavailable",
+            "badgateway", "gatewaytimeout",
+            "ratelimit", "apistatuserror",
+        )
+        if any(k in name_l for k in retryable_names):
+            return True
+
+        retryable_keywords = (
+            "timed out", "timeout", "connection reset", "connection aborted",
+            "remote end closed", "incomplete chunked", "broken pipe",
+            "rate limit", "internal server error", "bad gateway",
+            "service unavailable", "gateway timeout",
+            " 500", " 502", " 503", " 504", " 429",
+        )
+        if any(k in msg_l for k in retryable_keywords):
+            return True
+
+        return False
 
     @staticmethod
     def _read_report(path: str) -> str:
@@ -204,11 +358,23 @@ class ThemeExtractor:
         return text
 
     @staticmethod
-    def _http_timeout(seconds: float):
-        """构建 httpx 超时：流式场景 read 为相邻 chunk 间最大等待秒数。"""
+    def _http_timeout(idle_seconds: float):
+        """构建 httpx 超时。
+
+        Args:
+            idle_seconds: 流式 chunk 间最大静默秒数（即 ``stream_idle_timeout``）。
+                httpx 的 ``read`` 在 SSE 场景下就是"相邻 chunk 间最大等待"，
+                这个值砍小（默认 60s）= chunk 超过 60s 不到 → 抛 ReadTimeout
+                → ``extract_from_text`` 捕获后自动重试。
+
+        旧实现用 ``theme_extraction.timeout``（默认 1200s）的语义错位为
+        "整体读超时"，导致断流时要傻等 20 分钟才能感知，主人因此遇到"卡住"。
+        本次 hotfix（2026-05-28）把这个值砍到 60s 并配合外层重试循环。
+        """
         from httpx import Timeout
 
-        sec = max(float(seconds), 60.0)
+        # 至少 15s——给 LLM 启动响应留余量，不要太激进
+        sec = max(float(idle_seconds), 15.0)
         return Timeout(connect=15.0, read=sec, write=sec, pool=sec)
 
     def _call_llm(
@@ -226,7 +392,7 @@ class ThemeExtractor:
         if not api_key:
             raise ValueError(f"未配置 {self.provider} API Key")
 
-        http_timeout = self._http_timeout(self.timeout)
+        http_timeout = self._http_timeout(self.stream_idle_timeout)
         if self.provider == "zhipu":
             try:
                 from zhipuai import ZhipuAI

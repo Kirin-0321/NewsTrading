@@ -240,7 +240,15 @@ class AIConfig:
             "model": "deepseek-v4-pro",
             "temperature": 0.2,
             "max_tokens": DEFAULT_MAX_OUTPUT_TOKENS,
-            # 流式读超时（秒）：大报告 + 高 max_tokens 时 JSON 生成可能超过 10 分钟
+            # 流式 chunk 间最大静默秒数（= httpx read timeout）。
+            # 正常 LLM chunk 间隔 < 5s，超 60s 视为断流/假死 → 外层重试。
+            # 2026-05-28 hotfix：旧的 timeout=1200 会导致断流要等 20 分钟才感知，
+            # 改用此字段作为更紧的 chunk 心跳阈值，配合 max_attempts 重试。
+            "stream_idle_timeout": 60,
+            # 含首次的最大尝试次数（首次 + 2 次重试）
+            "max_attempts": 3,
+            # 兼容旧配置：仅当用户配了 timeout 但没配 stream_idle_timeout 时，
+            # ThemeExtractor 会用 min(timeout, stream_idle_timeout) 兜底。
             "timeout": 1200,
         }
         cfg = dict(defaults)
