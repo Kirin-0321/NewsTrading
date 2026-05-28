@@ -13,11 +13,13 @@ UI 布局
     │         + ⚡ 一键打分未完成 + 🔁 重打分 + 导出 + 刷新           │
     ├──────────────────────────────────────────────────────────────┤
     │ 【上表 master】 模板汇总（按 prompt_id 聚合）                │
-    │   模板 | 版本 | 样本 | D+1 D+2 D+3 D+4 D+5 | α | α-1 |       │
+    │   模板 | 版本 | 样本 | α+1 α+2 α+3 α+4 α+5 | α | α-1 |       │
     │   命中率 | 方向准 | AI 高质量 | 最近报告日                     │
+    │   （α+N = D+N - 中证1000 当日 pct，加权聚合，2026-05-28 22:00）│
     ├──────────────────────────────────────────────────────────────┤
     │ 【下表 detail】 选中模板的报告级明细（按 ai_reports.id 聚合）│
-    │   报告日期 | 真/回 | 题材数 | D+1~D+5 | α | α-1 | 命中率 | 文件名│
+    │   报告日期 | 真/回 | 题材数 | D/α+1~D/α+5 | α | α-1 | 命中率 | 文件名│
+    │   （D/α+N 单元格紧凑双值「+2.50% / +1.20%」，前 D 后 α）       │
     │   （双击 → 跳到「题材预测」页查看该报告的题材列表）           │
     └──────────────────────────────────────────────────────────────┘
 
@@ -102,16 +104,18 @@ _BACKTEST_FILTERS = [
 ]
 
 
+# 2026-05-28 22:00：上方表 D+N 列直接改为 α+N（α+N = D+N - 中证1000 当日 pct）
 _TPL_COLS = [
     ("模板", 220), ("版本", 60), ("真/回测", 70),
     ("题材", 50), ("已打", 50),
-    ("D+1", 75), ("D+2", 75), ("D+3", 75), ("D+4", 75), ("D+5", 75),
+    ("α+1", 75), ("α+2", 75), ("α+3", 75), ("α+4", 75), ("α+5", 75),
     ("α", 75), ("α-1", 75), ("命中率", 70), ("方向准", 70),
     ("AI 高质量", 80), ("最近报告日", 100),
 ]
 
 
-# 报告树（QTreeWidget）共享 14 列定义（2026-05-28 树形展开重构 + 18:40 加 α-1）
+# 报告树（QTreeWidget）共享 14 列定义（2026-05-28 树形展开重构 + 18:40 加 α-1
+# + 22:00 D+N 改为 D/α+N 双值列）
 #
 # 同一列在 3 级（📄 报告 / 🎯 题材 / 📈 标的）下语义对齐：
 #   * 列 0  名称：📄报告日期+真/回 / 🎯题材名 / 📈标的名（带图标前缀）
@@ -119,7 +123,7 @@ _TPL_COLS = [
 #   * 列 2  辅助：📄版本 / 🎯板块代码 / 📈标准化代码
 #   * 列 3  子项数/排名：📄题材数 / 🎯排名 / 📈—
 #   * 列 4  进度/分数：📄打分 X/Y / 🎯强度分 / 📈—
-#   * 列 5~9  D+1~D+5（单位 %，红涨绿跌染色统一）
+#   * 列 5~9  D/α+1 ~ D/α+5（紧凑双值「D / α」，染色按 D 值，排序按 D 值）
 #   * 列 10 α / —
 #   * 列 11 α-1（D+2~D+5 题材综合涨幅减中证1000 的 4 天均值，2026-05-28 18:40 加入）
 #   * 列 12 命中率（📄/🎯）/ 命中标记 ✓✗（📈）
@@ -128,17 +132,17 @@ _TREE_COLS = [
     ("名称",            260),  # 0
     ("类型/等级/角色",   100),  # 1
     ("辅助",            100),  # 2
-    ("子项/排名",        70),  # 3
-    ("进度/分数",        80),  # 4
-    ("D+1",             75),  # 5
-    ("D+2",             75),  # 6
-    ("D+3",             75),  # 7
-    ("D+4",             75),  # 8
-    ("D+5",             75),  # 9
-    ("α",               75),  # 10
-    ("α-1",             75),  # 11
+    ("子项/排名",        70),   # 3
+    ("进度/分数",        80),   # 4
+    ("D/α+1",           120),  # 5
+    ("D/α+2",           120),  # 6
+    ("D/α+3",           120),  # 7
+    ("D/α+4",           120),  # 8
+    ("D/α+5",           120),  # 9
+    ("α",               75),   # 10
+    ("α-1",             75),   # 11
     ("命中率",           80),  # 12
-    ("文件名/理由/按钮",   0),  # 13 stretch
+    ("文件名/理由/按钮",   0),   # 13 stretch
 ]
 _COL_NAME = 0
 _COL_TYPE = 1
@@ -558,11 +562,11 @@ class PromptEvalPage(QWidget):
                 self._fmt_backtest_marker(data),
                 str(themes_total),
                 str(scored_themes),
-                _fmt_pct(data.get("d1_avg")),
-                _fmt_pct(data.get("d2_avg")),
-                _fmt_pct(data.get("d3_avg")),
-                _fmt_pct(data.get("d4_avg")),
-                _fmt_pct(data.get("d5_avg")),
+                _fmt_pct(data.get("a1_avg")),
+                _fmt_pct(data.get("a2_avg")),
+                _fmt_pct(data.get("a3_avg")),
+                _fmt_pct(data.get("a4_avg")),
+                _fmt_pct(data.get("a5_avg")),
                 _fmt_pct(data.get("alpha_avg")),
                 _fmt_pct(data.get("alpha_avg_excl_d1")),
                 _fmt_rate(data.get("hit_rate_avg")),
@@ -638,11 +642,11 @@ class PromptEvalPage(QWidget):
                 aux_text,
                 count_text,
                 score_text,
-                _fmt_pct(data.get("d1_avg")),
-                _fmt_pct(data.get("d2_avg")),
-                _fmt_pct(data.get("d3_avg")),
-                _fmt_pct(data.get("d4_avg")),
-                _fmt_pct(data.get("d5_avg")),
+                _fmt_pct_dual(data.get("d1_avg"), data.get("a1_avg")),
+                _fmt_pct_dual(data.get("d2_avg"), data.get("a2_avg")),
+                _fmt_pct_dual(data.get("d3_avg"), data.get("a3_avg")),
+                _fmt_pct_dual(data.get("d4_avg"), data.get("a4_avg")),
+                _fmt_pct_dual(data.get("d5_avg"), data.get("a5_avg")),
                 _fmt_pct(data.get("alpha_avg")),
                 _fmt_pct(data.get("alpha_avg_excl_d1")),
                 _fmt_rate(data.get("hit_rate_avg")),
@@ -816,11 +820,11 @@ class PromptEvalPage(QWidget):
             sector_cell,
             str(rank) if rank is not None else "—",
             str(score) if score is not None else "—",
-            _fmt_pct(t.get("d1")),
-            _fmt_pct(t.get("d2")),
-            _fmt_pct(t.get("d3")),
-            _fmt_pct(t.get("d4")),
-            _fmt_pct(t.get("d5")),
+            _fmt_pct_dual(t.get("d1"), t.get("a1")),
+            _fmt_pct_dual(t.get("d2"), t.get("a2")),
+            _fmt_pct_dual(t.get("d3"), t.get("a3")),
+            _fmt_pct_dual(t.get("d4"), t.get("a4")),
+            _fmt_pct_dual(t.get("d5"), t.get("a5")),
             _fmt_pct(t.get("alpha_avg")),
             _fmt_pct(t.get("alpha_avg_excl_d1")),
             _fmt_rate(t.get("hit_rate_avg")),
@@ -904,11 +908,11 @@ class PromptEvalPage(QWidget):
             str(s.get("normalized_code") or "—"),
             "—",  # 排名列对标的不适用
             "—",  # 强度分对标的不适用
-            _fmt_pct(s.get("d1_pct")),
-            _fmt_pct(s.get("d2_pct")),
-            _fmt_pct(s.get("d3_pct")),
-            _fmt_pct(s.get("d4_pct")),
-            _fmt_pct(s.get("d5_pct")),
+            _fmt_pct_dual(s.get("d1_pct"), s.get("a1_pct")),
+            _fmt_pct_dual(s.get("d2_pct"), s.get("a2_pct")),
+            _fmt_pct_dual(s.get("d3_pct"), s.get("a3_pct")),
+            _fmt_pct_dual(s.get("d4_pct"), s.get("a4_pct")),
+            _fmt_pct_dual(s.get("d5_pct"), s.get("a5_pct")),
             "—",  # α 列对标的不适用
             "—",  # α-1 列对标的不适用（2026-05-28 18:40 加列后保留占位）
             hit_text,
@@ -1444,9 +1448,9 @@ class PromptEvalPage(QWidget):
                         "—",
                         themes_total,
                         r.get("scored_themes") or 0,
-                        r.get("d1_avg"), r.get("d2_avg"),
-                        r.get("d3_avg"), r.get("d4_avg"),
-                        r.get("d5_avg"),
+                        r.get("a1_avg"), r.get("a2_avg"),
+                        r.get("a3_avg"), r.get("a4_avg"),
+                        r.get("a5_avg"),
                         r.get("alpha_avg"),
                         r.get("alpha_avg_excl_d1"),
                         r.get("hit_rate_avg"),
@@ -1466,6 +1470,7 @@ class PromptEvalPage(QWidget):
                     "themes_count", "scored_pairs", "expected_pairs",
                     "score_status",
                     "d1_avg", "d2_avg", "d3_avg", "d4_avg", "d5_avg",
+                    "a1_avg", "a2_avg", "a3_avg", "a4_avg", "a5_avg",
                     "alpha_avg", "alpha_avg_excl_d1",
                     "hit_rate_avg", "direction_correct_rate",
                     "file_path",
@@ -1484,6 +1489,9 @@ class PromptEvalPage(QWidget):
                         r.get("d1_avg"), r.get("d2_avg"),
                         r.get("d3_avg"), r.get("d4_avg"),
                         r.get("d5_avg"),
+                        r.get("a1_avg"), r.get("a2_avg"),
+                        r.get("a3_avg"), r.get("a4_avg"),
+                        r.get("a5_avg"),
                         r.get("alpha_avg"),
                         r.get("alpha_avg_excl_d1"),
                         r.get("hit_rate_avg"),
@@ -1502,6 +1510,7 @@ class PromptEvalPage(QWidget):
                     "sector_ts_code", "sector_match_conf",
                     "stocks_count", "scored_pairs",
                     "d1", "d2", "d3", "d4", "d5",
+                    "a1", "a2", "a3", "a4", "a5",
                     "alpha_avg", "alpha_avg_excl_d1",
                     "hit_rate_avg", "direction_correct_rate",
                     "sector_pct_avg",
@@ -1511,6 +1520,7 @@ class PromptEvalPage(QWidget):
                     "theme_id", "theme_stock_id", "stock_name",
                     "normalized_code", "role", "scored_days",
                     "d1_pct", "d2_pct", "d3_pct", "d4_pct", "d5_pct",
+                    "a1_pct", "a2_pct", "a3_pct", "a4_pct", "a5_pct",
                     "d1_hit", "d2_hit", "d3_hit", "d4_hit", "d5_hit",
                 ]]
 
@@ -1540,6 +1550,9 @@ class PromptEvalPage(QWidget):
                             t.get("d1"), t.get("d2"),
                             t.get("d3"), t.get("d4"),
                             t.get("d5"),
+                            t.get("a1"), t.get("a2"),
+                            t.get("a3"), t.get("a4"),
+                            t.get("a5"),
                             t.get("alpha_avg"),
                             t.get("alpha_avg_excl_d1"),
                             t.get("hit_rate_avg"),
@@ -1565,6 +1578,9 @@ class PromptEvalPage(QWidget):
                                 s.get("d1_pct"), s.get("d2_pct"),
                                 s.get("d3_pct"), s.get("d4_pct"),
                                 s.get("d5_pct"),
+                                s.get("a1_pct"), s.get("a2_pct"),
+                                s.get("a3_pct"), s.get("a4_pct"),
+                                s.get("a5_pct"),
                                 s.get("d1_hit"), s.get("d2_hit"),
                                 s.get("d3_hit"), s.get("d4_hit"),
                                 s.get("d5_hit"),
@@ -1594,6 +1610,16 @@ def _fmt_pct(v) -> str:
         return f"{float(v):+.2f}%"
     except (TypeError, ValueError):
         return "—"
+
+
+def _fmt_pct_dual(d, a) -> str:
+    """双值紧凑显示：``+2.50% / +1.20%``。
+
+    用于下方树 D/α+N 列，左为原始 D+N（板块/题材/标的涨幅），
+    右为 α+N（D+N 减当天中证1000）。任一为 None 时显示 "—"，
+    两个都 None → "—"。
+    """
+    return f"{_fmt_pct(d)} / {_fmt_pct(a)}"
 
 
 def _fmt_rate(v) -> str:

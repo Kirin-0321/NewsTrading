@@ -363,6 +363,7 @@ def get_template_eval(
                 "scored_themes": 0,              # 至少有一行 scores 的题材数
                 "sample_count": 14,              # 兼容老字段 = themes_total
                 "d1_avg": None, ..., "d5_avg": None,
+                "a1_avg": None, ..., "a5_avg": None,  # α+N：D+N - 中证1000 加权（同 D+N 口径）
                 "alpha_avg": None,
                 "alpha_avg_excl_d1": None,        # α-1：D+2~D+5 (theme_pct - 中证1000) 均值
                 "hit_rate_avg": None,
@@ -407,6 +408,9 @@ def get_template_eval(
     # 2026-05-28 v2 改造：
     #   * 题材级 D+N 用 sector_pct（板块涨跌幅）替换 stock_weighted_pct（标的均值）
     #   * 报告级聚合用 |strength_score| 加权，仅 strength > 0 的题材参与
+    # 2026-05-28 22:00 加入 α+N 列（逐日 D+N - 中证1000）：
+    #   * 题材级 a_n = sector_pct - benchmark_zz1000_pct（与该层 D+N 同基础）
+    #   * 模板级 a_n_avg 用 |strength_score| 加权（与 d_n_avg 同口径）
     sql = f"""
     WITH per_theme AS (
         SELECT
@@ -426,6 +430,16 @@ def get_template_eval(
                      THEN tps.sector_pct END) AS d4,
             MAX(CASE WHEN tps.days_offset=5
                      THEN tps.sector_pct END) AS d5,
+            MAX(CASE WHEN tps.days_offset=1
+                     THEN tps.sector_pct - tps.benchmark_zz1000_pct END) AS a1,
+            MAX(CASE WHEN tps.days_offset=2
+                     THEN tps.sector_pct - tps.benchmark_zz1000_pct END) AS a2,
+            MAX(CASE WHEN tps.days_offset=3
+                     THEN tps.sector_pct - tps.benchmark_zz1000_pct END) AS a3,
+            MAX(CASE WHEN tps.days_offset=4
+                     THEN tps.sector_pct - tps.benchmark_zz1000_pct END) AS a4,
+            MAX(CASE WHEN tps.days_offset=5
+                     THEN tps.sector_pct - tps.benchmark_zz1000_pct END) AS a5,
             AVG(tps.alpha) AS alpha_avg,
             -- α-1 题材级口径：D+2~D+5 各算 (theme_pct - 中证1000 pct)，再 4 天均值
             -- AVG 自动忽略 NULL（D+1 行 / 缺数据行整体 NULL）
@@ -468,6 +482,26 @@ def get_template_eval(
                  THEN d5 * ABS(strength_score) END)
           / NULLIF(SUM(CASE WHEN strength_score > 0 AND d5 IS NOT NULL
                             THEN ABS(strength_score) END), 0) AS d5_avg,
+        SUM(CASE WHEN strength_score > 0 AND a1 IS NOT NULL
+                 THEN a1 * ABS(strength_score) END)
+          / NULLIF(SUM(CASE WHEN strength_score > 0 AND a1 IS NOT NULL
+                            THEN ABS(strength_score) END), 0) AS a1_avg,
+        SUM(CASE WHEN strength_score > 0 AND a2 IS NOT NULL
+                 THEN a2 * ABS(strength_score) END)
+          / NULLIF(SUM(CASE WHEN strength_score > 0 AND a2 IS NOT NULL
+                            THEN ABS(strength_score) END), 0) AS a2_avg,
+        SUM(CASE WHEN strength_score > 0 AND a3 IS NOT NULL
+                 THEN a3 * ABS(strength_score) END)
+          / NULLIF(SUM(CASE WHEN strength_score > 0 AND a3 IS NOT NULL
+                            THEN ABS(strength_score) END), 0) AS a3_avg,
+        SUM(CASE WHEN strength_score > 0 AND a4 IS NOT NULL
+                 THEN a4 * ABS(strength_score) END)
+          / NULLIF(SUM(CASE WHEN strength_score > 0 AND a4 IS NOT NULL
+                            THEN ABS(strength_score) END), 0) AS a4_avg,
+        SUM(CASE WHEN strength_score > 0 AND a5 IS NOT NULL
+                 THEN a5 * ABS(strength_score) END)
+          / NULLIF(SUM(CASE WHEN strength_score > 0 AND a5 IS NOT NULL
+                            THEN ABS(strength_score) END), 0) AS a5_avg,
         AVG(alpha_avg) AS alpha_avg,
         AVG(alpha_excl_d1) AS alpha_avg_excl_d1,
         AVG(hit_rate_avg) AS hit_rate_avg,
@@ -536,6 +570,7 @@ def get_report_eval(
                 "expected_pairs": 70,            # = themes_count * 5
                 "score_status": "none",          # none / partial / full
                 "d1_avg": None, ..., "d5_avg": None,
+                "a1_avg": None, ..., "a5_avg": None,  # α+N：theme_pct - 中证1000 加权
                 "alpha_avg": None,
                 "alpha_avg_excl_d1": None,        # α-1：D+2~D+5 (theme_pct - 中证1000) 均值
                 "hit_rate_avg": None,
@@ -589,6 +624,7 @@ def get_report_eval(
     #   * 报告级 D+N 用 theme_pct（= 0.6·sector_pct + 0.4·stock_avg_pct，无标的兜底
     #     = sector_pct）替换原 sector_pct，与题材级第 2 层故意差异化
     #   * 报告级聚合用 |strength_score| 加权，仅 strength > 0 的题材参与
+    # 2026-05-28 22:00 加入 α+N 列（逐日 theme_pct - 中证1000，同加权口径）
     sql = f"""
     WITH per_theme AS (
         SELECT
@@ -605,6 +641,16 @@ def get_report_eval(
                      THEN tps.theme_pct END) AS d4,
             MAX(CASE WHEN tps.days_offset=5
                      THEN tps.theme_pct END) AS d5,
+            MAX(CASE WHEN tps.days_offset=1
+                     THEN tps.theme_pct - tps.benchmark_zz1000_pct END) AS a1,
+            MAX(CASE WHEN tps.days_offset=2
+                     THEN tps.theme_pct - tps.benchmark_zz1000_pct END) AS a2,
+            MAX(CASE WHEN tps.days_offset=3
+                     THEN tps.theme_pct - tps.benchmark_zz1000_pct END) AS a3,
+            MAX(CASE WHEN tps.days_offset=4
+                     THEN tps.theme_pct - tps.benchmark_zz1000_pct END) AS a4,
+            MAX(CASE WHEN tps.days_offset=5
+                     THEN tps.theme_pct - tps.benchmark_zz1000_pct END) AS a5,
             AVG(tps.alpha) AS alpha_avg,
             -- α-1 题材级口径（与 get_prompt_eval 同口径）
             AVG(CASE WHEN tps.days_offset BETWEEN 2 AND 5
@@ -665,6 +711,41 @@ def get_report_eval(
                               AND per_theme.d5 IS NOT NULL
                             THEN ABS(per_theme.strength_score) END), 0)
           AS d5_avg,
+        SUM(CASE WHEN per_theme.strength_score > 0
+                  AND per_theme.a1 IS NOT NULL
+                 THEN per_theme.a1 * ABS(per_theme.strength_score) END)
+          / NULLIF(SUM(CASE WHEN per_theme.strength_score > 0
+                              AND per_theme.a1 IS NOT NULL
+                            THEN ABS(per_theme.strength_score) END), 0)
+          AS a1_avg,
+        SUM(CASE WHEN per_theme.strength_score > 0
+                  AND per_theme.a2 IS NOT NULL
+                 THEN per_theme.a2 * ABS(per_theme.strength_score) END)
+          / NULLIF(SUM(CASE WHEN per_theme.strength_score > 0
+                              AND per_theme.a2 IS NOT NULL
+                            THEN ABS(per_theme.strength_score) END), 0)
+          AS a2_avg,
+        SUM(CASE WHEN per_theme.strength_score > 0
+                  AND per_theme.a3 IS NOT NULL
+                 THEN per_theme.a3 * ABS(per_theme.strength_score) END)
+          / NULLIF(SUM(CASE WHEN per_theme.strength_score > 0
+                              AND per_theme.a3 IS NOT NULL
+                            THEN ABS(per_theme.strength_score) END), 0)
+          AS a3_avg,
+        SUM(CASE WHEN per_theme.strength_score > 0
+                  AND per_theme.a4 IS NOT NULL
+                 THEN per_theme.a4 * ABS(per_theme.strength_score) END)
+          / NULLIF(SUM(CASE WHEN per_theme.strength_score > 0
+                              AND per_theme.a4 IS NOT NULL
+                            THEN ABS(per_theme.strength_score) END), 0)
+          AS a4_avg,
+        SUM(CASE WHEN per_theme.strength_score > 0
+                  AND per_theme.a5 IS NOT NULL
+                 THEN per_theme.a5 * ABS(per_theme.strength_score) END)
+          / NULLIF(SUM(CASE WHEN per_theme.strength_score > 0
+                              AND per_theme.a5 IS NOT NULL
+                            THEN ABS(per_theme.strength_score) END), 0)
+          AS a5_avg,
         AVG(per_theme.alpha_avg) AS alpha_avg,
         AVG(per_theme.alpha_excl_d1) AS alpha_avg_excl_d1,
         AVG(per_theme.hit_rate_avg) AS hit_rate_avg,
@@ -996,6 +1077,7 @@ def get_theme_eval_for_report(report_id: int) -> List[Dict]:
                 "stocks_count": 6,           # theme_stocks 行数（懒加载下一层用）
                 "scored_pairs": 5,           # theme_prediction_scores 行数
                 "d1": ..., "d5": ...,        # stock_weighted_pct 透视
+                "a1": ..., "a5": ...,        # α+N：sector_pct - 中证1000 逐日值
                 "alpha_avg": None,
                 "alpha_avg_excl_d1": None,   # α-1：D+2~D+5 (theme_pct - 中证1000) 均值
                 "hit_rate_avg": None,
@@ -1008,6 +1090,7 @@ def get_theme_eval_for_report(report_id: int) -> List[Dict]:
         ``theme_id``，单报告（5~20 题材）耗时 < 50ms。
     """
     # 2026-05-28 v2：题材级 D+N 改用 sector_pct（与第 1 层口径对齐）
+    # 2026-05-28 22:00 加入 α+N 列（逐日 sector_pct - 中证1000，与 D+N 同基础）
     sql = """
     WITH per_theme_scores AS (
         SELECT
@@ -1022,6 +1105,16 @@ def get_theme_eval_for_report(report_id: int) -> List[Dict]:
                      THEN tps.sector_pct END) AS d4,
             MAX(CASE WHEN tps.days_offset=5
                      THEN tps.sector_pct END) AS d5,
+            MAX(CASE WHEN tps.days_offset=1
+                     THEN tps.sector_pct - tps.benchmark_zz1000_pct END) AS a1,
+            MAX(CASE WHEN tps.days_offset=2
+                     THEN tps.sector_pct - tps.benchmark_zz1000_pct END) AS a2,
+            MAX(CASE WHEN tps.days_offset=3
+                     THEN tps.sector_pct - tps.benchmark_zz1000_pct END) AS a3,
+            MAX(CASE WHEN tps.days_offset=4
+                     THEN tps.sector_pct - tps.benchmark_zz1000_pct END) AS a4,
+            MAX(CASE WHEN tps.days_offset=5
+                     THEN tps.sector_pct - tps.benchmark_zz1000_pct END) AS a5,
             AVG(tps.alpha) AS alpha_avg,
             -- α-1 题材级口径（与 get_prompt_eval / get_report_eval 同口径）
             AVG(CASE WHEN tps.days_offset BETWEEN 2 AND 5
@@ -1056,6 +1149,7 @@ def get_theme_eval_for_report(report_id: int) -> List[Dict]:
         COALESCE(sc.n, 0) AS stocks_count,
         COALESCE(pts.scored_pairs, 0) AS scored_pairs,
         pts.d1, pts.d2, pts.d3, pts.d4, pts.d5,
+        pts.a1, pts.a2, pts.a3, pts.a4, pts.a5,
         pts.alpha_avg,
         pts.alpha_avg_excl_d1,
         pts.hit_rate_avg,
@@ -1102,6 +1196,7 @@ def get_stock_scores_for_theme(theme_id: int) -> List[Dict]:
                 "role": "核心",                  # 核心 / 辐射 / 受益 / ...
                 "reason": "AI 给的理由",
                 "d1_pct": 5.2, ..., "d5_pct": ...,    # 涨跌幅 %
+                "a1_pct": ..., "a5_pct": ...,         # α+N：pct_chg - 中证1000 当日 pct
                 "d1_hit": 1, ..., "d5_hit": 0,        # 1=命中, 0=未命中, None=未打分
                 "scored_days": 3,              # theme_stock_scores 行数
             }
@@ -1115,6 +1210,9 @@ def get_stock_scores_for_theme(theme_id: int) -> List[Dict]:
         命中 ``theme_stocks(theme_id)`` + ``theme_stock_scores(theme_id)``
         索引，单题材（3~8 只）耗时 < 30ms。
     """
+    # 2026-05-28 22:00 加入 a_n_pct（pct_chg - 中证1000 当日 pct）
+    # 标的本身没存 zz1000，借同一 theme_id+score_date 的 theme_prediction_scores
+    # 行 join 取 benchmark_zz1000_pct
     sql = """
     WITH per_stock_pivot AS (
         SELECT
@@ -1130,6 +1228,16 @@ def get_stock_scores_for_theme(theme_id: int) -> List[Dict]:
             MAX(CASE WHEN tss.days_offset=5
                      THEN tss.pct_chg END) AS d5_pct,
             MAX(CASE WHEN tss.days_offset=1
+                     THEN tss.pct_chg - tps.benchmark_zz1000_pct END) AS a1_pct,
+            MAX(CASE WHEN tss.days_offset=2
+                     THEN tss.pct_chg - tps.benchmark_zz1000_pct END) AS a2_pct,
+            MAX(CASE WHEN tss.days_offset=3
+                     THEN tss.pct_chg - tps.benchmark_zz1000_pct END) AS a3_pct,
+            MAX(CASE WHEN tss.days_offset=4
+                     THEN tss.pct_chg - tps.benchmark_zz1000_pct END) AS a4_pct,
+            MAX(CASE WHEN tss.days_offset=5
+                     THEN tss.pct_chg - tps.benchmark_zz1000_pct END) AS a5_pct,
+            MAX(CASE WHEN tss.days_offset=1
                      THEN tss.is_hit END) AS d1_hit,
             MAX(CASE WHEN tss.days_offset=2
                      THEN tss.is_hit END) AS d2_hit,
@@ -1141,6 +1249,9 @@ def get_stock_scores_for_theme(theme_id: int) -> List[Dict]:
                      THEN tss.is_hit END) AS d5_hit,
             COUNT(tss.id) AS scored_days
         FROM theme_stock_scores tss
+        LEFT JOIN theme_prediction_scores tps
+               ON tps.theme_id = tss.theme_id
+              AND tps.score_date = tss.score_date
         WHERE tss.theme_id = ?
         GROUP BY tss.theme_stock_id
     )
@@ -1152,6 +1263,7 @@ def get_stock_scores_for_theme(theme_id: int) -> List[Dict]:
         ts.role,
         ts.reason,
         psp.d1_pct, psp.d2_pct, psp.d3_pct, psp.d4_pct, psp.d5_pct,
+        psp.a1_pct, psp.a2_pct, psp.a3_pct, psp.a4_pct, psp.a5_pct,
         psp.d1_hit, psp.d2_hit, psp.d3_hit, psp.d4_hit, psp.d5_hit,
         COALESCE(psp.scored_days, 0) AS scored_days
     FROM theme_stocks ts
