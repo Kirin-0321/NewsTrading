@@ -116,6 +116,24 @@ _TPL_COLS = [
     ("AI 高质量", 80), ("最近报告日", 100),
 ]
 
+# 上表列索引常量（与 _TPL_COLS 一一对应；用于排序 / 染色时定位列）
+_TPL_COL_NAME = 0
+_TPL_COL_VERSION = 1
+_TPL_COL_BACKTEST = 2
+_TPL_COL_THEMES = 3
+_TPL_COL_SCORED = 4
+_TPL_COL_A1 = 5
+_TPL_COL_A2 = 6
+_TPL_COL_A3 = 7
+_TPL_COL_A4 = 8
+_TPL_COL_A5 = 9
+_TPL_COL_ALPHA = 10
+_TPL_COL_ALPHA_M1 = 11
+_TPL_COL_HIT = 12
+_TPL_COL_DIR = 13
+_TPL_COL_AI_HQ = 14
+_TPL_COL_LAST_DATE = 15
+
 
 # 报告树（QTreeWidget）共享 14 列定义（2026-05-28 树形展开重构 + 18:40 加 α-1
 # + 22:00 D+N 改为 D/α+N 双值列）
@@ -237,6 +255,31 @@ class _ReportTreeItem(QTreeWidgetItem):
         a = self.data(col, Qt.UserRole + 1)
         b = other.data(col, Qt.UserRole + 1) if other is not None else None
         # NULL 末尾（升序时排后；降序时 Qt 自动反转，依然在末尾）
+        if a is None and b is None:
+            return False
+        if a is None:
+            return False
+        if b is None:
+            return True
+        try:
+            return a < b
+        except TypeError:
+            return str(a) < str(b)
+
+
+class _TplTableItem(QTableWidgetItem):
+    """模板汇总表行 item：按 ``Qt.UserRole + 1`` 存的原始可比较值排序。
+
+    设计与 ``_ReportTreeItem`` 同款：避免按显示文本（``+1.23%`` / ``—`` / ``50.0%``）
+    做字符串比较——那会让 ``-1.23%`` 排在 ``+0.10%`` 后面、``—`` 排在中间。
+
+    每列在渲染时把原始值（float / int / str / None）塞到 ``UserRole + 1``，
+    比较时直接读这个槽；None 永远当作"比任何东西都大"处理，让排序时 None 沉底。
+    """
+
+    def __lt__(self, other):  # noqa: D401
+        a = self.data(Qt.UserRole + 1)
+        b = other.data(Qt.UserRole + 1) if other is not None else None
         if a is None and b is None:
             return False
         if a is None:
@@ -434,7 +477,7 @@ class PromptEvalPage(QWidget):
         return group
 
     def _build_template_group(self) -> QGroupBox:
-        group = QGroupBox("📈 模板汇总")
+        group = QGroupBox("📈 模板汇总（点击表头排序）")
         layout = QVBoxLayout(group)
 
         self.tpl_table = QTableWidget(0, len(_TPL_COLS))
@@ -452,6 +495,10 @@ class PromptEvalPage(QWidget):
         self.tpl_table.horizontalHeader().setSectionResizeMode(
             0, QHeaderView.Stretch
         )
+        # 启用列头排序（每列原始可比较值塞到 UserRole+1，由 _TplTableItem 读取）
+        self.tpl_table.setSortingEnabled(True)
+        self.tpl_table.horizontalHeader().setSortIndicatorShown(True)
+        self.tpl_table.horizontalHeader().setSectionsClickable(True)
         self.tpl_table.itemSelectionChanged.connect(
             self._on_template_selected
         )
@@ -589,7 +636,22 @@ class PromptEvalPage(QWidget):
 
     def _render_template_table(self, rows: List[Dict]) -> None:
         from gui.utils.prompt_name_helper import friendly_prompt_name
+        # 填充期间关掉排序，避免边写边触发 sortItems()；填完再开
+        self.tpl_table.setSortingEnabled(False)
         self.tpl_table.setRowCount(len(rows))
+
+        # 数值列：(列索引, 数据 key) → 取 float / None 塞 UserRole+1
+        pct_cols = (
+            (_TPL_COL_A1, "a1_avg"),
+            (_TPL_COL_A2, "a2_avg"),
+            (_TPL_COL_A3, "a3_avg"),
+            (_TPL_COL_A4, "a4_avg"),
+            (_TPL_COL_A5, "a5_avg"),
+            (_TPL_COL_ALPHA, "alpha_avg"),
+            (_TPL_COL_ALPHA_M1, "alpha_avg_excl_d1"),
+            (_TPL_COL_HIT, "hit_rate_avg"),
+            (_TPL_COL_DIR, "direction_correct_rate"),
+        )
         for r_idx, data in enumerate(rows):
             pid = data.get("prompt_id") or "—"
             themes_total = int(
@@ -615,36 +677,59 @@ class PromptEvalPage(QWidget):
                 "—",  # AI 高质量占比（Phase 7 待实现）
                 format_yyyymmdd_to_dash(data.get("last_report_date") or "—"),
             ]
+            # 每列原始可比较值（None 让 _TplTableItem 沉底）
+            sort_values: List = [None] * len(_TPL_COLS)
+            sort_values[_TPL_COL_NAME] = cells[_TPL_COL_NAME]
+            sort_values[_TPL_COL_VERSION] = cells[_TPL_COL_VERSION]
+            sort_values[_TPL_COL_BACKTEST] = cells[_TPL_COL_BACKTEST]
+            sort_values[_TPL_COL_THEMES] = themes_total
+            sort_values[_TPL_COL_SCORED] = scored_themes
+            for c_idx, key in pct_cols:
+                v = data.get(key)
+                sort_values[c_idx] = None if v is None else float(v)
+            # AI 高质量占比列暂无数据 → None 沉底
+            sort_values[_TPL_COL_AI_HQ] = None
+            # 最近报告日：原始 YYYYMMDD 字符串可直接比较（不用显示用的破折号串）
+            sort_values[_TPL_COL_LAST_DATE] = data.get("last_report_date") or None
+
             low_sample = themes_total < _LOW_SAMPLE_THRESHOLD
             unscored = themes_total > 0 and scored_themes == 0
             for c_idx, text in enumerate(cells):
-                item = QTableWidgetItem(text)
+                item = _TplTableItem(text)
                 item.setToolTip(text)
-                # prompt_id 实际值塞到第 0 列的 Qt.UserRole
-                if c_idx == 0:
+                item.setData(Qt.UserRole + 1, sort_values[c_idx])
+                # prompt_id 实际值塞到第 0 列的 Qt.UserRole（_on_template_selected 用）
+                if c_idx == _TPL_COL_NAME:
                     item.setData(Qt.UserRole, pid)
                 # 题材列（小样本警告）
-                if c_idx == 3 and low_sample:
+                if c_idx == _TPL_COL_THEMES and low_sample:
                     item.setBackground(QColor("#fff7e6"))
                     item.setToolTip(
                         f"题材仅 {themes_total}，建议 ≥ "
                         f"{_LOW_SAMPLE_THRESHOLD} 才有统计意义"
                     )
                 # 已打列（全 0 时高亮提示需要打分）
-                if c_idx == 4 and unscored:
+                if c_idx == _TPL_COL_SCORED and unscored:
                     item.setBackground(QColor("#fff1f0"))
                     item.setForeground(QColor("#cf1322"))
                     item.setToolTip(
                         "该模板下题材都未打分，去下表点「打分」按钮"
                     )
                 # D+N / α / α-1 染色（c_idx 5~11）
-                if c_idx in (5, 6, 7, 8, 9, 10, 11):
+                if c_idx in (
+                    _TPL_COL_A1, _TPL_COL_A2, _TPL_COL_A3, _TPL_COL_A4,
+                    _TPL_COL_A5, _TPL_COL_ALPHA, _TPL_COL_ALPHA_M1,
+                ):
                     self._colorize_pct(item, data, c_idx, "d_or_alpha")
-                # AI 高质量占比列：tooltip 说明（α-1 列加进来后顺移至 14）
-                if c_idx == 14:
+                # AI 高质量占比列：tooltip 说明
+                if c_idx == _TPL_COL_AI_HQ:
                     item.setForeground(QColor("#bfbfbf"))
                     item.setToolTip("等 Phase 7 AI 评分员（ai_scorer.py）落地")
                 self.tpl_table.setItem(r_idx, c_idx, item)
+
+        # 重新启用排序并应用默认序：α-1 降序
+        self.tpl_table.setSortingEnabled(True)
+        self.tpl_table.sortByColumn(_TPL_COL_ALPHA_M1, Qt.DescendingOrder)
 
     def _render_tree_top_level(self, rows: List[Dict]) -> None:
         """渲染顶层 📄 报告节点；每个节点挂一个 placeholder 让 ▶ 出现。"""
