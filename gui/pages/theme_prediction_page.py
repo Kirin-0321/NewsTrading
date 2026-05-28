@@ -1,14 +1,18 @@
 """题材预测库页面。
 
-上半区: 手动选择分析报告 .md → 调 AI 抽取 → 入库
+上半区（2026-05-28 队列化改造后改为左右两栏）：
+    左栏：手动选择分析报告 .md → 调 AI 抽取 → 入库（原 UI 不动）
+    右栏：📋 任务队列（评估页 + 本页所有抽取任务汇入同一条队列）
 下半区: 按报告日期查看已入库题材，行点击展开标的与新闻
 
 调用链:
     init_ui()
-        ├── _build_extract_group()       手动抽取
-        └── _build_viewer_group()        查看已入库
+        ├── _build_extract_group()       上半区（左：手动抽取 / 右：队列）
+        └── _build_viewer_group()        下半区（查看已入库）
     start_extract()
-        └→ ThemeExtractWorker (线程)
+        └→ self._tem.enqueue(report_path=...) → ThemeExtractWorker (线程)
+    set_theme_extract_manager(mgr)        MainWindow 注入 manager 单例
+        └→ _wire_manager_signals()       接 5 个信号刷队列表
     showEvent / refresh / 日期切换
         └→ _reload_dates() / _reload_themes_for_date()
     选中题材表格行
@@ -18,20 +22,32 @@
 import os
 from typing import Optional
 
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QColor, QTextCursor
 from PyQt5.QtWidgets import (
+    QAbstractItemView, QHeaderView, QSpinBox,
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QGroupBox,
     QComboBox, QLineEdit, QFileDialog, QMessageBox, QTextBrowser,
     QTableWidget, QTableWidgetItem, QSplitter, QTabWidget,
 )
 
 from gui.utils.styles import (
-    BUTTON_PRIMARY, BUTTON_SUCCESS, COMBOBOX_STYLE, INPUT_STYLE,
-    TEXTBROWSER_STYLE, TABLE_STYLE,
+    BUTTON_DANGER, BUTTON_PRIMARY, BUTTON_SUCCESS,
+    COMBOBOX_STYLE, INPUT_STYLE, TEXTBROWSER_STYLE, TABLE_STYLE,
 )
 from gui.widgets.sparkline import SparklineWidget
-from gui.workers.theme_extract_worker import ThemeExtractWorker
+from gui.workers.theme_extract_manager import (
+    STATUS_COLOR, STATUS_LABEL, TaskStatus, ThemeExtractTaskManager,
+)
+
+
+# 任务队列表格列定义（4 列：# / 报告名 / 状态+用时 / 删除）
+_QUEUE_TABLE_COLS = [
+    ("#", 40),
+    ("报告名", 320),
+    ("状态 / 用时", 130),
+    ("删除", 60),
+]
 
 
 _THEME_TABLE_COLS = [
@@ -107,11 +123,24 @@ class ThemePredictionPage(QWidget):
 
     def __init__(self):
         super().__init__()
-        self.worker: Optional[ThemeExtractWorker] = None
+        # manager 由 MainWindow 在 pages 创建完成后通过
+        # set_theme_extract_manager 显式注入（self.window() 在 __init__
+        # 阶段拿不到 mainwindow，必须走 setter）。
+        self._tem: Optional[ThemeExtractTaskManager] = None
+        # 队列表格里的 task_id ↔ row 双向映射（信号增量更新用）
+        self._row_to_tid: list[int] = []
+        self._tid_to_row: dict[int, int] = {}
+        # 当前选中"看进度"的 task_id（左栏日志/流式回灌的目标）
+        self._current_task_id: Optional[int] = None
         self._current_themes: list = []
         self._sort_col: Optional[int] = None
         self._sort_asc: bool = True
         self.init_ui()
+        # RUNNING 任务用时实时刷新（参考手动回测同款 1s tick）
+        self._elapsed_timer = QTimer(self)
+        self._elapsed_timer.setInterval(1000)
+        self._elapsed_timer.timeout.connect(self._refresh_running_elapsed)
+        self._elapsed_timer.start()
         self.refresh()
 
     def init_ui(self):
@@ -133,9 +162,28 @@ class ThemePredictionPage(QWidget):
         splitter.setSizes([260, 700])
         layout.addWidget(splitter, 1)
 
-    # ---------- 上半区：手动抽取 ----------
+    # ---------- 上半区：手动抽取（左）+ 任务队列（右） ----------
 
-    def _build_extract_group(self) -> QGroupBox:
+    def _build_extract_group(self) -> QWidget:
+        """上半区改造（2026-05-28 队列化）：横向左右两栏 QSplitter。
+
+        左栏：原"手动抽取"GroupBox（文件选择 / 抽取按钮 / 阶段日志 /
+              流式预览），日志和流式都跟随当前选中任务回灌。
+        右栏：新增"📋 任务队列"GroupBox（4 列任务表 + 顶部并发 spin
+              + 清完成按钮），评估页 / 本页发起的抽取任务全部汇入此队列。
+        """
+        split = QSplitter(Qt.Horizontal)
+        split.setChildrenCollapsible(False)
+        split.addWidget(self._build_manual_extract_group())
+        split.addWidget(self._build_queue_panel())
+        # 左 3 / 右 2 的初始比例（左栏是日志主区，右栏只看任务行）
+        split.setStretchFactor(0, 3)
+        split.setStretchFactor(1, 2)
+        split.setSizes([600, 400])
+        return split
+
+    def _build_manual_extract_group(self) -> QGroupBox:
+        """左栏：原"手动抽取"UI 完全保留，日志 / 流式跟随当前选中任务。"""
         group = QGroupBox("📥 手动抽取题材（选择已有分析报告）")
         layout = QVBoxLayout()
 
@@ -158,18 +206,21 @@ class ThemePredictionPage(QWidget):
         self.extract_btn = QPushButton("🚀 开始抽取并入库")
         self.extract_btn.setStyleSheet(BUTTON_PRIMARY)
         self.extract_btn.setMinimumHeight(36)
+        self.extract_btn.setToolTip(
+            "把当前选中的 .md 加入队列（连点 N 次排 N 个任务）"
+        )
         self.extract_btn.clicked.connect(self.start_extract)
         action_row.addWidget(self.extract_btn)
         action_row.addStretch()
         layout.addLayout(action_row)
 
-        # 阶段日志（带时间戳）
+        # 阶段日志（带时间戳；跟随当前选中任务回灌）
         self.extract_log = QTextBrowser()
         self.extract_log.setStyleSheet(TEXTBROWSER_STYLE)
         self.extract_log.setMaximumHeight(100)
         layout.addWidget(self.extract_log)
 
-        # AI 流式输出预览（chunk 实时粘连写入，避免长任务假死观感）
+        # AI 流式输出预览（chunk 实时粘连写入；跟随当前选中任务回灌）
         layout.addWidget(QLabel("🤖 AI 实时输出（流式 JSON 预览）:"))
         self.stream_browser = QTextBrowser()
         self.stream_browser.setStyleSheet(
@@ -181,6 +232,80 @@ class ThemePredictionPage(QWidget):
         layout.addWidget(self.stream_browser)
 
         group.setLayout(layout)
+        return group
+
+    def _build_queue_panel(self) -> QGroupBox:
+        """右栏：任务队列面板（4 列任务表 + 顶部并发 spin + 清完成按钮）。
+
+        信号绑定要等 manager 注入（``set_theme_extract_manager``）后才接，
+        构造时控件先创出来即可。
+        """
+        group = QGroupBox(
+            "📋 题材抽取队列（评估页 / 本页所有抽取任务汇入此处）"
+        )
+        layout = QVBoxLayout(group)
+        layout.setContentsMargins(8, 6, 8, 8)
+        layout.setSpacing(6)
+
+        # 顶栏：并发数微调器 + 清完成按钮
+        top_row = QHBoxLayout()
+        top_row.addWidget(QLabel("并发:"))
+        self.queue_concurrency_spin = QSpinBox()
+        self.queue_concurrency_spin.setRange(
+            1, ThemeExtractTaskManager.MAX_CONCURRENT_HARD_CAP
+        )
+        self.queue_concurrency_spin.setValue(
+            ThemeExtractTaskManager._DEFAULT_MAX_CONCURRENT
+        )
+        self.queue_concurrency_spin.setSuffix(" 路")
+        self.queue_concurrency_spin.setToolTip(
+            "同时跑几个题材抽取任务（1~64）。\n"
+            "默认 16 路与 DeepSeek V4 Pro 60+ req/min 阈值匹配；\n"
+            "调大立即填满空位，调小不强杀 RUNNING 但停止派新单。"
+        )
+        self.queue_concurrency_spin.valueChanged.connect(
+            self._on_queue_concurrency_changed
+        )
+        top_row.addWidget(self.queue_concurrency_spin)
+        top_row.addSpacing(12)
+
+        self.queue_hint_label = QLabel("（暂无任务）")
+        self.queue_hint_label.setStyleSheet(
+            "color: #1890ff; font-size: 12px; padding: 0 6px;"
+        )
+        top_row.addWidget(self.queue_hint_label, 1)
+
+        self.clear_done_btn = QPushButton("🧹 清完成")
+        self.clear_done_btn.setStyleSheet(BUTTON_SUCCESS)
+        self.clear_done_btn.setToolTip(
+            "把所有终态任务（成功 / 失败 / 跳过）从队列移除"
+        )
+        self.clear_done_btn.clicked.connect(self._on_clear_done)
+        top_row.addWidget(self.clear_done_btn)
+        layout.addLayout(top_row)
+
+        # 任务表
+        self.queue_table = QTableWidget(0, len(_QUEUE_TABLE_COLS))
+        self.queue_table.setHorizontalHeaderLabels(
+            [c[0] for c in _QUEUE_TABLE_COLS]
+        )
+        self.queue_table.setStyleSheet(TABLE_STYLE)
+        self.queue_table.verticalHeader().setVisible(False)
+        self.queue_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.queue_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.queue_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        for i, (_, w) in enumerate(_QUEUE_TABLE_COLS):
+            self.queue_table.setColumnWidth(i, w)
+        header = self.queue_table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.Fixed)
+        header.setSectionResizeMode(1, QHeaderView.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.Fixed)
+        header.setSectionResizeMode(3, QHeaderView.Fixed)
+        self.queue_table.itemSelectionChanged.connect(
+            self._on_queue_row_selected
+        )
+        layout.addWidget(self.queue_table, 1)
+
         return group
 
     def _on_browse(self):
@@ -196,9 +321,39 @@ class ThemePredictionPage(QWidget):
         if path:
             self.file_input.setText(path)
 
+    # ---------- manager 注入 + 信号绑定 ----------
+
+    def set_theme_extract_manager(
+        self, manager: ThemeExtractTaskManager
+    ) -> None:
+        """MainWindow 在 pages 创建完成后调用，把跨页 manager 单例注入。
+
+        一次性绑定 5 个信号；UI 控件创建已在 init_ui 完成，此处只做接线。
+        """
+        if self._tem is not None:
+            return
+        self._tem = manager
+        # 同步 spin 当前值（manager 默认 16，与 spin 默认一致；保险起见同步）
+        self.queue_concurrency_spin.blockSignals(True)
+        self.queue_concurrency_spin.setValue(manager.get_max_concurrent())
+        self.queue_concurrency_spin.blockSignals(False)
+
+        manager.task_added.connect(self._on_task_added)
+        manager.task_started.connect(self._on_task_started)
+        manager.task_progress.connect(self._on_task_progress)
+        manager.task_streaming.connect(self._on_task_streaming)
+        manager.task_finished.connect(self._on_task_finished)
+        manager.task_removed.connect(self._on_task_removed)
+
+    # ---------- 入队 ----------
+
     def start_extract(self):
-        if self.worker and self.worker.isRunning():
-            QMessageBox.warning(self, "提示", "抽取正在进行中")
+        """把当前选中的 .md 入队（连点 N 次 = 排 N 个任务）。"""
+        if self._tem is None:
+            QMessageBox.warning(
+                self, "未就绪",
+                "题材抽取 manager 未注入，请重启 GUI 后再试。"
+            )
             return
 
         path = self.file_input.text().strip()
@@ -209,46 +364,185 @@ class ThemePredictionPage(QWidget):
             QMessageBox.warning(self, "提示", f"文件不存在：{path}")
             return
 
-        self.extract_btn.setEnabled(False)
-        self.extract_log.clear()
-        self.stream_browser.clear()
-        self._append_log(f"开始抽取: {os.path.basename(path)}")
+        tid = self._tem.enqueue(report_path=os.path.abspath(path))
+        # 立即把这个新任务设为"看进度"焦点，主人能立刻在左栏看见日志/流式
+        self._select_task_row(tid)
 
-        self.worker = ThemeExtractWorker(report_path=path)
-        self.worker.progress.connect(self._append_log)
-        self.worker.streaming.connect(self._append_stream)
-        self.worker.finished.connect(self._on_extract_finished)
-        self.worker.error.connect(self._on_extract_error)
-        self.worker.start()
+    # ---------- manager 信号槽 ----------
 
-    def _append_stream(self, chunk: str):
-        """流式 chunk 粘连写入预览区，自动滚到末尾。"""
+    def _on_task_added(self, tid: int) -> None:
+        if self._tem is None:
+            return
+        task = self._tem.get(tid)
+        if task is None:
+            return
+        row = self.queue_table.rowCount()
+        self.queue_table.insertRow(row)
+        self._row_to_tid.append(tid)
+        self._tid_to_row[tid] = row
+        self._render_task_row(row, tid)
+        self._refresh_queue_hint()
+
+    def _on_task_started(self, tid: int) -> None:
+        self._render_task_row(self._tid_to_row.get(tid, -1), tid)
+        self._refresh_queue_hint()
+
+    def _on_task_progress(self, tid: int, line: str) -> None:
+        if tid != self._current_task_id:
+            return
+        self.extract_log.append(line)
+
+    def _on_task_streaming(self, tid: int, chunk: str) -> None:
+        if tid != self._current_task_id:
+            return
         self.stream_browser.insertPlainText(chunk)
         self.stream_browser.moveCursor(QTextCursor.End)
 
-    def _on_extract_finished(self, payload: dict):
-        msg = (
-            f"✅ 入库完成: {payload['themes']} 题材 / "
-            f"{payload['stocks']} 标的 / {payload['news']} 新闻引用"
+    def _on_task_finished(self, tid: int) -> None:
+        self._render_task_row(self._tid_to_row.get(tid, -1), tid)
+        self._refresh_queue_hint()
+        if self._tem is None:
+            return
+        task = self._tem.get(tid)
+        if task is None:
+            return
+        # 成功 → 自动刷新查看区到对应日期
+        if (
+            task.status == TaskStatus.SUCCESS
+            and task.result
+            and task.result.get("report_date")
+        ):
+            self._reload_dates(prefer_date=task.result["report_date"])
+
+    def _on_task_removed(self, tid: int) -> None:
+        row = self._tid_to_row.pop(tid, None)
+        if row is None:
+            return
+        self.queue_table.removeRow(row)
+        self._row_to_tid.pop(row)
+        # 重排 row → tid 映射（被移除行之后的行号 -1）
+        self._tid_to_row = {t: i for i, t in enumerate(self._row_to_tid)}
+        if self._current_task_id == tid:
+            self._current_task_id = None
+            self.extract_log.clear()
+            self.stream_browser.clear()
+        self._refresh_queue_hint()
+
+    # ---------- 队列 UI 辅助 ----------
+
+    def _render_task_row(self, row: int, tid: int) -> None:
+        if row < 0 or self._tem is None:
+            return
+        task = self._tem.get(tid)
+        if task is None:
+            return
+        # # 列
+        self.queue_table.setItem(row, 0, QTableWidgetItem(str(tid)))
+        # 报告名列
+        name_item = QTableWidgetItem(task.report_basename)
+        name_item.setToolTip(task.report_path)
+        self.queue_table.setItem(row, 1, name_item)
+        # 状态 / 用时
+        status_text = f"{task.status_label} / {task.elapsed_text()}"
+        st_item = QTableWidgetItem(status_text)
+        st_item.setForeground(QColor(task.status_color))
+        self.queue_table.setItem(row, 2, st_item)
+        # 删除按钮（RUNNING disable）
+        del_btn = QPushButton("🗑")
+        del_btn.setStyleSheet(BUTTON_DANGER)
+        del_btn.setEnabled(task.status != TaskStatus.RUNNING)
+        del_btn.setToolTip(
+            "RUNNING 任务不可删；其它状态删除仅清队列行，不动 .md / 数据库"
         )
-        self._append_log(msg)
-        if payload.get("warning"):
-            self._append_log(f"⚠️ 警告: {payload['warning']}")
+        del_btn.clicked.connect(lambda _, _t=tid: self._on_remove_task(_t))
+        self.queue_table.setCellWidget(row, 3, del_btn)
 
-        self.extract_btn.setEnabled(True)
+    def _on_remove_task(self, tid: int) -> None:
+        if self._tem is None:
+            return
+        if not self._tem.remove(tid):
+            QMessageBox.information(
+                self, "无法删除",
+                "任务正在运行中，无法删除。等它跑完再试。"
+            )
 
-        # 自动刷新查看区到对应日期
-        self._reload_dates(prefer_date=payload.get("report_date"))
+    def _on_clear_done(self) -> None:
+        if self._tem is None:
+            return
+        terminal_tids = [
+            t.task_id for t in self._tem.list_tasks() if t.is_terminal
+        ]
+        for tid in terminal_tids:
+            self._tem.remove(tid)
 
-    def _on_extract_error(self, msg: str):
-        self._append_log(f"❌ {msg}")
-        self.extract_btn.setEnabled(True)
-        QMessageBox.critical(self, "抽取失败", msg)
+    def _on_queue_concurrency_changed(self, n: int) -> None:
+        if self._tem is None:
+            return
+        applied = self._tem.set_max_concurrent(n)
+        if applied != n:
+            self.queue_concurrency_spin.blockSignals(True)
+            self.queue_concurrency_spin.setValue(applied)
+            self.queue_concurrency_spin.blockSignals(False)
 
-    def _append_log(self, msg: str):
-        from datetime import datetime
-        ts = datetime.now().strftime("%H:%M:%S")
-        self.extract_log.append(f"[{ts}] {msg}")
+    def _on_queue_row_selected(self) -> None:
+        rows = self.queue_table.selectionModel().selectedRows()
+        if not rows:
+            return
+        row = rows[0].row()
+        if 0 <= row < len(self._row_to_tid):
+            self._select_task_row(self._row_to_tid[row])
+
+    def _select_task_row(self, tid: int) -> None:
+        """把 tid 任务设为左栏日志/流式回灌的目标，并自动选中表格行。"""
+        if self._tem is None:
+            return
+        task = self._tem.get(tid)
+        if task is None:
+            return
+        self._current_task_id = tid
+        # 整段回灌
+        self.extract_log.clear()
+        for line in task.log_buffer:
+            self.extract_log.append(line)
+        self.stream_browser.clear()
+        if task.stream_buffer:
+            self.stream_browser.setPlainText("".join(task.stream_buffer))
+            self.stream_browser.moveCursor(QTextCursor.End)
+        # 同步表格选中态
+        row = self._tid_to_row.get(tid)
+        if row is not None and self.queue_table.currentRow() != row:
+            self.queue_table.blockSignals(True)
+            self.queue_table.selectRow(row)
+            self.queue_table.blockSignals(False)
+
+    def _refresh_running_elapsed(self) -> None:
+        """1s tick：刷新所有 RUNNING 任务行的"用时"显示。"""
+        if self._tem is None:
+            return
+        for tid, row in self._tid_to_row.items():
+            task = self._tem.get(tid)
+            if task is None or task.status != TaskStatus.RUNNING:
+                continue
+            it = self.queue_table.item(row, 2)
+            if it is not None:
+                it.setText(f"{task.status_label} / {task.elapsed_text()}")
+
+    def _refresh_queue_hint(self) -> None:
+        if self._tem is None:
+            self.queue_hint_label.setText("（暂无任务）")
+            return
+        tasks = self._tem.list_tasks()
+        if not tasks:
+            self.queue_hint_label.setText("（暂无任务）")
+            return
+        n_pending = sum(1 for t in tasks if t.status == TaskStatus.PENDING)
+        n_running = sum(1 for t in tasks if t.status == TaskStatus.RUNNING)
+        n_success = sum(1 for t in tasks if t.status == TaskStatus.SUCCESS)
+        n_failed = sum(1 for t in tasks if t.status == TaskStatus.FAILED)
+        self.queue_hint_label.setText(
+            f"⌛ {n_pending} / ⏳ {n_running} / "
+            f"✅ {n_success} / ❌ {n_failed}"
+        )
 
     # ---------- 下半区：查看 ----------
 

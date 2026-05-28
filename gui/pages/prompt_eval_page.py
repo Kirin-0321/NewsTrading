@@ -87,6 +87,9 @@ from gui.utils.styles import (
 )
 from gui.workers.delete_report_worker import DeleteReportWorker
 from gui.workers.rescore_worker import RescoreWorker
+from gui.workers.theme_extract_manager import (
+    TaskStatus, ThemeExtractTaskManager,
+)
 
 
 _RANGE_OPTIONS = [
@@ -265,11 +268,30 @@ class PromptEvalPage(QWidget):
         self._selected_prompt_id: Optional[str] = None
         self._rescore_worker: Optional[RescoreWorker] = None
         self._delete_worker: Optional[DeleteReportWorker] = None
+        # 题材抽取 manager（跨页单例，由 MainWindow 注入；构造时不可用）
+        self._tem: Optional[ThemeExtractTaskManager] = None
+        # 已入队的 report_id 集合（用于把行内「🎯 提取题材」按钮置为
+        # 「⌛ 已入队」灰色，避免重复点）。task_finished 时根据成功/失败
+        # 决定是否清出（成功后行刷新会重建按钮，无需手动维护）
+        self._enqueued_report_ids: set[int] = set()
         # 树形展开缓存：{ai_reports.id: List[theme_dict]}, {theme_id: List[stock_dict]}
         self._theme_cache: Dict[int, List[Dict]] = {}
         self._stock_cache: Dict[int, List[Dict]] = {}
         self.init_ui()
         self.refresh()
+
+    # ------------------------------------------------------------------
+    # manager 注入（MainWindow 在 pages 创建完成后调用）
+    # ------------------------------------------------------------------
+
+    def set_theme_extract_manager(
+        self, manager: ThemeExtractTaskManager
+    ) -> None:
+        """挂 manager 单例并连 task_finished：成功后自动刷新评估页表。"""
+        if self._tem is not None:
+            return
+        self._tem = manager
+        manager.task_finished.connect(self._on_extract_task_finished)
 
     # ------------------------------------------------------------------
     # UI 构建
@@ -371,6 +393,24 @@ class PromptEvalPage(QWidget):
         self.batch_score_btn.clicked.connect(self._on_batch_score_unfinished)
         row2.addWidget(self.batch_score_btn)
 
+        self.batch_extract_btn = QPushButton("⚡ 全部提取（未抽题材）")
+        self.batch_extract_btn.setStyleSheet(BUTTON_SUCCESS)
+        self.batch_extract_btn.setToolTip(
+            "扫当前【时间范围】内 themes_count=0 的报告，全部加入题材抽取队列。\n"
+            "任务在「预测题材」页右栏并发跑（默认 16 路）。"
+        )
+        self.batch_extract_btn.clicked.connect(self._on_batch_extract_all)
+        row2.addWidget(self.batch_extract_btn)
+
+        self.batch_delete_btn = QPushButton("🗑 批量删除")
+        self.batch_delete_btn.setStyleSheet(BUTTON_DANGER)
+        self.batch_delete_btn.setToolTip(
+            "删除树中当前【已选中】的报告（Ctrl+点 / Shift+范围 多选）。\n"
+            "全回测：单次确认；含真实报告：弹强提示二次确认。"
+        )
+        self.batch_delete_btn.clicked.connect(self._on_batch_delete)
+        row2.addWidget(self.batch_delete_btn)
+
         self.rescore_btn = QPushButton("🔁 重打分（按筛选范围）")
         self.rescore_btn.setStyleSheet(BUTTON_DANGER)
         self.rescore_btn.setToolTip(
@@ -436,7 +476,8 @@ class PromptEvalPage(QWidget):
         self.report_tree.setUniformRowHeights(True)
         self.report_tree.setRootIsDecorated(True)
         self.report_tree.setAlternatingRowColors(True)
-        self.report_tree.setSelectionMode(QTreeWidget.SingleSelection)
+        # 2026-05-28：启用多选（Ctrl+点 / Shift+范围），供「🗑 批量删除」用
+        self.report_tree.setSelectionMode(QTreeWidget.ExtendedSelection)
         self.report_tree.setSortingEnabled(True)
         # 默认按报告日期降序（_COL_NAME 列存日期作为可比较值）
         self.report_tree.sortByColumn(_COL_NAME, Qt.DescendingOrder)
@@ -965,13 +1006,36 @@ class PromptEvalPage(QWidget):
     def _build_score_button(
         self, data: Dict, status: str, themes_n: int,
     ) -> QPushButton:
-        """构造该行的「打分」按钮，根据 score_status 切换文字/样式。"""
+        """构造该行的「打分」按钮，根据 score_status 切换文字/样式。
+
+        2026-05-28 改造：``themes_n == 0`` 不再是灰色禁用按钮，而是可点击的
+        「🎯 提取题材」按钮——点击后入队到题材抽取队列，跑完后回到此处重打分。
+        """
         report_id = int(data.get("report_id") or 0)
         if themes_n == 0:
-            btn = QPushButton("✗ 无题材")
+            already_enqueued = report_id in self._enqueued_report_ids
+            if already_enqueued:
+                btn = QPushButton("⌛ 已入队")
+                btn.setStyleSheet(_BTN_NONE)
+                btn.setEnabled(False)
+                btn.setToolTip("已加入题材抽取队列，请到「预测题材」页查看进度")
+                return btn
+            btn = QPushButton("🎯 提取题材")
             btn.setStyleSheet(_BTN_NONE)
-            btn.setEnabled(False)
-            btn.setToolTip("该报告未抽取到题材，无法打分")
+            file_path = data.get("file_path") or ""
+            tooltip = (
+                "把该报告的 .md 文件加入题材抽取队列\n"
+                f"路径：{file_path}\n"
+                "—— 任务在「预测题材」页右栏队列中并发跑"
+            )
+            if not file_path:
+                btn.setEnabled(False)
+                tooltip = "缺 file_path，无法定位 .md 报告"
+            btn.setToolTip(tooltip)
+            btn.clicked.connect(
+                lambda _checked=False, rid=report_id, fp=file_path:
+                self._on_extract_one_clicked(rid, fp)
+            )
             return btn
         if status == "none":
             btn = QPushButton("⚡ 初次打分")
@@ -1356,9 +1420,254 @@ class PromptEvalPage(QWidget):
         self._rescore_worker.error.connect(self._on_rescore_error)
         self._rescore_worker.start()
 
+    # ------------------------------------------------------------------
+    # 题材抽取交互（2026-05-28 队列化改造新增）
+    # ------------------------------------------------------------------
+
+    def _on_extract_one_clicked(self, report_id: int, file_path: str) -> None:
+        """行内「🎯 提取题材」按钮：把单份 .md 入队 + toast。"""
+        if self._tem is None:
+            QMessageBox.warning(
+                self, "未就绪",
+                "题材抽取 manager 未注入，请重启 GUI 后再试。"
+            )
+            return
+        if not file_path:
+            QMessageBox.warning(self, "缺路径", "该报告缺 file_path，无法抽取")
+            return
+        import os as _os
+        if not _os.path.isfile(file_path):
+            QMessageBox.warning(
+                self, "文件不存在", f".md 文件不存在：\n{file_path}"
+            )
+            return
+        tid = self._tem.enqueue(report_path=_os.path.abspath(file_path))
+        self._enqueued_report_ids.add(report_id)
+        # 不切 Tab，仅 toast（主人决策 q1=toast_only）
+        QMessageBox.information(
+            self, "已入队",
+            f"✅ 已加入题材抽取队列（task_id={tid}）。\n\n"
+            f"切到「预测题材」页右栏可看进度。"
+        )
+        # 重建该行的尾按钮（让它立刻变成「⌛ 已入队」灰）
+        self._reload_report_table()
+
+    def _on_batch_extract_all(self) -> None:
+        """表头「⚡ 全部提取（未抽题材）」：扫当前筛选范围内 themes_count=0
+        的报告全部入队。"""
+        if self._tem is None:
+            QMessageBox.warning(
+                self, "未就绪",
+                "题材抽取 manager 未注入，请重启 GUI 后再试。"
+            )
+            return
+        targets: list[Dict] = []
+        for r in self._report_rows:
+            tn = int(r.get("themes_count") or 0)
+            rid = int(r.get("report_id") or 0)
+            fp = r.get("file_path") or ""
+            if tn == 0 and rid > 0 and fp:
+                targets.append(r)
+        if not targets:
+            QMessageBox.information(
+                self, "无候选",
+                "当前筛选范围内没有 themes_count=0 且 file_path 有效的报告。"
+            )
+            return
+        n_real = sum(
+            1 for r in targets if int(r.get("is_backtest") or 0) == 0
+        )
+        n_bt = len(targets) - n_real
+        body = (
+            f"<b>将提取 {len(targets)} 份未抽题材的报告</b><br>"
+            f"&nbsp;&nbsp;含回测 {n_bt} 份 / 真实 {n_real} 份<br>"
+            f"&nbsp;&nbsp;时间范围：最近 {self.range_combo.currentText()}<br>"
+            f"<br>全部加入「预测题材」页右栏队列，"
+            f"按当前并发数（默认 16）后台跑。"
+        )
+        reply = QMessageBox.question(
+            self, "确认全部提取", body,
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        import os as _os
+        ok_n = 0
+        skip_n = 0
+        for r in targets:
+            fp = r.get("file_path") or ""
+            rid = int(r.get("report_id") or 0)
+            if not _os.path.isfile(fp):
+                skip_n += 1
+                continue
+            self._tem.enqueue(report_path=_os.path.abspath(fp))
+            self._enqueued_report_ids.add(rid)
+            ok_n += 1
+        QMessageBox.information(
+            self, "已入队",
+            f"✅ 已加入 {ok_n} 个任务"
+            + (f"（跳过 {skip_n} 份：.md 不存在）" if skip_n else "")
+            + "\n\n切到「预测题材」页右栏可看进度。"
+        )
+        self._reload_report_table()
+
+    def _on_batch_delete(self) -> None:
+        """表头「🗑 批量删除」：删除当前选中的报告（树多选 Ctrl/Shift）。
+
+        - 仅顶层 📄 报告节点参与（题材/标的子级即使被多选也忽略）
+        - 全回测：弹普通确认；含真实：弹强提示二次确认
+        - 已在队列 PENDING/RUNNING 的报告：拒删（避免 worker 跑完落空）
+        - 串行调用 ``delete_report``，复用现有 service 接口
+        """
+        sel_items = self.report_tree.selectedItems()
+        target_rows: list[Dict] = []
+        for it in sel_items:
+            if it.parent() is not None:
+                continue  # 跳过题材/标的子级
+            meta = it.data(_COL_NAME, Qt.UserRole) or {}
+            if meta.get("kind") != _KIND_REPORT:
+                continue
+            d = meta.get("data") or {}
+            if int(d.get("report_id") or 0) > 0:
+                target_rows.append(d)
+        if not target_rows:
+            QMessageBox.information(
+                self, "未选中",
+                "请先在树里选中至少一行报告（Ctrl+点 / Shift+范围多选）。"
+            )
+            return
+        # 拦截：被选中的报告里有正在抽题材的 → 让主人先取消队列任务再删
+        if self._tem is not None:
+            for d in target_rows:
+                fp = d.get("file_path") or ""
+                if fp and self._tem.has_active_for_path(fp):
+                    QMessageBox.warning(
+                        self, "无法删除",
+                        f"报告 id={d.get('report_id')} 正在题材抽取队列中"
+                        f"（PENDING/RUNNING）。\n"
+                        f"请到「预测题材」页右栏先删掉对应任务再来。"
+                    )
+                    return
+
+        n_real = sum(
+            1 for d in target_rows if int(d.get("is_backtest") or 0) == 0
+        )
+        n_bt = len(target_rows) - n_real
+        body = (
+            f"<b>即将删除 {len(target_rows)} 份报告</b><br>"
+            f"&nbsp;&nbsp;含回测 {n_bt} 份 / "
+            f"<span style='color:#c00'>真实 {n_real} 份</span><br>"
+            f"&nbsp;&nbsp;同步删 theme_predictions(+CASCADE 子表) + .md 文件<br>"
+            f"<br><span style='color:#c00'>此操作不可逆。</span>"
+        )
+        reply = QMessageBox.question(
+            self, "确认批量删除", body,
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        if n_real > 0:
+            # 二次确认：含真实报告时强提示
+            from PyQt5.QtWidgets import QInputDialog
+            text, ok = QInputDialog.getText(
+                self,
+                "⚠ 二次确认：批量删除含真实报告",
+                f"<b>选中含 {n_real} 份真实分析报告</b>。\n"
+                f"真实报告通常是历史决策记录，删除后无法重生。\n\n"
+                f"请输入「我确认删除」4 个字以继续："
+            )
+            if not ok:
+                return
+            if text.strip() != "我确认删除":
+                QMessageBox.warning(
+                    self, "确认失败",
+                    f"输入「{text.strip()}」不一致，已取消删除"
+                )
+                return
+
+        # 串行调用 service.delete_report（GUI 线程同步跑——批量删数量
+        # 一般 10~50 行，每行 < 100ms，用户能等；若主人后续反馈卡顿
+        # 再改异步 worker）
+        from services.scoring.scoring_service import delete_report
+        ok_count = 0
+        fail_count = 0
+        fail_msgs: list[str] = []
+        self._set_buttons_busy(True)
+        try:
+            for d in target_rows:
+                rid = int(d.get("report_id") or 0)
+                is_bt = int(d.get("is_backtest") or 0)
+                try:
+                    res = delete_report(
+                        report_id=rid,
+                        allow_real=(is_bt == 0),  # 真实需开 allow_real
+                        delete_md=True,
+                        dry_run=False,
+                    )
+                    if res.get("ok"):
+                        ok_count += 1
+                    else:
+                        fail_count += 1
+                        fail_msgs.append(
+                            f"id={rid}: {res.get('error') or '失败'}"
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    fail_count += 1
+                    fail_msgs.append(f"id={rid}: {exc}")
+        finally:
+            self._set_buttons_busy(False)
+
+        if fail_count == 0:
+            self.status_label.setText(
+                f"<span style='color:#0a0'>✅ 批量删除完成 "
+                f"{ok_count} 份</span>"
+            )
+        else:
+            self.status_label.setText(
+                f"<span style='color:#c80'>⚠ 批量删除 "
+                f"成功 {ok_count} / 失败 {fail_count}</span>"
+            )
+            QMessageBox.warning(
+                self, "部分失败",
+                "以下报告删除失败：\n\n" + "\n".join(fail_msgs[:20])
+                + (f"\n\n... 还有 {len(fail_msgs) - 20} 行" if len(fail_msgs) > 20 else "")
+            )
+        self.refresh()
+
+    def _on_extract_task_finished(self, tid: int) -> None:
+        """题材抽取队列任意任务终态触发：根据 report_path 反查 ai_reports.id
+        从 ``_enqueued_report_ids`` 清出 + 刷新下表。
+
+        注意：``task.result["report_id"]`` 是 .md 文件 basename（字符串
+        hash），不是 ai_reports.id（整型主键）；评估页的 enqueued 集合
+        用的是后者，所以走 ``file_path`` 反查 ``_report_rows`` 的方式。
+        """
+        if self._tem is None:
+            return
+        task = self._tem.get(tid)
+        if task is None:
+            return
+        # 不论 SUCCESS / FAILED，都先从 enqueued 集合清出该 rid——
+        # 失败时主人需要看到「🎯 提取题材」按钮以便重试；成功时虽然
+        # themes_count 已 > 0 不会走入队按钮分支，但清掉避免内存泄漏
+        import os as _os
+        if task.report_path:
+            target = _os.path.abspath(task.report_path)
+            for r in self._report_rows:
+                rfp = r.get("file_path") or ""
+                if rfp and _os.path.abspath(rfp) == target:
+                    self._enqueued_report_ids.discard(
+                        int(r.get("report_id") or 0)
+                    )
+                    break
+        # 不论成败都 reload，让行状态（themes_count / 按钮文字）刷新到位
+        self._reload_report_table()
+
     def _set_buttons_busy(self, busy: bool):
         self.rescore_btn.setEnabled(not busy)
         self.batch_score_btn.setEnabled(not busy)
+        self.batch_extract_btn.setEnabled(not busy)
+        self.batch_delete_btn.setEnabled(not busy)
         self.refresh_btn.setEnabled(not busy)
         self.range_combo.setEnabled(not busy)
         self.backtest_combo.setEnabled(not busy)

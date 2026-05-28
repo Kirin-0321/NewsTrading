@@ -24,6 +24,7 @@ from gui.pages.news_cleaning_page import NewsCleaningPage
 from gui.pages.prompt_manager_page import PromptManagerPage
 from gui.pages.market_summary_page import MarketSummaryPage
 from core.scheduler_service import SchedulerService
+from gui.workers.theme_extract_manager import ThemeExtractTaskManager
 
 
 class MainWindow(QMainWindow):
@@ -98,6 +99,17 @@ class MainWindow(QMainWindow):
 
         for page in self.pages.values():
             self.content_stack.addWidget(page)
+
+        # 题材抽取任务队列管理器（评估页 + 预测题材页跨页共享单例）。
+        # 必须 pages 创建完之后再注入：page.__init__ 时 self.window() 还
+        # 拿不到 mainwindow，所以走显式 setter 注入而不是懒读。
+        self.theme_extract_manager = ThemeExtractTaskManager(self)
+        for pid in ('theme_prediction', 'prompt_eval'):
+            page = self.pages.get(pid)
+            if page is not None and hasattr(
+                page, 'set_theme_extract_manager'
+            ):
+                page.set_theme_extract_manager(self.theme_extract_manager)
 
         # 连接"提示词管理"页面信号 -> 让依赖方刷新模板下拉
         prompt_mgr = self.pages.get('prompt_manager')
@@ -254,4 +266,10 @@ class MainWindow(QMainWindow):
         # 停止定时任务服务
         if hasattr(self, 'scheduler_service'):
             self.scheduler_service.stop()
+        # 取消所有 PENDING 题材抽取任务（RUNNING 不强杀，让它自然结束）
+        if hasattr(self, 'theme_extract_manager'):
+            try:
+                self.theme_extract_manager.shutdown()
+            except Exception as e:
+                print(f"[MainWindow] theme_extract_manager.shutdown 失败: {e}")
         event.accept()
