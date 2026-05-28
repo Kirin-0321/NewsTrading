@@ -247,12 +247,17 @@ def _print_theme_detail(theme_id: int, rows: List[dict]) -> None:
     print(
         f"  {'score_date':10s} {'D+N':>3s} "
         f"{'sector':>7s} {'std_avg':>7s} {'std_w':>7s} "
-        f"{'hit':>4s} {'bench':>7s} {'alpha':>7s} {'dir':>4s}"
+        f"{'hit':>4s} {'bench':>7s} {'α+N':>7s} {'dir':>4s}"
     )
     print("  " + "-" * 74)
     for r in rows:
         dir_c = r.get("direction_correct")
         dir_s = "-" if dir_c is None else ("✓" if dir_c else "✗")
+        # 2026-05-28 22:30 α 体系金字塔重构：单日 alpha 字段已 DROP，
+        # 这里改为现推 α+N = theme_pct - benchmark_zz1000_pct（与 GUI 一致）
+        tp = r.get("theme_pct")
+        zz = r.get("benchmark_zz1000_pct")
+        a_n = (tp - zz) if (tp is not None and zz is not None) else None
         print(
             f"  {r['score_date']} {r['days_offset']:>3d} "
             f"{_fmt_pct(r.get('sector_pct'))} "
@@ -260,7 +265,7 @@ def _print_theme_detail(theme_id: int, rows: List[dict]) -> None:
             f"{_fmt_pct(r.get('stock_weighted_pct'))} "
             f"{(r.get('hit_count') or 0):2d}/{(r.get('total_count') or 0):2d} "
             f"{_fmt_pct(r.get('benchmark_pct'))} "
-            f"{_fmt_pct(r.get('alpha'))} "
+            f"{_fmt_pct(a_n)} "
             f"{dir_s:>4s}"
         )
 

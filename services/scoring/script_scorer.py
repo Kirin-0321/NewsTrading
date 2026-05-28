@@ -7,7 +7,7 @@
 * ``theme_prediction_scores`` ：单题材单日 1 行（6 个核心指标 + AI 复审栏）
 * ``theme_stock_scores``      ：单标的单日 1 行（明细，给题材详情 Tab 用）
 
-8 个核心指标（2026-05-28 18:40 中证1000 基准列加入后）
+7 个核心指标（2026-05-28 22:30 α 体系金字塔重构后）
 -------------------------------------------
 | 字段 | 含义 |
 |------|------|
@@ -16,16 +16,24 @@
 | ``stock_weighted_pct`` | 一期等权 = 算术平均；二期可按强度加权 |
 | ``theme_pct`` | **题材综合涨幅**（报告级评分用）= 0.6·sector_pct + 0.4·stock_avg_pct；标的 NULL 时退回 sector_pct |
 | ``hit_rate`` | 涨幅 ≥ ``hit_threshold_pct`` 的标的占比 |
-| ``benchmark_pct`` | 大盘基准涨跌幅（默认上证综指 ``000001.SH``） |
-| ``benchmark_zz1000_pct`` | 中证1000（``000852.SH``）当日涨跌幅；α-1 指标的基准（2026-05-28 18:40 加入） |
-| ``alpha`` | ``theme_pct - benchmark_pct``（2026-05-28 17:15 起从 stock_weighted_pct 切换到 theme_pct） |
+| ``benchmark_pct`` | 大盘基准涨跌幅（默认上证综指 ``000001.SH``，仅留作历史兜底；2026-05-28 22:30 起聚合层不再引用） |
+| ``benchmark_zz1000_pct`` | 中证1000（``000852.SH``）当日涨跌幅；α / α-1 / α+N 体系唯一基准 |
 | ``direction_correct`` | 强度方向与板块涨跌方向同号则 1，反向 0，无法判定 NULL |
 
-衍生指标（**不存表**，由聚合层 SQL 推出）
+衍生指标（**不存表**，2026-05-28 22:30 起全部 SQL 现推 + 中证1000 基准 + 报告→模板两步聚合）
 -------------------------------------------
 | 字段 | 公式 | 出现位置 |
 |------|------|---------|
-| ``alpha_avg_excl_d1`` | 题材内 D+2~D+5 的 ``theme_pct - benchmark_zz1000_pct`` 算术平均 | ``scoring_service.get_prompt_eval / get_report_eval / get_themes_for_report`` |
+| 报告级 ``a_n_avg``（N=1..5） | 报告内按 ``|strength|`` 加权（仅 strength>0）``(theme_pct − benchmark_zz1000_pct)`` 逐日 | ``scoring_service.get_report_eval`` |
+| 报告级 ``alpha_avg`` / ``alpha_avg_excl_d1`` | 5/4 天 ``a_n_avg`` 简单均值（忽略 NULL） | 同上 |
+| 模板级 ``a_n_avg`` / ``alpha_avg`` / ``alpha_avg_excl_d1`` | 跨报告对 ``per_report`` 各字段简单均值（每份报告等权） | ``scoring_service.get_template_eval`` |
+| 题材级 ``a_n`` / ``alpha_avg`` / ``alpha_avg_excl_d1`` | 独立体系（与界面 D+N 同基础）：``sector_pct − benchmark_zz1000_pct`` 逐日 + 5/4 天均值 | ``scoring_service.get_theme_eval_for_report`` |
+| 标的级 ``a_n_pct`` | ``pct_chg − benchmark_zz1000_pct``（按 score_date join tps 取 zz1000） | ``scoring_service.get_stock_scores_for_theme`` |
+
+历史字段 ``alpha``（已废）
+-------------------------
+2026-05-28 22:30 迁移 004 ``DROP COLUMN alpha``。原语义 = ``theme_pct − benchmark_pct(上证综指)``，
+被金字塔体系全面替换；不再回写、不再读取、不再落库。
 
 防穿越约束
 ----------
@@ -111,9 +119,8 @@ class ThemeDailyScore:
     hit_rate: float
 
     benchmark_pct: Optional[float]
-    #: 中证1000 当日涨跌幅（α-1 指标的基准；2026-05-28 18:40 加入）
+    #: 中证1000 当日涨跌幅；2026-05-28 22:30 起为 α 体系唯一基准
     benchmark_zz1000_pct: Optional[float]
-    alpha: Optional[float]
     direction_correct: Optional[int]
 
     #: 每只标的明细 (theme_stock_id, normalized_code, pct_chg, is_hit)
@@ -228,11 +235,6 @@ def score_theme_on_date(
 
         theme_pct = _compute_theme_pct(sector_pct, stock_avg_pct)
 
-        if theme_pct is not None and benchmark_pct is not None:
-            alpha: Optional[float] = theme_pct - benchmark_pct
-        else:
-            alpha = None
-
         direction_correct = _compute_direction(
             theme["strength_score"], sector_pct,
         )
@@ -273,7 +275,6 @@ def score_theme_on_date(
             hit_rate=hit_rate,
             benchmark_pct=benchmark_pct,
             benchmark_zz1000_pct=benchmark_zz1000_pct,
-            alpha=alpha,
             direction_correct=direction_correct,
             stock_rows=stock_score_rows,
         )
@@ -455,9 +456,9 @@ INSERT INTO theme_prediction_scores
      days_offset, sector_pct, stock_avg_pct, stock_weighted_pct,
      theme_pct,
      hit_count, total_count, hit_rate,
-     benchmark_pct, benchmark_zz1000_pct, alpha, direction_correct,
+     benchmark_pct, benchmark_zz1000_pct, direction_correct,
      created_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(theme_id, score_date) DO UPDATE SET
     days_offset = excluded.days_offset,
     sector_pct = excluded.sector_pct,
@@ -469,7 +470,6 @@ ON CONFLICT(theme_id, score_date) DO UPDATE SET
     hit_rate = excluded.hit_rate,
     benchmark_pct = excluded.benchmark_pct,
     benchmark_zz1000_pct = excluded.benchmark_zz1000_pct,
-    alpha = excluded.alpha,
     direction_correct = excluded.direction_correct,
     created_at = excluded.created_at
 """.strip()
@@ -503,7 +503,7 @@ def _write_scores(
             result.theme_pct,
             result.hit_count, result.total_count, result.hit_rate,
             result.benchmark_pct, result.benchmark_zz1000_pct,
-            result.alpha, result.direction_correct,
+            result.direction_correct,
             now,
         ),
     )

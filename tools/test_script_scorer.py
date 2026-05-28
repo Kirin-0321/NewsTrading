@@ -16,7 +16,7 @@
     theme_stock_scores 子表对应行自动清
 11. ``_compute_theme_pct`` 三分支精确（2026-05-28 17:15 加权改造）
 12. theme_pct 持久化与内存值一致（2026-05-28 17:15）
-13. alpha 切换至 theme_pct 口径（2026-05-28 17:15）
+13. theme_pct 加权口径稳定（2026-05-28 22:30 α 体系金字塔重构后单日 alpha 已 DROP）
 14. benchmark_zz1000_pct 写入正确（2026-05-28 18:40 α-1 指标）
 15. 中证1000 当日缺数据时 benchmark_zz1000_pct=None 不 crash
 16. backfill_benchmark_zz1000 干跑/真跑 行为正确
@@ -266,15 +266,12 @@ def case_02_single_theme_d1() -> None:
     assert res.benchmark_pct == 0.5
     # 2026-05-28 17:15 加权改造：
     #   theme_pct = 0.6 * 1.85 + 0.4 * (4/3) = 1.11 + 0.53333... = 1.64333...
-    #   alpha     = theme_pct - benchmark_pct = 1.64333... - 0.5
+    # 2026-05-28 22:30 α 体系金字塔重构：单日 alpha 字段已 DROP，
+    # α / α-1 / α+N 全部由聚合层 SQL 现推（theme_pct - zz1000）。
     expected_theme_pct = 0.6 * 1.85 + 0.4 * (4.0 / 3)
     assert res.theme_pct is not None
     assert abs(res.theme_pct - expected_theme_pct) < 1e-6, (
         f"theme_pct 错: 期望 {expected_theme_pct}, 得到 {res.theme_pct}"
-    )
-    assert res.alpha is not None
-    assert abs(res.alpha - (expected_theme_pct - 0.5)) < 1e-6, (
-        f"alpha 错: 期望 {expected_theme_pct - 0.5}, 得到 {res.alpha}"
     )
     assert res.direction_correct == 1  # +80 强度 + 板块涨 = 同向
 
@@ -350,8 +347,8 @@ def case_05_cross_holiday_offset() -> None:
 def case_06_empty_stocks_no_crash() -> None:
     """theme_stocks 为空 → stock_avg_pct=None, hit_rate=0 但不 crash。
 
-    2026-05-28 17:15 加权改造：标的全空时 theme_pct 退回 sector_pct（系数 1.0），
-    alpha 改用 theme_pct - benchmark；sector_pct 不为 None 时 alpha 也有值。
+    2026-05-28 17:15 加权改造：标的全空时 theme_pct 退回 sector_pct（系数 1.0）。
+    2026-05-28 22:30 α 体系金字塔重构：单日 alpha 字段已 DROP，dataclass 不再有 alpha。
     """
     from services.scoring.script_scorer import score_theme_on_date
     _make_theme(999807, report_date="99990430", stock_codes=[])
@@ -361,15 +358,9 @@ def case_06_empty_stocks_no_crash() -> None:
     assert res.stock_weighted_pct is None
     assert res.total_count == 0
     assert res.hit_rate == 0.0
-    # sector_pct 仍能查到（题材关联了 TEST_BK.DC）
     assert res.sector_pct == 1.85
-    # 新口径：theme_pct 退回 sector_pct
     assert res.theme_pct is not None and abs(res.theme_pct - 1.85) < 1e-9, (
         f"无标的兜底应 theme_pct=sector_pct=1.85，得到 {res.theme_pct}"
-    )
-    # alpha = theme_pct - benchmark = 1.85 - 0.5
-    assert res.alpha is not None and abs(res.alpha - 1.35) < 1e-9, (
-        f"无标的 alpha 应 = sector - benchmark = 1.35，得到 {res.alpha}"
     )
 
 
@@ -393,12 +384,10 @@ def case_07_null_sector() -> None:
     assert res.direction_correct is None, (
         f"sector_pct=None 应得 direction=None，得到 {res.direction_correct}"
     )
-    # 2026-05-28 17:15 加权改造：sector_pct=None 时 theme_pct=None，alpha=None
+    # 2026-05-28 17:15 加权改造：sector_pct=None 时 theme_pct=None
+    # 2026-05-28 22:30 α 体系金字塔重构：单日 alpha 字段已删除
     assert res.theme_pct is None, (
         f"sector_pct=None 应得 theme_pct=None，得到 {res.theme_pct}"
-    )
-    assert res.alpha is None, (
-        f"theme_pct=None 应得 alpha=None，得到 {res.alpha}"
     )
 
 
@@ -526,9 +515,10 @@ def case_12_score_writes_theme_pct_column() -> None:
     )
     res = score_theme_on_date(999812, "99990506",
                               benchmark_ts_code="TEST_BENCH.SH")
+    # 2026-05-28 22:30 α 体系金字塔重构：alpha 列已 DROP，仅校验 theme_pct
     with get_ai_inference_db().connect(readonly=True) as conn:
         row = conn.execute(
-            "SELECT theme_pct, alpha "
+            "SELECT theme_pct "
             "FROM theme_prediction_scores WHERE theme_id = ?",
             (999812,),
         ).fetchone()
@@ -537,17 +527,15 @@ def case_12_score_writes_theme_pct_column() -> None:
     assert abs(row["theme_pct"] - res.theme_pct) < 1e-9, (
         f"DB 中 theme_pct={row['theme_pct']} 与内存 {res.theme_pct} 不一致"
     )
-    assert abs(row["alpha"] - res.alpha) < 1e-9
 
 
-def case_13_alpha_uses_theme_pct() -> None:
-    """alpha 应等于 ``theme_pct - benchmark_pct``（不再走 stock_weighted_pct）。
+def case_13_theme_pct_weighted() -> None:
+    """theme_pct 应等于 ``0.6·sector_pct + 0.4·stock_avg_pct``。
 
-    用 case_02 已经验证过的具体数值再校一遍口径切换：
-        sector_pct=1.85, stock_avg=4/3, benchmark=0.5
+    （原 case_13 校验 alpha = theme_pct - benchmark；2026-05-28 22:30 α 字段
+    DROP 后，单日 alpha 已不存在，本用例改为校验 theme_pct 加权口径仍正确。）
+        sector_pct=1.85, stock_avg=4/3
         theme_pct = 0.6·1.85 + 0.4·(4/3) = 1.6433...
-        旧口径 alpha = stock_weighted - bench = 4/3 - 0.5 = 0.8333...
-        新口径 alpha = theme_pct - bench = 1.6433... - 0.5 = 1.1433...
     """
     from services.scoring.script_scorer import score_theme_on_date
     _make_theme(999813, report_date="99990430",
@@ -556,16 +544,13 @@ def case_13_alpha_uses_theme_pct() -> None:
     res = score_theme_on_date(999813, "99990506",
                               benchmark_ts_code="TEST_BENCH.SH")
     expected_theme_pct = 0.6 * 1.85 + 0.4 * (4.0 / 3)
-    expected_alpha = expected_theme_pct - 0.5
-    old_alpha = (4.0 / 3) - 0.5
-    assert res.alpha is not None
-    assert abs(res.alpha - expected_alpha) < 1e-6, (
-        f"新 alpha 期望 {expected_alpha}，得到 {res.alpha}"
+    assert res.theme_pct is not None
+    assert abs(res.theme_pct - expected_theme_pct) < 1e-6, (
+        f"theme_pct 期望 {expected_theme_pct}，得到 {res.theme_pct}"
     )
-    # 防误回归：alpha 不应再等于旧口径值
-    assert abs(res.alpha - old_alpha) > 1e-3, (
-        f"alpha 仍等于旧 stock_weighted-bench 口径 {old_alpha}，未切换成功"
-    )
+    # 防误回归：theme_pct 不应再等于纯 stock_avg 或纯 sector
+    assert abs(res.theme_pct - (4.0 / 3)) > 1e-3, "theme_pct 不应等于 stock_avg"
+    assert abs(res.theme_pct - 1.85) > 1e-3, "theme_pct 不应等于 sector_pct"
 
 
 # ---------------------------------------------------------------------------
@@ -608,7 +593,7 @@ def case_15_benchmark_zz1000_missing_is_none() -> None:
     """中证1000 当日无数据时 ``benchmark_zz1000_pct`` 应为 None 不 crash。
 
     99990507 故意没造 000852.SH 行情，benchmark_zz1000_pct 应兜底 None。
-    上证综指替身 TEST_BENCH.SH 99990507 是有数据的，benchmark_pct/alpha 不受影响。
+    上证综指替身 TEST_BENCH.SH 99990507 是有数据的，benchmark_pct 不受影响。
     """
     from services.scoring.script_scorer import score_theme_on_date
     _make_theme(999815, report_date="99990430",
@@ -618,9 +603,9 @@ def case_15_benchmark_zz1000_missing_is_none() -> None:
     assert res.benchmark_zz1000_pct is None, (
         f"中证1000 99990507 无数据应得 None，得到 {res.benchmark_zz1000_pct}"
     )
-    # 但 alpha (基于 TEST_BENCH.SH) 仍应有值
-    assert res.benchmark_pct is not None and res.alpha is not None, (
-        "上证综指替身有数据，alpha 不应受 zz1000 缺数据影响"
+    # 上证综指替身有数据，benchmark_pct 不受 zz1000 缺数据影响
+    assert res.benchmark_pct is not None, (
+        "上证综指替身有数据，benchmark_pct 不应受 zz1000 缺数据影响"
     )
 
 
@@ -701,7 +686,7 @@ _CASES: List[Tuple[str, Callable[[], None]]] = [
     # 2026-05-28 17:15 加权改造
     ("11_compute_theme_pct_pure", case_11_compute_theme_pct_pure),
     ("12_score_writes_theme_pct_column", case_12_score_writes_theme_pct_column),
-    ("13_alpha_uses_theme_pct", case_13_alpha_uses_theme_pct),
+    ("13_theme_pct_weighted", case_13_theme_pct_weighted),
     # 2026-05-28 18:40 α-1 / 中证1000 基准列
     ("14_benchmark_zz1000_written", case_14_benchmark_zz1000_written),
     ("15_benchmark_zz1000_missing_is_none",

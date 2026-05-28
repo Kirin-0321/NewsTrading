@@ -1,21 +1,43 @@
 """打分服务入口（Phase 2 Step 2.2 + 2026-05-27 评估页改造 + 2026-05-28 树形展开扩展
-+ 2026-05-28 11:30 板块行情接入 + 加权平均改造 + 2026-05-28 17:15 报告级题材综合涨幅切换）。
++ 2026-05-28 11:30 板块行情接入 + 加权平均改造 + 2026-05-28 17:15 报告级题材综合涨幅切换
++ 2026-05-28 22:30 α 体系金字塔重构）。
 
 把 :mod:`services.scoring.script_scorer` 单题材单日的算法包装成 7 个对外
 API，给 CLI / scheduled_runner / GUI 复用：
 
-D+N 列口径（2026-05-28 17:15 报告级切换 theme_pct 后）
+D+N 列口径
 ------------------------------------------------------
 * **标的级**（第 3 层 ``get_stock_scores_for_theme``）：``theme_stock_scores.pct_chg``
-  即个股当日涨跌幅（不变）
-* **题材级**（第 2 层 ``get_theme_eval_for_report``）：``sector_pct`` 即题材
-  绑定板块的当日涨跌幅（不变，保持 v2 口径）
-* **报告级**（``get_report_eval``）：``theme_pct`` 即「板块 0.6 + 标的均值 0.4」
-  的综合涨幅（无标的兜底 1.0×板块），按 ``|strength_score|`` 加权，
-  仅 strength > 0 的看多题材参与；全部 strength≤0 时 D+N=NULL（NULLIF 兜底）。
-  **从 17:15 起 d1_avg ~ d5_avg 不再读 sector_pct，改读 theme_pct。**
-* **模板级**（``get_template_eval``）：``sector_pct`` 加权（不变，保持 v2 口径，
-  与报告级故意差异化以保留板块视角）
+  即个股当日涨跌幅
+* **题材级**（第 2 层 ``get_theme_eval_for_report``）：``sector_pct`` 题材绑定板块当日涨跌幅
+* **报告级**（``get_report_eval``）：``theme_pct``（= 0.6·sector + 0.4·标的均值，无标的
+  兜底 1.0·sector），按 ``|strength_score|`` 加权，仅 strength > 0 题材参与
+* **模板级**（``get_template_eval``）：题材→报告 ``|strength|`` 加权 ``sector_pct``
+  → 报告→模板**简单 AVG over reports**（2026-05-28 22:30 改，每份报告等权）
+
+α / α-1 / α+N 金字塔（2026-05-28 22:30 重构，统一中证1000 基准）
+------------------------------------------------------
+::
+
+    报告级（per_report 加权聚合，仅 strength > 0）
+        ├── 报告 α+N = SUM(|str|·(theme_pct − zz1000)) / SUM(|str|)
+        ├── 报告 α   = AVG(报告 α+1..+5)，忽略 NULL
+        └── 报告 α-1 = AVG(报告 α+2..+5)，忽略 NULL
+
+    模板级（per_template 简单 AVG over reports）
+        ├── 模板 α+N = AVG over reports of (报告 α+N)
+        ├── 模板 α   = AVG(模板 α+1..+5)，忽略 NULL
+        └── 模板 α-1 = AVG(模板 α+2..+5)，忽略 NULL
+
+    题材级（独立体系，与该层 D+N 同基础 sector_pct）
+        ├── α+N = sector_pct − zz1000（逐日）
+        ├── α   = AVG over 5 days of α+N
+        └── α-1 = AVG over D+2..D+5 of α+N
+
+    标的级
+        └── α+N = pct_chg − zz1000（join tps 取同 score_date 的 zz1000）
+
+* 单日 ``tps.alpha`` 字段已废（迁移 004 ``DROP COLUMN``），不再读不再写
 
 | API | 用途 |
 |------|------|
@@ -363,9 +385,9 @@ def get_template_eval(
                 "scored_themes": 0,              # 至少有一行 scores 的题材数
                 "sample_count": 14,              # 兼容老字段 = themes_total
                 "d1_avg": None, ..., "d5_avg": None,
-                "a1_avg": None, ..., "a5_avg": None,  # α+N：D+N - 中证1000 加权（同 D+N 口径）
-                "alpha_avg": None,
-                "alpha_avg_excl_d1": None,        # α-1：D+2~D+5 (theme_pct - 中证1000) 均值
+                "a1_avg": None, ..., "a5_avg": None,   # 模板 α+N = AVG over reports of (报告 α+N)
+                "alpha_avg": None,                     # 模板 α = AVG(模板 α+1..+5)（忽略 NULL）
+                "alpha_avg_excl_d1": None,             # 模板 α-1 = AVG(模板 α+2..+5)（忽略 NULL）
                 "hit_rate_avg": None,
                 "direction_correct_rate": None,
                 "last_report_date": "20260522",  # YYYYMMDD 8 字符（schema 协议）
@@ -404,48 +426,56 @@ def get_template_eval(
         )
         time_params = [cutoff_compact]
 
-    # CTE：每个 theme 的 D+N 拍平 + 标记是否打分过
-    # 2026-05-28 v2 改造：
-    #   * 题材级 D+N 用 sector_pct（板块涨跌幅）替换 stock_weighted_pct（标的均值）
-    #   * 报告级聚合用 |strength_score| 加权，仅 strength > 0 的题材参与
-    # 2026-05-28 22:00 加入 α+N 列（逐日 D+N - 中证1000）：
-    #   * 题材级 a_n = sector_pct - benchmark_zz1000_pct（与该层 D+N 同基础）
-    #   * 模板级 a_n_avg 用 |strength_score| 加权（与 d_n_avg 同口径）
+    # 2026-05-28 22:30 α 体系金字塔重构（题材→报告→模板 严格两步聚合）：
+    #   * 模板级 D+N 用 sector_pct 加权（v2 视角，与报告级故意差异化）
+    #     —— 题材→报告 |strength| 加权 → 报告→模板 简单 AVG over reports
+    #   * 模板级 α+N 用 theme_pct-zz1000 加权
+    #     —— 题材→报告 |strength| 加权 → 报告→模板 简单 AVG over reports
+    #   * 模板级 α   = AVG over 5 days of (模板 α+N)，忽略 NULL
+    #   * 模板级 α-1 = AVG over D+2..D+5 of (模板 α+N)，忽略 NULL
+    #   * 不再读 tps.alpha 单日字段（已 DROP COLUMN，迁移 004）
+    # 4 层 CTE 结构：
+    #   per_theme: 题材内透视 sector_pct（D 视角）+ theme_pct-zz1000（α 视角）
+    #   per_report: 题材→报告 |strength| 加权（仅 strength>0）
+    #   tpl_basics: 题材级聚合（themes_total / scored_themes / last_report_date / hit_rate / direction）
+    #   tpl_aggs:   报告级聚合（D+N / α+N 简单 AVG over reports）
+    #   外层 LEFT JOIN basics + aggs，再派生 alpha_avg / alpha_avg_excl_d1
+    join_keys = (
+        "prompt_id" if ignore_version else "prompt_id, prompt_version"
+    )
+    pv_select = (
+        "NULL AS prompt_version" if ignore_version else "prompt_version"
+    )
     sql = f"""
     WITH per_theme AS (
         SELECT
             tp.id AS theme_id,
+            tp.report_path,
             tp.prompt_id,
             tp.prompt_version,
             tp.strength_score,
             tp.report_date AS theme_report_date,
             CASE WHEN COUNT(tps.id) > 0 THEN 1 ELSE 0 END AS is_scored,
             MAX(CASE WHEN tps.days_offset=1
-                     THEN tps.sector_pct END) AS d1,
+                     THEN tps.sector_pct END) AS sd1,
             MAX(CASE WHEN tps.days_offset=2
-                     THEN tps.sector_pct END) AS d2,
+                     THEN tps.sector_pct END) AS sd2,
             MAX(CASE WHEN tps.days_offset=3
-                     THEN tps.sector_pct END) AS d3,
+                     THEN tps.sector_pct END) AS sd3,
             MAX(CASE WHEN tps.days_offset=4
-                     THEN tps.sector_pct END) AS d4,
+                     THEN tps.sector_pct END) AS sd4,
             MAX(CASE WHEN tps.days_offset=5
-                     THEN tps.sector_pct END) AS d5,
+                     THEN tps.sector_pct END) AS sd5,
             MAX(CASE WHEN tps.days_offset=1
-                     THEN tps.sector_pct - tps.benchmark_zz1000_pct END) AS a1,
+                     THEN tps.theme_pct - tps.benchmark_zz1000_pct END) AS ta1,
             MAX(CASE WHEN tps.days_offset=2
-                     THEN tps.sector_pct - tps.benchmark_zz1000_pct END) AS a2,
+                     THEN tps.theme_pct - tps.benchmark_zz1000_pct END) AS ta2,
             MAX(CASE WHEN tps.days_offset=3
-                     THEN tps.sector_pct - tps.benchmark_zz1000_pct END) AS a3,
+                     THEN tps.theme_pct - tps.benchmark_zz1000_pct END) AS ta3,
             MAX(CASE WHEN tps.days_offset=4
-                     THEN tps.sector_pct - tps.benchmark_zz1000_pct END) AS a4,
+                     THEN tps.theme_pct - tps.benchmark_zz1000_pct END) AS ta4,
             MAX(CASE WHEN tps.days_offset=5
-                     THEN tps.sector_pct - tps.benchmark_zz1000_pct END) AS a5,
-            AVG(tps.alpha) AS alpha_avg,
-            -- α-1 题材级口径：D+2~D+5 各算 (theme_pct - 中证1000 pct)，再 4 天均值
-            -- AVG 自动忽略 NULL（D+1 行 / 缺数据行整体 NULL）
-            AVG(CASE WHEN tps.days_offset BETWEEN 2 AND 5
-                     THEN tps.theme_pct - tps.benchmark_zz1000_pct END)
-                 AS alpha_excl_d1,
+                     THEN tps.theme_pct - tps.benchmark_zz1000_pct END) AS ta5,
             AVG(tps.hit_rate) AS hit_rate_avg,
             AVG(CASE WHEN tps.direction_correct IS NOT NULL
                      THEN CAST(tps.direction_correct AS REAL) END)
@@ -455,61 +485,110 @@ def get_template_eval(
                ON tps.theme_id = tp.id
         WHERE {time_where} {backtest_clause}
         GROUP BY tp.id, tp.prompt_id, tp.prompt_version,
-                 tp.strength_score, tp.report_date
+                 tp.strength_score, tp.report_date, tp.report_path
+    ),
+    per_report AS (
+        SELECT
+            report_path,
+            prompt_id,
+            prompt_version,
+            SUM(CASE WHEN strength_score > 0 AND sd1 IS NOT NULL
+                     THEN sd1 * ABS(strength_score) END)
+              / NULLIF(SUM(CASE WHEN strength_score > 0 AND sd1 IS NOT NULL
+                                THEN ABS(strength_score) END), 0) AS rd1,
+            SUM(CASE WHEN strength_score > 0 AND sd2 IS NOT NULL
+                     THEN sd2 * ABS(strength_score) END)
+              / NULLIF(SUM(CASE WHEN strength_score > 0 AND sd2 IS NOT NULL
+                                THEN ABS(strength_score) END), 0) AS rd2,
+            SUM(CASE WHEN strength_score > 0 AND sd3 IS NOT NULL
+                     THEN sd3 * ABS(strength_score) END)
+              / NULLIF(SUM(CASE WHEN strength_score > 0 AND sd3 IS NOT NULL
+                                THEN ABS(strength_score) END), 0) AS rd3,
+            SUM(CASE WHEN strength_score > 0 AND sd4 IS NOT NULL
+                     THEN sd4 * ABS(strength_score) END)
+              / NULLIF(SUM(CASE WHEN strength_score > 0 AND sd4 IS NOT NULL
+                                THEN ABS(strength_score) END), 0) AS rd4,
+            SUM(CASE WHEN strength_score > 0 AND sd5 IS NOT NULL
+                     THEN sd5 * ABS(strength_score) END)
+              / NULLIF(SUM(CASE WHEN strength_score > 0 AND sd5 IS NOT NULL
+                                THEN ABS(strength_score) END), 0) AS rd5,
+            SUM(CASE WHEN strength_score > 0 AND ta1 IS NOT NULL
+                     THEN ta1 * ABS(strength_score) END)
+              / NULLIF(SUM(CASE WHEN strength_score > 0 AND ta1 IS NOT NULL
+                                THEN ABS(strength_score) END), 0) AS ra1,
+            SUM(CASE WHEN strength_score > 0 AND ta2 IS NOT NULL
+                     THEN ta2 * ABS(strength_score) END)
+              / NULLIF(SUM(CASE WHEN strength_score > 0 AND ta2 IS NOT NULL
+                                THEN ABS(strength_score) END), 0) AS ra2,
+            SUM(CASE WHEN strength_score > 0 AND ta3 IS NOT NULL
+                     THEN ta3 * ABS(strength_score) END)
+              / NULLIF(SUM(CASE WHEN strength_score > 0 AND ta3 IS NOT NULL
+                                THEN ABS(strength_score) END), 0) AS ra3,
+            SUM(CASE WHEN strength_score > 0 AND ta4 IS NOT NULL
+                     THEN ta4 * ABS(strength_score) END)
+              / NULLIF(SUM(CASE WHEN strength_score > 0 AND ta4 IS NOT NULL
+                                THEN ABS(strength_score) END), 0) AS ra4,
+            SUM(CASE WHEN strength_score > 0 AND ta5 IS NOT NULL
+                     THEN ta5 * ABS(strength_score) END)
+              / NULLIF(SUM(CASE WHEN strength_score > 0 AND ta5 IS NOT NULL
+                                THEN ABS(strength_score) END), 0) AS ra5
+        FROM per_theme
+        GROUP BY report_path, prompt_id, prompt_version
+    ),
+    tpl_basics AS (
+        SELECT
+            prompt_id,
+            {pv_select},
+            COUNT(*) AS themes_total,
+            SUM(is_scored) AS scored_themes,
+            MAX(theme_report_date) AS last_report_date,
+            AVG(hit_rate_avg) AS hit_rate_avg,
+            AVG(dir_rate) AS direction_correct_rate
+        FROM per_theme
+        GROUP BY {join_keys}
+    ),
+    tpl_aggs AS (
+        SELECT
+            prompt_id,
+            {pv_select},
+            AVG(rd1) AS d1_avg, AVG(rd2) AS d2_avg, AVG(rd3) AS d3_avg,
+            AVG(rd4) AS d4_avg, AVG(rd5) AS d5_avg,
+            AVG(ra1) AS a1_avg, AVG(ra2) AS a2_avg, AVG(ra3) AS a3_avg,
+            AVG(ra4) AS a4_avg, AVG(ra5) AS a5_avg
+        FROM per_report
+        GROUP BY {join_keys}
     )
     SELECT
-        prompt_id,
-        {"NULL AS prompt_version" if ignore_version else "prompt_version"},
-        COUNT(*) AS themes_total,
-        SUM(is_scored) AS scored_themes,
-        SUM(CASE WHEN strength_score > 0 AND d1 IS NOT NULL
-                 THEN d1 * ABS(strength_score) END)
-          / NULLIF(SUM(CASE WHEN strength_score > 0 AND d1 IS NOT NULL
-                            THEN ABS(strength_score) END), 0) AS d1_avg,
-        SUM(CASE WHEN strength_score > 0 AND d2 IS NOT NULL
-                 THEN d2 * ABS(strength_score) END)
-          / NULLIF(SUM(CASE WHEN strength_score > 0 AND d2 IS NOT NULL
-                            THEN ABS(strength_score) END), 0) AS d2_avg,
-        SUM(CASE WHEN strength_score > 0 AND d3 IS NOT NULL
-                 THEN d3 * ABS(strength_score) END)
-          / NULLIF(SUM(CASE WHEN strength_score > 0 AND d3 IS NOT NULL
-                            THEN ABS(strength_score) END), 0) AS d3_avg,
-        SUM(CASE WHEN strength_score > 0 AND d4 IS NOT NULL
-                 THEN d4 * ABS(strength_score) END)
-          / NULLIF(SUM(CASE WHEN strength_score > 0 AND d4 IS NOT NULL
-                            THEN ABS(strength_score) END), 0) AS d4_avg,
-        SUM(CASE WHEN strength_score > 0 AND d5 IS NOT NULL
-                 THEN d5 * ABS(strength_score) END)
-          / NULLIF(SUM(CASE WHEN strength_score > 0 AND d5 IS NOT NULL
-                            THEN ABS(strength_score) END), 0) AS d5_avg,
-        SUM(CASE WHEN strength_score > 0 AND a1 IS NOT NULL
-                 THEN a1 * ABS(strength_score) END)
-          / NULLIF(SUM(CASE WHEN strength_score > 0 AND a1 IS NOT NULL
-                            THEN ABS(strength_score) END), 0) AS a1_avg,
-        SUM(CASE WHEN strength_score > 0 AND a2 IS NOT NULL
-                 THEN a2 * ABS(strength_score) END)
-          / NULLIF(SUM(CASE WHEN strength_score > 0 AND a2 IS NOT NULL
-                            THEN ABS(strength_score) END), 0) AS a2_avg,
-        SUM(CASE WHEN strength_score > 0 AND a3 IS NOT NULL
-                 THEN a3 * ABS(strength_score) END)
-          / NULLIF(SUM(CASE WHEN strength_score > 0 AND a3 IS NOT NULL
-                            THEN ABS(strength_score) END), 0) AS a3_avg,
-        SUM(CASE WHEN strength_score > 0 AND a4 IS NOT NULL
-                 THEN a4 * ABS(strength_score) END)
-          / NULLIF(SUM(CASE WHEN strength_score > 0 AND a4 IS NOT NULL
-                            THEN ABS(strength_score) END), 0) AS a4_avg,
-        SUM(CASE WHEN strength_score > 0 AND a5 IS NOT NULL
-                 THEN a5 * ABS(strength_score) END)
-          / NULLIF(SUM(CASE WHEN strength_score > 0 AND a5 IS NOT NULL
-                            THEN ABS(strength_score) END), 0) AS a5_avg,
-        AVG(alpha_avg) AS alpha_avg,
-        AVG(alpha_excl_d1) AS alpha_avg_excl_d1,
-        AVG(hit_rate_avg) AS hit_rate_avg,
-        AVG(dir_rate) AS direction_correct_rate,
-        MAX(theme_report_date) AS last_report_date
-    FROM per_theme
-    GROUP BY {group_cols.replace('tp.', '')}
-    ORDER BY themes_total DESC
+        b.prompt_id,
+        b.prompt_version,
+        b.themes_total,
+        b.scored_themes,
+        a.d1_avg, a.d2_avg, a.d3_avg, a.d4_avg, a.d5_avg,
+        a.a1_avg, a.a2_avg, a.a3_avg, a.a4_avg, a.a5_avg,
+        (COALESCE(a.a1_avg, 0) + COALESCE(a.a2_avg, 0)
+         + COALESCE(a.a3_avg, 0) + COALESCE(a.a4_avg, 0)
+         + COALESCE(a.a5_avg, 0))
+          / NULLIF(
+                (CASE WHEN a.a1_avg IS NOT NULL THEN 1 ELSE 0 END)
+              + (CASE WHEN a.a2_avg IS NOT NULL THEN 1 ELSE 0 END)
+              + (CASE WHEN a.a3_avg IS NOT NULL THEN 1 ELSE 0 END)
+              + (CASE WHEN a.a4_avg IS NOT NULL THEN 1 ELSE 0 END)
+              + (CASE WHEN a.a5_avg IS NOT NULL THEN 1 ELSE 0 END), 0)
+          AS alpha_avg,
+        (COALESCE(a.a2_avg, 0) + COALESCE(a.a3_avg, 0)
+         + COALESCE(a.a4_avg, 0) + COALESCE(a.a5_avg, 0))
+          / NULLIF(
+                (CASE WHEN a.a2_avg IS NOT NULL THEN 1 ELSE 0 END)
+              + (CASE WHEN a.a3_avg IS NOT NULL THEN 1 ELSE 0 END)
+              + (CASE WHEN a.a4_avg IS NOT NULL THEN 1 ELSE 0 END)
+              + (CASE WHEN a.a5_avg IS NOT NULL THEN 1 ELSE 0 END), 0)
+          AS alpha_avg_excl_d1,
+        b.hit_rate_avg,
+        b.direction_correct_rate,
+        b.last_report_date
+    FROM tpl_basics b
+    LEFT JOIN tpl_aggs a USING ({join_keys})
+    ORDER BY b.themes_total DESC
     """
 
     params: List = time_params + extra_params
@@ -570,9 +649,9 @@ def get_report_eval(
                 "expected_pairs": 70,            # = themes_count * 5
                 "score_status": "none",          # none / partial / full
                 "d1_avg": None, ..., "d5_avg": None,
-                "a1_avg": None, ..., "a5_avg": None,  # α+N：theme_pct - 中证1000 加权
-                "alpha_avg": None,
-                "alpha_avg_excl_d1": None,        # α-1：D+2~D+5 (theme_pct - 中证1000) 均值
+                "a1_avg": None, ..., "a5_avg": None,  # 报告 α+N = SUM(|str|·(theme_pct−zz1000))/SUM(|str|)
+                "alpha_avg": None,                    # 报告 α = AVG(报告 α+1..+5)（忽略 NULL）
+                "alpha_avg_excl_d1": None,            # 报告 α-1 = AVG(报告 α+2..+5)（忽略 NULL）
                 "hit_rate_avg": None,
                 "direction_correct_rate": None,
             }
@@ -620,11 +699,14 @@ def get_report_eval(
         )
         time_params = [cutoff_compact]
 
-    # 2026-05-28 v2 改造（11:30）+ 17:15 题材综合涨幅切换：
-    #   * 报告级 D+N 用 theme_pct（= 0.6·sector_pct + 0.4·stock_avg_pct，无标的兜底
-    #     = sector_pct）替换原 sector_pct，与题材级第 2 层故意差异化
-    #   * 报告级聚合用 |strength_score| 加权，仅 strength > 0 的题材参与
-    # 2026-05-28 22:00 加入 α+N 列（逐日 theme_pct - 中证1000，同加权口径）
+    # 2026-05-28 22:30 α 体系金字塔重构：
+    #   * 报告级 α+N = 报告内按 |strength| 加权（仅 strength>0）的
+    #     (theme_pct - benchmark_zz1000_pct) 逐日值
+    #   * 报告级 α   = AVG over 5 days of (报告 α+N)，忽略 NULL
+    #   * 报告级 α-1 = AVG over D+2..D+5 of (报告 α+N)，忽略 NULL
+    #   * 不再读 tps.alpha 单日字段（已 DROP COLUMN，迁移 004）
+    # 嵌套结构：per_theme（题材内透视） → per_report（题材→报告加权）
+    #         → 外层 SELECT 推导 alpha_avg / alpha_avg_excl_d1
     sql = f"""
     WITH per_theme AS (
         SELECT
@@ -642,20 +724,15 @@ def get_report_eval(
             MAX(CASE WHEN tps.days_offset=5
                      THEN tps.theme_pct END) AS d5,
             MAX(CASE WHEN tps.days_offset=1
-                     THEN tps.theme_pct - tps.benchmark_zz1000_pct END) AS a1,
+                     THEN tps.theme_pct - tps.benchmark_zz1000_pct END) AS ta1,
             MAX(CASE WHEN tps.days_offset=2
-                     THEN tps.theme_pct - tps.benchmark_zz1000_pct END) AS a2,
+                     THEN tps.theme_pct - tps.benchmark_zz1000_pct END) AS ta2,
             MAX(CASE WHEN tps.days_offset=3
-                     THEN tps.theme_pct - tps.benchmark_zz1000_pct END) AS a3,
+                     THEN tps.theme_pct - tps.benchmark_zz1000_pct END) AS ta3,
             MAX(CASE WHEN tps.days_offset=4
-                     THEN tps.theme_pct - tps.benchmark_zz1000_pct END) AS a4,
+                     THEN tps.theme_pct - tps.benchmark_zz1000_pct END) AS ta4,
             MAX(CASE WHEN tps.days_offset=5
-                     THEN tps.theme_pct - tps.benchmark_zz1000_pct END) AS a5,
-            AVG(tps.alpha) AS alpha_avg,
-            -- α-1 题材级口径（与 get_prompt_eval 同口径）
-            AVG(CASE WHEN tps.days_offset BETWEEN 2 AND 5
-                     THEN tps.theme_pct - tps.benchmark_zz1000_pct END)
-                 AS alpha_excl_d1,
+                     THEN tps.theme_pct - tps.benchmark_zz1000_pct END) AS ta5,
             AVG(tps.hit_rate) AS hit_rate_avg,
             AVG(CASE WHEN tps.direction_correct IS NOT NULL
                      THEN CAST(tps.direction_correct AS REAL) END)
@@ -665,97 +742,125 @@ def get_report_eval(
         LEFT JOIN theme_prediction_scores tps
                ON tps.theme_id = tp.id
         GROUP BY tp.id, tp.report_path, tp.strength_score
+    ),
+    per_report AS (
+        SELECT
+            ar.id AS report_id,
+            ar.report_date,
+            ar.file_path,
+            ar.prompt_id,
+            ar.prompt_version,
+            ar.is_backtest,
+            COALESCE(SUM(CASE WHEN per_theme.theme_id IS NOT NULL
+                              THEN 1 ELSE 0 END), 0) AS themes_count,
+            COALESCE(SUM(per_theme.scored_pairs_one), 0) AS scored_pairs,
+            SUM(CASE WHEN per_theme.strength_score > 0
+                      AND per_theme.d1 IS NOT NULL
+                     THEN per_theme.d1 * ABS(per_theme.strength_score) END)
+              / NULLIF(SUM(CASE WHEN per_theme.strength_score > 0
+                                  AND per_theme.d1 IS NOT NULL
+                                THEN ABS(per_theme.strength_score) END), 0)
+              AS d1_avg,
+            SUM(CASE WHEN per_theme.strength_score > 0
+                      AND per_theme.d2 IS NOT NULL
+                     THEN per_theme.d2 * ABS(per_theme.strength_score) END)
+              / NULLIF(SUM(CASE WHEN per_theme.strength_score > 0
+                                  AND per_theme.d2 IS NOT NULL
+                                THEN ABS(per_theme.strength_score) END), 0)
+              AS d2_avg,
+            SUM(CASE WHEN per_theme.strength_score > 0
+                      AND per_theme.d3 IS NOT NULL
+                     THEN per_theme.d3 * ABS(per_theme.strength_score) END)
+              / NULLIF(SUM(CASE WHEN per_theme.strength_score > 0
+                                  AND per_theme.d3 IS NOT NULL
+                                THEN ABS(per_theme.strength_score) END), 0)
+              AS d3_avg,
+            SUM(CASE WHEN per_theme.strength_score > 0
+                      AND per_theme.d4 IS NOT NULL
+                     THEN per_theme.d4 * ABS(per_theme.strength_score) END)
+              / NULLIF(SUM(CASE WHEN per_theme.strength_score > 0
+                                  AND per_theme.d4 IS NOT NULL
+                                THEN ABS(per_theme.strength_score) END), 0)
+              AS d4_avg,
+            SUM(CASE WHEN per_theme.strength_score > 0
+                      AND per_theme.d5 IS NOT NULL
+                     THEN per_theme.d5 * ABS(per_theme.strength_score) END)
+              / NULLIF(SUM(CASE WHEN per_theme.strength_score > 0
+                                  AND per_theme.d5 IS NOT NULL
+                                THEN ABS(per_theme.strength_score) END), 0)
+              AS d5_avg,
+            SUM(CASE WHEN per_theme.strength_score > 0
+                      AND per_theme.ta1 IS NOT NULL
+                     THEN per_theme.ta1 * ABS(per_theme.strength_score) END)
+              / NULLIF(SUM(CASE WHEN per_theme.strength_score > 0
+                                  AND per_theme.ta1 IS NOT NULL
+                                THEN ABS(per_theme.strength_score) END), 0)
+              AS a1_avg,
+            SUM(CASE WHEN per_theme.strength_score > 0
+                      AND per_theme.ta2 IS NOT NULL
+                     THEN per_theme.ta2 * ABS(per_theme.strength_score) END)
+              / NULLIF(SUM(CASE WHEN per_theme.strength_score > 0
+                                  AND per_theme.ta2 IS NOT NULL
+                                THEN ABS(per_theme.strength_score) END), 0)
+              AS a2_avg,
+            SUM(CASE WHEN per_theme.strength_score > 0
+                      AND per_theme.ta3 IS NOT NULL
+                     THEN per_theme.ta3 * ABS(per_theme.strength_score) END)
+              / NULLIF(SUM(CASE WHEN per_theme.strength_score > 0
+                                  AND per_theme.ta3 IS NOT NULL
+                                THEN ABS(per_theme.strength_score) END), 0)
+              AS a3_avg,
+            SUM(CASE WHEN per_theme.strength_score > 0
+                      AND per_theme.ta4 IS NOT NULL
+                     THEN per_theme.ta4 * ABS(per_theme.strength_score) END)
+              / NULLIF(SUM(CASE WHEN per_theme.strength_score > 0
+                                  AND per_theme.ta4 IS NOT NULL
+                                THEN ABS(per_theme.strength_score) END), 0)
+              AS a4_avg,
+            SUM(CASE WHEN per_theme.strength_score > 0
+                      AND per_theme.ta5 IS NOT NULL
+                     THEN per_theme.ta5 * ABS(per_theme.strength_score) END)
+              / NULLIF(SUM(CASE WHEN per_theme.strength_score > 0
+                                  AND per_theme.ta5 IS NOT NULL
+                                THEN ABS(per_theme.strength_score) END), 0)
+              AS a5_avg,
+            AVG(per_theme.hit_rate_avg) AS hit_rate_avg,
+            AVG(per_theme.dir_rate) AS direction_correct_rate
+        FROM ai_reports ar
+        LEFT JOIN per_theme
+               ON per_theme.report_path = ar.file_path
+        WHERE {time_where} {where_extra}
+        GROUP BY ar.id
     )
     SELECT
-        ar.id AS report_id,
-        ar.report_date,
-        ar.file_path,
-        ar.prompt_id,
-        ar.prompt_version,
-        ar.is_backtest,
-        COALESCE(SUM(CASE WHEN per_theme.theme_id IS NOT NULL
-                          THEN 1 ELSE 0 END), 0) AS themes_count,
-        COALESCE(SUM(per_theme.scored_pairs_one), 0) AS scored_pairs,
-        SUM(CASE WHEN per_theme.strength_score > 0
-                  AND per_theme.d1 IS NOT NULL
-                 THEN per_theme.d1 * ABS(per_theme.strength_score) END)
-          / NULLIF(SUM(CASE WHEN per_theme.strength_score > 0
-                              AND per_theme.d1 IS NOT NULL
-                            THEN ABS(per_theme.strength_score) END), 0)
-          AS d1_avg,
-        SUM(CASE WHEN per_theme.strength_score > 0
-                  AND per_theme.d2 IS NOT NULL
-                 THEN per_theme.d2 * ABS(per_theme.strength_score) END)
-          / NULLIF(SUM(CASE WHEN per_theme.strength_score > 0
-                              AND per_theme.d2 IS NOT NULL
-                            THEN ABS(per_theme.strength_score) END), 0)
-          AS d2_avg,
-        SUM(CASE WHEN per_theme.strength_score > 0
-                  AND per_theme.d3 IS NOT NULL
-                 THEN per_theme.d3 * ABS(per_theme.strength_score) END)
-          / NULLIF(SUM(CASE WHEN per_theme.strength_score > 0
-                              AND per_theme.d3 IS NOT NULL
-                            THEN ABS(per_theme.strength_score) END), 0)
-          AS d3_avg,
-        SUM(CASE WHEN per_theme.strength_score > 0
-                  AND per_theme.d4 IS NOT NULL
-                 THEN per_theme.d4 * ABS(per_theme.strength_score) END)
-          / NULLIF(SUM(CASE WHEN per_theme.strength_score > 0
-                              AND per_theme.d4 IS NOT NULL
-                            THEN ABS(per_theme.strength_score) END), 0)
-          AS d4_avg,
-        SUM(CASE WHEN per_theme.strength_score > 0
-                  AND per_theme.d5 IS NOT NULL
-                 THEN per_theme.d5 * ABS(per_theme.strength_score) END)
-          / NULLIF(SUM(CASE WHEN per_theme.strength_score > 0
-                              AND per_theme.d5 IS NOT NULL
-                            THEN ABS(per_theme.strength_score) END), 0)
-          AS d5_avg,
-        SUM(CASE WHEN per_theme.strength_score > 0
-                  AND per_theme.a1 IS NOT NULL
-                 THEN per_theme.a1 * ABS(per_theme.strength_score) END)
-          / NULLIF(SUM(CASE WHEN per_theme.strength_score > 0
-                              AND per_theme.a1 IS NOT NULL
-                            THEN ABS(per_theme.strength_score) END), 0)
-          AS a1_avg,
-        SUM(CASE WHEN per_theme.strength_score > 0
-                  AND per_theme.a2 IS NOT NULL
-                 THEN per_theme.a2 * ABS(per_theme.strength_score) END)
-          / NULLIF(SUM(CASE WHEN per_theme.strength_score > 0
-                              AND per_theme.a2 IS NOT NULL
-                            THEN ABS(per_theme.strength_score) END), 0)
-          AS a2_avg,
-        SUM(CASE WHEN per_theme.strength_score > 0
-                  AND per_theme.a3 IS NOT NULL
-                 THEN per_theme.a3 * ABS(per_theme.strength_score) END)
-          / NULLIF(SUM(CASE WHEN per_theme.strength_score > 0
-                              AND per_theme.a3 IS NOT NULL
-                            THEN ABS(per_theme.strength_score) END), 0)
-          AS a3_avg,
-        SUM(CASE WHEN per_theme.strength_score > 0
-                  AND per_theme.a4 IS NOT NULL
-                 THEN per_theme.a4 * ABS(per_theme.strength_score) END)
-          / NULLIF(SUM(CASE WHEN per_theme.strength_score > 0
-                              AND per_theme.a4 IS NOT NULL
-                            THEN ABS(per_theme.strength_score) END), 0)
-          AS a4_avg,
-        SUM(CASE WHEN per_theme.strength_score > 0
-                  AND per_theme.a5 IS NOT NULL
-                 THEN per_theme.a5 * ABS(per_theme.strength_score) END)
-          / NULLIF(SUM(CASE WHEN per_theme.strength_score > 0
-                              AND per_theme.a5 IS NOT NULL
-                            THEN ABS(per_theme.strength_score) END), 0)
-          AS a5_avg,
-        AVG(per_theme.alpha_avg) AS alpha_avg,
-        AVG(per_theme.alpha_excl_d1) AS alpha_avg_excl_d1,
-        AVG(per_theme.hit_rate_avg) AS hit_rate_avg,
-        AVG(per_theme.dir_rate) AS direction_correct_rate
-    FROM ai_reports ar
-    LEFT JOIN per_theme
-           ON per_theme.report_path = ar.file_path
-    WHERE {time_where} {where_extra}
-    GROUP BY ar.id
-    ORDER BY ar.report_date DESC, ar.prompt_id ASC, ar.id DESC
+        report_id, report_date, file_path,
+        prompt_id, prompt_version, is_backtest,
+        themes_count, scored_pairs,
+        d1_avg, d2_avg, d3_avg, d4_avg, d5_avg,
+        a1_avg, a2_avg, a3_avg, a4_avg, a5_avg,
+        -- 报告级 α = AVG over 5 days of a_n_avg（忽略 NULL）
+        (COALESCE(a1_avg, 0) + COALESCE(a2_avg, 0)
+         + COALESCE(a3_avg, 0) + COALESCE(a4_avg, 0)
+         + COALESCE(a5_avg, 0))
+          / NULLIF(
+                (CASE WHEN a1_avg IS NOT NULL THEN 1 ELSE 0 END)
+              + (CASE WHEN a2_avg IS NOT NULL THEN 1 ELSE 0 END)
+              + (CASE WHEN a3_avg IS NOT NULL THEN 1 ELSE 0 END)
+              + (CASE WHEN a4_avg IS NOT NULL THEN 1 ELSE 0 END)
+              + (CASE WHEN a5_avg IS NOT NULL THEN 1 ELSE 0 END), 0)
+          AS alpha_avg,
+        -- 报告级 α-1 = AVG over D+2..D+5 of a_n_avg（忽略 NULL）
+        (COALESCE(a2_avg, 0) + COALESCE(a3_avg, 0)
+         + COALESCE(a4_avg, 0) + COALESCE(a5_avg, 0))
+          / NULLIF(
+                (CASE WHEN a2_avg IS NOT NULL THEN 1 ELSE 0 END)
+              + (CASE WHEN a3_avg IS NOT NULL THEN 1 ELSE 0 END)
+              + (CASE WHEN a4_avg IS NOT NULL THEN 1 ELSE 0 END)
+              + (CASE WHEN a5_avg IS NOT NULL THEN 1 ELSE 0 END), 0)
+          AS alpha_avg_excl_d1,
+        hit_rate_avg, direction_correct_rate
+    FROM per_report
+    ORDER BY report_date DESC, prompt_id ASC, report_id DESC
     """
 
     params: List = time_params + extra_params
@@ -1076,10 +1181,10 @@ def get_theme_eval_for_report(report_id: int) -> List[Dict]:
                 "sector_ts_code": "BK0871.DC",
                 "stocks_count": 6,           # theme_stocks 行数（懒加载下一层用）
                 "scored_pairs": 5,           # theme_prediction_scores 行数
-                "d1": ..., "d5": ...,        # stock_weighted_pct 透视
-                "a1": ..., "a5": ...,        # α+N：sector_pct - 中证1000 逐日值
-                "alpha_avg": None,
-                "alpha_avg_excl_d1": None,   # α-1：D+2~D+5 (theme_pct - 中证1000) 均值
+                "d1": ..., "d5": ...,        # sector_pct 逐日透视
+                "a1": ..., "a5": ...,        # α+N = sector_pct - 中证1000 逐日
+                "alpha_avg": None,           # 题材 α = AVG(α+1..+5)（sector-zz1000）
+                "alpha_avg_excl_d1": None,   # 题材 α-1 = AVG(α+2..+5)（sector-zz1000）
                 "hit_rate_avg": None,
                 "direction_correct_rate": None,
                 "sector_pct_avg": None,      # 板块涨跌幅均值
@@ -1089,8 +1194,11 @@ def get_theme_eval_for_report(report_id: int) -> List[Dict]:
         命中 ``theme_predictions(report_path)`` 索引 + 子查询 GROUP BY
         ``theme_id``，单报告（5~20 题材）耗时 < 50ms。
     """
-    # 2026-05-28 v2：题材级 D+N 改用 sector_pct（与第 1 层口径对齐）
-    # 2026-05-28 22:00 加入 α+N 列（逐日 sector_pct - 中证1000，与 D+N 同基础）
+    # 2026-05-28 22:30 题材级独立体系（与上层报告/模板差异化）：
+    #   * D+N = sector_pct（保持 v2）
+    #   * α+N = sector_pct - benchmark_zz1000_pct（与 D+N 同基础）
+    #   * α   = AVG over 5 days of α+N（即 AVG(sector - zz1000)）
+    #   * α-1 = AVG over D+2..D+5 of α+N（剔除 D+1）
     sql = """
     WITH per_theme_scores AS (
         SELECT
@@ -1115,10 +1223,11 @@ def get_theme_eval_for_report(report_id: int) -> List[Dict]:
                      THEN tps.sector_pct - tps.benchmark_zz1000_pct END) AS a4,
             MAX(CASE WHEN tps.days_offset=5
                      THEN tps.sector_pct - tps.benchmark_zz1000_pct END) AS a5,
-            AVG(tps.alpha) AS alpha_avg,
-            -- α-1 题材级口径（与 get_prompt_eval / get_report_eval 同口径）
+            AVG(CASE WHEN tps.days_offset BETWEEN 1 AND 5
+                     THEN tps.sector_pct - tps.benchmark_zz1000_pct END)
+                 AS alpha_avg,
             AVG(CASE WHEN tps.days_offset BETWEEN 2 AND 5
-                     THEN tps.theme_pct - tps.benchmark_zz1000_pct END)
+                     THEN tps.sector_pct - tps.benchmark_zz1000_pct END)
                  AS alpha_avg_excl_d1,
             AVG(tps.hit_rate) AS hit_rate_avg,
             AVG(CASE WHEN tps.direction_correct IS NOT NULL

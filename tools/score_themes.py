@@ -110,13 +110,19 @@ def _print_summary(label: str, res: BatchScoringResult) -> None:
 
 
 def _print_score(score) -> None:
+    # 2026-05-28 22:30 α 体系金字塔重构：单日 alpha 字段已 DROP，
+    # 此处现推 α+N = theme_pct - benchmark_zz1000_pct（与 GUI / 聚合层一致）
+    if score.theme_pct is not None and score.benchmark_zz1000_pct is not None:
+        a_n = score.theme_pct - score.benchmark_zz1000_pct
+    else:
+        a_n = None
     print(
         f"  theme_id={score.theme_id} score_date={score.score_date} "
         f"D+{score.days_offset}: "
         f"sector={score.sector_pct} "
         f"stock_avg={score.stock_avg_pct} "
         f"hit={score.hit_count}/{score.total_count} "
-        f"alpha={score.alpha} "
+        f"α+{score.days_offset}={a_n} "
         f"dir={score.direction_correct}"
     )
 

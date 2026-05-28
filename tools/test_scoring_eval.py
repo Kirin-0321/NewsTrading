@@ -206,6 +206,9 @@ def _seed_dataset() -> None:
                     sd = (
                         base_dt + timedelta(days=d_off)
                     ).strftime("%Y%m%d")
+                    # 2026-05-28 22:30 α 体系金字塔重构：alpha 列已 DROP，
+                    # 改写 benchmark_zz1000_pct（中证1000 基准），
+                    # α/α-1/α+N 全部由聚合层 SQL 现推。
                     conn.execute(
                         "INSERT INTO theme_prediction_scores "
                         "(theme_id, prompt_id, prompt_version, "
@@ -213,7 +216,8 @@ def _seed_dataset() -> None:
                         " sector_pct, stock_avg_pct, stock_weighted_pct, "
                         " theme_pct, "
                         " hit_count, total_count, hit_rate, "
-                        " benchmark_pct, alpha, direction_correct, "
+                        " benchmark_pct, benchmark_zz1000_pct, "
+                        " direction_correct, "
                         " created_at) "
                         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
                         "        ?, ?, ?, ?, ?)",
@@ -222,7 +226,7 @@ def _seed_dataset() -> None:
                             rdate_dash, sd, d_off,
                             2.0, 1.5, 2.0, 1.8,
                             3, 5, 0.6,
-                            1.0, 1.0, 1,
+                            1.0, 0.8, 1,
                             now_iso,
                         ),
                     )
@@ -621,11 +625,12 @@ def case_14_delete_backtest_cascade() -> None:
                     " sector_pct, stock_avg_pct, stock_weighted_pct, "
                     " theme_pct, "
                     " hit_count, total_count, hit_rate, "
-                    " benchmark_pct, alpha, direction_correct, "
+                    " benchmark_pct, benchmark_zz1000_pct, "
+                    " direction_correct, "
                     " created_at) "
                     "VALUES (?, 'TEST_EV_DEL_BT', 'v1', "
                     "        ?, ?, ?, 1.0, 1.0, 1.0, 1.0, 1, 1, 1.0, "
-                    "        0.5, 0.5, 1, ?)",
+                    "        0.5, 0.4, 1, ?)",
                     (tid, rdate, sd, d_off, now_iso),
                 )
 
@@ -1070,18 +1075,19 @@ def _seed_weighted_dataset() -> None:
                 " sector_pct, stock_avg_pct, stock_weighted_pct, "
                 " theme_pct, "
                 " hit_count, total_count, hit_rate, "
-                " benchmark_pct, alpha, direction_correct, "
+                " benchmark_pct, benchmark_zz1000_pct, "
+                " direction_correct, "
                 " created_at) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     tid, _PREFIX_W + "P", "v1",
                     rdate, sd, 1,
                     d1v,
-                    77.0,  # ⚠ stock_avg_pct 故意设 77，验证报告级 d1 不再读它
-                    99.0,  # ⚠ stock_weighted_pct 故意设 99，验证 v2 切走过这一字段
-                    d1v,   # 2026-05-28 17:15 加权改造：theme_pct 才是报告级真值
+                    77.0,
+                    99.0,
+                    d1v,
                     1, 1, 1.0,
-                    0.0, d1v, 1,
+                    0.0, 0.0, 1,
                     now_iso,
                 ),
             )
@@ -1245,14 +1251,15 @@ def case_24_report_eval_all_short_returns_null() -> None:
                     " sector_pct, stock_avg_pct, stock_weighted_pct, "
                     " theme_pct, "
                     " hit_count, total_count, hit_rate, "
-                    " benchmark_pct, alpha, direction_correct, created_at) "
+                    " benchmark_pct, benchmark_zz1000_pct, "
+                    " direction_correct, created_at) "
                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         tid, _PREFIX_W + "S", "v1",
                         rdate, sd, 1,
                         -2.0, -2.0, -2.0, -2.0,
                         0, 1, 0.0,
-                        0.0, -2.0, 1,
+                        0.0, -1.0, 1,
                         now_iso,
                     ),
                 )
