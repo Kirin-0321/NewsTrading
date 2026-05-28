@@ -1,4 +1,4 @@
-"""Phase 2 打分核心回归测试（10 用例，全部走伪数据，0 API 消耗）。
+"""Phase 2 打分核心回归测试（16 用例，全部走伪数据，0 API 消耗）。
 
 覆盖
 ----
@@ -14,6 +14,12 @@
 9. 跨库 ATTACH/DETACH 连续 50 次后再开常规连接不报错
 10. CASCADE：DELETE theme_predictions 1 行 → theme_prediction_scores +
     theme_stock_scores 子表对应行自动清
+11. ``_compute_theme_pct`` 三分支精确（2026-05-28 17:15 加权改造）
+12. theme_pct 持久化与内存值一致（2026-05-28 17:15）
+13. alpha 切换至 theme_pct 口径（2026-05-28 17:15）
+14. benchmark_zz1000_pct 写入正确（2026-05-28 18:40 α-1 指标）
+15. 中证1000 当日缺数据时 benchmark_zz1000_pct=None 不 crash
+16. backfill_benchmark_zz1000 干跑/真跑 行为正确
 
 数据隔离
 --------
@@ -84,10 +90,14 @@ _FAKE_SECTOR_DAILY = [
 ]
 
 # benchmark 指数伪行情
+# 注：000852.SH 为中证1000 真实代码（α-1 指标基准），由 script_scorer
+# 硬编码作为 zz1000 基准查询；本测试为它造伪行情。
+# 99990506 故意造数据，99990507 故意不造 → 验证缺数据时 None 兜底
 _FAKE_INDEX_DAILY = [
     # (ts_code, trade_date, pct_chg, close)
     ("TEST_BENCH.SH", "99990506", 0.5, 4145.0),
     ("TEST_BENCH.SH", "99990507", -0.3, 4132.6),
+    ("000852.SH", "99990506", 0.8, 6500.0),
 ]
 
 
@@ -559,6 +569,119 @@ def case_13_alpha_uses_theme_pct() -> None:
 
 
 # ---------------------------------------------------------------------------
+# 2026-05-28 18:40 α-1 指标 / 中证1000 基准列专项用例
+# ---------------------------------------------------------------------------
+
+
+def case_14_benchmark_zz1000_written() -> None:
+    """打分时 ``benchmark_zz1000_pct`` 列写入正确（来自 fact_index_daily 000852.SH）。
+
+    伪 _FAKE_INDEX_DAILY 给 99990506 造了 000852.SH 的 pct_chg=0.8。
+    打完分后内存对象 + DB 行的 benchmark_zz1000_pct 都应为 0.8。
+    """
+    from services.scoring.script_scorer import score_theme_on_date
+    from services.storage.ai_inference_db import get_ai_inference_db
+    _make_theme(999814, report_date="99990430",
+                stock_codes=["TEST_A.SH"])
+    res = score_theme_on_date(999814, "99990506",
+                              benchmark_ts_code="TEST_BENCH.SH")
+    assert res.benchmark_zz1000_pct is not None, (
+        "中证1000 99990506 已造数据，应写入 benchmark_zz1000_pct"
+    )
+    assert abs(res.benchmark_zz1000_pct - 0.8) < 1e-9, (
+        f"期望 0.8，得到 {res.benchmark_zz1000_pct}"
+    )
+    with get_ai_inference_db().connect(readonly=True) as conn:
+        row = conn.execute(
+            "SELECT benchmark_zz1000_pct "
+            "FROM theme_prediction_scores WHERE theme_id = ?",
+            (999814,),
+        ).fetchone()
+    assert row is not None
+    assert row["benchmark_zz1000_pct"] is not None
+    assert abs(row["benchmark_zz1000_pct"] - 0.8) < 1e-9, (
+        f"DB 中 benchmark_zz1000_pct={row['benchmark_zz1000_pct']} != 0.8"
+    )
+
+
+def case_15_benchmark_zz1000_missing_is_none() -> None:
+    """中证1000 当日无数据时 ``benchmark_zz1000_pct`` 应为 None 不 crash。
+
+    99990507 故意没造 000852.SH 行情，benchmark_zz1000_pct 应兜底 None。
+    上证综指替身 TEST_BENCH.SH 99990507 是有数据的，benchmark_pct/alpha 不受影响。
+    """
+    from services.scoring.script_scorer import score_theme_on_date
+    _make_theme(999815, report_date="99990430",
+                stock_codes=["TEST_A.SH"])
+    res = score_theme_on_date(999815, "99990507",
+                              benchmark_ts_code="TEST_BENCH.SH")
+    assert res.benchmark_zz1000_pct is None, (
+        f"中证1000 99990507 无数据应得 None，得到 {res.benchmark_zz1000_pct}"
+    )
+    # 但 alpha (基于 TEST_BENCH.SH) 仍应有值
+    assert res.benchmark_pct is not None and res.alpha is not None, (
+        "上证综指替身有数据，alpha 不应受 zz1000 缺数据影响"
+    )
+
+
+def case_16_backfill_benchmark_zz1000() -> None:
+    """``backfill_benchmark_zz1000`` 能把 NULL 行重新填回。
+
+    流程：
+        1. 跑一次打分让某行有 benchmark_zz1000_pct = 0.8
+        2. 手动 UPDATE 设回 NULL（模拟迁移 003 后的老行）
+        3. 干跑：rows_to_fill=1, rows_updated=0, missing_dates=[]
+        4. 真跑：rows_updated=1，列重新等于 0.8
+    """
+    from services.scoring.script_scorer import (
+        backfill_benchmark_zz1000, score_theme_on_date,
+    )
+    from services.storage.ai_inference_db import get_ai_inference_db
+    _make_theme(999816, report_date="99990430",
+                stock_codes=["TEST_A.SH"])
+    score_theme_on_date(999816, "99990506",
+                        benchmark_ts_code="TEST_BENCH.SH")
+
+    # 设 NULL 模拟迁移后老行
+    with get_ai_inference_db().connect() as conn:
+        conn.execute(
+            "UPDATE theme_prediction_scores "
+            "SET benchmark_zz1000_pct = NULL WHERE theme_id = ?",
+            (999816,),
+        )
+
+    # 干跑
+    dry = backfill_benchmark_zz1000(dry_run=True)
+    assert dry.rows_to_fill >= 1, (
+        f"干跑应识别至少 1 行 NULL，得到 rows_to_fill={dry.rows_to_fill}"
+    )
+    assert dry.rows_updated == 0, (
+        f"干跑不应实际写库，得到 rows_updated={dry.rows_updated}"
+    )
+
+    # 真跑
+    real = backfill_benchmark_zz1000(dry_run=False)
+    assert real.rows_updated >= 1, (
+        f"真跑应至少更新 1 行，得到 {real.rows_updated}"
+    )
+
+    # 验证列已填回 0.8
+    with get_ai_inference_db().connect(readonly=True) as conn:
+        row = conn.execute(
+            "SELECT benchmark_zz1000_pct "
+            "FROM theme_prediction_scores WHERE theme_id = ?",
+            (999816,),
+        ).fetchone()
+    assert row is not None and row["benchmark_zz1000_pct"] is not None, (
+        "回填后该列应非 NULL"
+    )
+    assert abs(row["benchmark_zz1000_pct"] - 0.8) < 1e-9, (
+        f"回填值应等于 fact_index_daily 中的 0.8，得到 "
+        f"{row['benchmark_zz1000_pct']}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
 
@@ -579,6 +702,11 @@ _CASES: List[Tuple[str, Callable[[], None]]] = [
     ("11_compute_theme_pct_pure", case_11_compute_theme_pct_pure),
     ("12_score_writes_theme_pct_column", case_12_score_writes_theme_pct_column),
     ("13_alpha_uses_theme_pct", case_13_alpha_uses_theme_pct),
+    # 2026-05-28 18:40 α-1 / 中证1000 基准列
+    ("14_benchmark_zz1000_written", case_14_benchmark_zz1000_written),
+    ("15_benchmark_zz1000_missing_is_none",
+     case_15_benchmark_zz1000_missing_is_none),
+    ("16_backfill_benchmark_zz1000", case_16_backfill_benchmark_zz1000),
 ]
 
 

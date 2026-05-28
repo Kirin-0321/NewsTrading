@@ -364,6 +364,7 @@ def get_template_eval(
                 "sample_count": 14,              # 兼容老字段 = themes_total
                 "d1_avg": None, ..., "d5_avg": None,
                 "alpha_avg": None,
+                "alpha_avg_excl_d1": None,        # α-1：D+2~D+5 (theme_pct - 中证1000) 均值
                 "hit_rate_avg": None,
                 "direction_correct_rate": None,
                 "last_report_date": "20260522",  # YYYYMMDD 8 字符（schema 协议）
@@ -426,6 +427,11 @@ def get_template_eval(
             MAX(CASE WHEN tps.days_offset=5
                      THEN tps.sector_pct END) AS d5,
             AVG(tps.alpha) AS alpha_avg,
+            -- α-1 题材级口径：D+2~D+5 各算 (theme_pct - 中证1000 pct)，再 4 天均值
+            -- AVG 自动忽略 NULL（D+1 行 / 缺数据行整体 NULL）
+            AVG(CASE WHEN tps.days_offset BETWEEN 2 AND 5
+                     THEN tps.theme_pct - tps.benchmark_zz1000_pct END)
+                 AS alpha_excl_d1,
             AVG(tps.hit_rate) AS hit_rate_avg,
             AVG(CASE WHEN tps.direction_correct IS NOT NULL
                      THEN CAST(tps.direction_correct AS REAL) END)
@@ -463,6 +469,7 @@ def get_template_eval(
           / NULLIF(SUM(CASE WHEN strength_score > 0 AND d5 IS NOT NULL
                             THEN ABS(strength_score) END), 0) AS d5_avg,
         AVG(alpha_avg) AS alpha_avg,
+        AVG(alpha_excl_d1) AS alpha_avg_excl_d1,
         AVG(hit_rate_avg) AS hit_rate_avg,
         AVG(dir_rate) AS direction_correct_rate,
         MAX(theme_report_date) AS last_report_date
@@ -530,6 +537,7 @@ def get_report_eval(
                 "score_status": "none",          # none / partial / full
                 "d1_avg": None, ..., "d5_avg": None,
                 "alpha_avg": None,
+                "alpha_avg_excl_d1": None,        # α-1：D+2~D+5 (theme_pct - 中证1000) 均值
                 "hit_rate_avg": None,
                 "direction_correct_rate": None,
             }
@@ -598,6 +606,10 @@ def get_report_eval(
             MAX(CASE WHEN tps.days_offset=5
                      THEN tps.theme_pct END) AS d5,
             AVG(tps.alpha) AS alpha_avg,
+            -- α-1 题材级口径（与 get_prompt_eval 同口径）
+            AVG(CASE WHEN tps.days_offset BETWEEN 2 AND 5
+                     THEN tps.theme_pct - tps.benchmark_zz1000_pct END)
+                 AS alpha_excl_d1,
             AVG(tps.hit_rate) AS hit_rate_avg,
             AVG(CASE WHEN tps.direction_correct IS NOT NULL
                      THEN CAST(tps.direction_correct AS REAL) END)
@@ -654,6 +666,7 @@ def get_report_eval(
                             THEN ABS(per_theme.strength_score) END), 0)
           AS d5_avg,
         AVG(per_theme.alpha_avg) AS alpha_avg,
+        AVG(per_theme.alpha_excl_d1) AS alpha_avg_excl_d1,
         AVG(per_theme.hit_rate_avg) AS hit_rate_avg,
         AVG(per_theme.dir_rate) AS direction_correct_rate
     FROM ai_reports ar
@@ -984,6 +997,7 @@ def get_theme_eval_for_report(report_id: int) -> List[Dict]:
                 "scored_pairs": 5,           # theme_prediction_scores 行数
                 "d1": ..., "d5": ...,        # stock_weighted_pct 透视
                 "alpha_avg": None,
+                "alpha_avg_excl_d1": None,   # α-1：D+2~D+5 (theme_pct - 中证1000) 均值
                 "hit_rate_avg": None,
                 "direction_correct_rate": None,
                 "sector_pct_avg": None,      # 板块涨跌幅均值
@@ -1009,6 +1023,10 @@ def get_theme_eval_for_report(report_id: int) -> List[Dict]:
             MAX(CASE WHEN tps.days_offset=5
                      THEN tps.sector_pct END) AS d5,
             AVG(tps.alpha) AS alpha_avg,
+            -- α-1 题材级口径（与 get_prompt_eval / get_report_eval 同口径）
+            AVG(CASE WHEN tps.days_offset BETWEEN 2 AND 5
+                     THEN tps.theme_pct - tps.benchmark_zz1000_pct END)
+                 AS alpha_avg_excl_d1,
             AVG(tps.hit_rate) AS hit_rate_avg,
             AVG(CASE WHEN tps.direction_correct IS NOT NULL
                      THEN CAST(tps.direction_correct AS REAL) END)
@@ -1039,6 +1057,7 @@ def get_theme_eval_for_report(report_id: int) -> List[Dict]:
         COALESCE(pts.scored_pairs, 0) AS scored_pairs,
         pts.d1, pts.d2, pts.d3, pts.d4, pts.d5,
         pts.alpha_avg,
+        pts.alpha_avg_excl_d1,
         pts.hit_rate_avg,
         pts.dir_rate AS direction_correct_rate,
         pts.sector_pct_avg

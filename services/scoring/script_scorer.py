@@ -7,7 +7,7 @@
 * ``theme_prediction_scores`` ：单题材单日 1 行（6 个核心指标 + AI 复审栏）
 * ``theme_stock_scores``      ：单标的单日 1 行（明细，给题材详情 Tab 用）
 
-7 个核心指标（2026-05-28 17:15 加权改造后）
+8 个核心指标（2026-05-28 18:40 中证1000 基准列加入后）
 -------------------------------------------
 | 字段 | 含义 |
 |------|------|
@@ -16,8 +16,16 @@
 | ``stock_weighted_pct`` | 一期等权 = 算术平均；二期可按强度加权 |
 | ``theme_pct`` | **题材综合涨幅**（报告级评分用）= 0.6·sector_pct + 0.4·stock_avg_pct；标的 NULL 时退回 sector_pct |
 | ``hit_rate`` | 涨幅 ≥ ``hit_threshold_pct`` 的标的占比 |
+| ``benchmark_pct`` | 大盘基准涨跌幅（默认上证综指 ``000001.SH``） |
+| ``benchmark_zz1000_pct`` | 中证1000（``000852.SH``）当日涨跌幅；α-1 指标的基准（2026-05-28 18:40 加入） |
 | ``alpha`` | ``theme_pct - benchmark_pct``（2026-05-28 17:15 起从 stock_weighted_pct 切换到 theme_pct） |
 | ``direction_correct`` | 强度方向与板块涨跌方向同号则 1，反向 0，无法判定 NULL |
+
+衍生指标（**不存表**，由聚合层 SQL 推出）
+-------------------------------------------
+| 字段 | 公式 | 出现位置 |
+|------|------|---------|
+| ``alpha_avg_excl_d1`` | 题材内 D+2~D+5 的 ``theme_pct - benchmark_zz1000_pct`` 算术平均 | ``scoring_service.get_prompt_eval / get_report_eval / get_themes_for_report`` |
 
 防穿越约束
 ----------
@@ -63,6 +71,9 @@ DEFAULT_HIT_THRESHOLD_PCT = 3.0
 #: benchmark 指数代码（上证综指）
 DEFAULT_BENCHMARK_TS_CODE = "000001.SH"
 
+#: 中证1000 指数代码（α-1 指标的基准）
+ZZ1000_TS_CODE = "000852.SH"
+
 #: theme_pct 合成系数（2026-05-28 17:15 加权改造）
 THEME_PCT_SECTOR_WEIGHT = 0.6
 THEME_PCT_STOCK_WEIGHT = 0.4
@@ -100,6 +111,8 @@ class ThemeDailyScore:
     hit_rate: float
 
     benchmark_pct: Optional[float]
+    #: 中证1000 当日涨跌幅（α-1 指标的基准；2026-05-28 18:40 加入）
+    benchmark_zz1000_pct: Optional[float]
     alpha: Optional[float]
     direction_correct: Optional[int]
 
@@ -209,6 +222,9 @@ def score_theme_on_date(
         benchmark_pct = _query_benchmark_pct(
             conn, benchmark_ts_code, score_date,
         )
+        benchmark_zz1000_pct = _query_benchmark_pct(
+            conn, ZZ1000_TS_CODE, score_date,
+        )
 
         theme_pct = _compute_theme_pct(sector_pct, stock_avg_pct)
 
@@ -256,6 +272,7 @@ def score_theme_on_date(
             total_count=total_count,
             hit_rate=hit_rate,
             benchmark_pct=benchmark_pct,
+            benchmark_zz1000_pct=benchmark_zz1000_pct,
             alpha=alpha,
             direction_correct=direction_correct,
             stock_rows=stock_score_rows,
@@ -438,9 +455,9 @@ INSERT INTO theme_prediction_scores
      days_offset, sector_pct, stock_avg_pct, stock_weighted_pct,
      theme_pct,
      hit_count, total_count, hit_rate,
-     benchmark_pct, alpha, direction_correct,
+     benchmark_pct, benchmark_zz1000_pct, alpha, direction_correct,
      created_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(theme_id, score_date) DO UPDATE SET
     days_offset = excluded.days_offset,
     sector_pct = excluded.sector_pct,
@@ -451,6 +468,7 @@ ON CONFLICT(theme_id, score_date) DO UPDATE SET
     total_count = excluded.total_count,
     hit_rate = excluded.hit_rate,
     benchmark_pct = excluded.benchmark_pct,
+    benchmark_zz1000_pct = excluded.benchmark_zz1000_pct,
     alpha = excluded.alpha,
     direction_correct = excluded.direction_correct,
     created_at = excluded.created_at
@@ -484,8 +502,8 @@ def _write_scores(
             result.stock_weighted_pct,
             result.theme_pct,
             result.hit_count, result.total_count, result.hit_rate,
-            result.benchmark_pct, result.alpha,
-            result.direction_correct,
+            result.benchmark_pct, result.benchmark_zz1000_pct,
+            result.alpha, result.direction_correct,
             now,
         ),
     )
@@ -508,3 +526,93 @@ def _write_scores(
 def _ensure_yyyymmdd(s: str) -> None:
     if not isinstance(s, str) or len(s) != 8 or not s.isdigit():
         raise ValueError(f"日期格式应为 YYYYMMDD，得到 {s!r}")
+
+
+# ---------------------------------------------------------------------------
+# 回填中证1000 基准列（迁移 003 后的一次性补齐工具）
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class BackfillResult:
+    """``backfill_benchmark_zz1000`` 回填结果。"""
+
+    total_rows: int          # theme_prediction_scores 总行数
+    rows_to_fill: int        # benchmark_zz1000_pct 仍 NULL 的行数
+    rows_updated: int        # 实际更新成功的行数
+    distinct_dates: int      # 涉及的不同 score_date 数
+    missing_dates: List[str] # fact_index_daily 中无 zz1000 数据的 score_date
+
+
+def backfill_benchmark_zz1000(*, dry_run: bool = False) -> BackfillResult:
+    """把 ``theme_prediction_scores.benchmark_zz1000_pct`` 回填为
+    中证1000 (``000852.SH``) 当日 ``pct_chg``。
+
+    设计：
+        1. 取 NULL 行的 distinct ``score_date`` 集合（去重避免重复查 index）
+        2. 一次性 IN 查询 ``market.fact_index_daily`` 获取每日 pct_chg
+        3. 批量 UPDATE 单日表对应行
+
+    Args:
+        dry_run: True 时只统计不写库（用于先确认影响范围）。
+
+    Returns:
+        :class:`BackfillResult`，主人据此判断是否要补抓中证1000 行情。
+    """
+    with attached_dbs(primary="ai", attach=("market",)) as conn:
+        total_rows = conn.execute(
+            "SELECT COUNT(*) AS c FROM theme_prediction_scores"
+        ).fetchone()["c"]
+
+        null_rows = conn.execute(
+            "SELECT id, score_date "
+            "FROM theme_prediction_scores "
+            "WHERE benchmark_zz1000_pct IS NULL"
+        ).fetchall()
+        rows_to_fill = len(null_rows)
+        if rows_to_fill == 0:
+            return BackfillResult(
+                total_rows=total_rows, rows_to_fill=0,
+                rows_updated=0, distinct_dates=0,
+                missing_dates=[],
+            )
+
+        # 不同 score_date → pct_chg 字典
+        dates = sorted({r["score_date"] for r in null_rows})
+        placeholders = ",".join("?" * len(dates))
+        idx_rows = conn.execute(
+            f"SELECT trade_date, pct_chg "
+            f"FROM market.fact_index_daily "
+            f"WHERE ts_code = ? AND trade_date IN ({placeholders})",
+            (ZZ1000_TS_CODE, *dates),
+        ).fetchall()
+        date_to_pct = {
+            r["trade_date"]: float(r["pct_chg"])
+            for r in idx_rows
+            if r["pct_chg"] is not None
+        }
+        missing_dates = [d for d in dates if d not in date_to_pct]
+
+        if dry_run:
+            return BackfillResult(
+                total_rows=total_rows, rows_to_fill=rows_to_fill,
+                rows_updated=0, distinct_dates=len(dates),
+                missing_dates=missing_dates,
+            )
+
+        # 按 score_date 批量 UPDATE
+        updated = 0
+        for d, pct in date_to_pct.items():
+            cur = conn.execute(
+                "UPDATE theme_prediction_scores "
+                "SET benchmark_zz1000_pct = ? "
+                "WHERE benchmark_zz1000_pct IS NULL AND score_date = ?",
+                (pct, d),
+            )
+            updated += cur.rowcount
+
+        return BackfillResult(
+            total_rows=total_rows, rows_to_fill=rows_to_fill,
+            rows_updated=updated, distinct_dates=len(dates),
+            missing_dates=missing_dates,
+        )

@@ -13,11 +13,11 @@ UI 布局
     │         + ⚡ 一键打分未完成 + 🔁 重打分 + 导出 + 刷新           │
     ├──────────────────────────────────────────────────────────────┤
     │ 【上表 master】 模板汇总（按 prompt_id 聚合）                │
-    │   模板 | 版本 | 样本 | D+1 D+2 D+3 D+4 D+5 | α | 命中率 |    │
-    │   方向准 | AI 高质量 | 最近报告日                              │
+    │   模板 | 版本 | 样本 | D+1 D+2 D+3 D+4 D+5 | α | α-1 |       │
+    │   命中率 | 方向准 | AI 高质量 | 最近报告日                     │
     ├──────────────────────────────────────────────────────────────┤
     │ 【下表 detail】 选中模板的报告级明细（按 ai_reports.id 聚合）│
-    │   报告日期 | 真/回 | 题材数 | D+1~D+5 | α | 命中率 | 文件名   │
+    │   报告日期 | 真/回 | 题材数 | D+1~D+5 | α | α-1 | 命中率 | 文件名│
     │   （双击 → 跳到「题材预测」页查看该报告的题材列表）           │
     └──────────────────────────────────────────────────────────────┘
 
@@ -106,12 +106,12 @@ _TPL_COLS = [
     ("模板", 220), ("版本", 60), ("真/回测", 70),
     ("题材", 50), ("已打", 50),
     ("D+1", 75), ("D+2", 75), ("D+3", 75), ("D+4", 75), ("D+5", 75),
-    ("α", 75), ("命中率", 70), ("方向准", 70),
+    ("α", 75), ("α-1", 75), ("命中率", 70), ("方向准", 70),
     ("AI 高质量", 80), ("最近报告日", 100),
 ]
 
 
-# 报告树（QTreeWidget）共享 13 列定义（2026-05-28 树形展开重构）
+# 报告树（QTreeWidget）共享 14 列定义（2026-05-28 树形展开重构 + 18:40 加 α-1）
 #
 # 同一列在 3 级（📄 报告 / 🎯 题材 / 📈 标的）下语义对齐：
 #   * 列 0  名称：📄报告日期+真/回 / 🎯题材名 / 📈标的名（带图标前缀）
@@ -121,8 +121,9 @@ _TPL_COLS = [
 #   * 列 4  进度/分数：📄打分 X/Y / 🎯强度分 / 📈—
 #   * 列 5~9  D+1~D+5（单位 %，红涨绿跌染色统一）
 #   * 列 10 α / —
-#   * 列 11 命中率（📄/🎯）/ 命中标记 ✓✗（📈）
-#   * 列 12 文件名 / AI 评语 / 理由（stretch 末列，📄 行尾内嵌「打分/删除」按钮）
+#   * 列 11 α-1（D+2~D+5 题材综合涨幅减中证1000 的 4 天均值，2026-05-28 18:40 加入）
+#   * 列 12 命中率（📄/🎯）/ 命中标记 ✓✗（📈）
+#   * 列 13 文件名 / AI 评语 / 理由（stretch 末列，📄 行尾内嵌「打分/删除」按钮）
 _TREE_COLS = [
     ("名称",            260),  # 0
     ("类型/等级/角色",   100),  # 1
@@ -135,8 +136,9 @@ _TREE_COLS = [
     ("D+4",             75),  # 8
     ("D+5",             75),  # 9
     ("α",               75),  # 10
-    ("命中率",           80),  # 11
-    ("文件名/理由/按钮",   0),  # 12 stretch
+    ("α-1",             75),  # 11
+    ("命中率",           80),  # 12
+    ("文件名/理由/按钮",   0),  # 13 stretch
 ]
 _COL_NAME = 0
 _COL_TYPE = 1
@@ -145,8 +147,9 @@ _COL_COUNT = 3
 _COL_SCORE = 4
 _COL_D1, _COL_D2, _COL_D3, _COL_D4, _COL_D5 = 5, 6, 7, 8, 9
 _COL_ALPHA = 10
-_COL_HIT = 11
-_COL_TAIL = 12
+_COL_ALPHA_M1 = 11  # α-1：D+2~D+5 (theme_pct - 中证1000) 均值（2026-05-28 18:40 加入）
+_COL_HIT = 12
+_COL_TAIL = 13
 
 # 节点类型枚举（写在 QTreeWidgetItem.data(0, Qt.UserRole) 的 dict.kind 中）
 _KIND_REPORT = "report"
@@ -561,6 +564,7 @@ class PromptEvalPage(QWidget):
                 _fmt_pct(data.get("d4_avg")),
                 _fmt_pct(data.get("d5_avg")),
                 _fmt_pct(data.get("alpha_avg")),
+                _fmt_pct(data.get("alpha_avg_excl_d1")),
                 _fmt_rate(data.get("hit_rate_avg")),
                 _fmt_rate(data.get("direction_correct_rate")),
                 "—",  # AI 高质量占比（Phase 7 待实现）
@@ -588,11 +592,11 @@ class PromptEvalPage(QWidget):
                     item.setToolTip(
                         "该模板下题材都未打分，去下表点「打分」按钮"
                     )
-                # D+N / α 染色（c_idx 5~10）
-                if c_idx in (5, 6, 7, 8, 9, 10):
+                # D+N / α / α-1 染色（c_idx 5~11）
+                if c_idx in (5, 6, 7, 8, 9, 10, 11):
                     self._colorize_pct(item, data, c_idx, "d_or_alpha")
-                # AI 高质量占比列：tooltip 说明
-                if c_idx == 13:
+                # AI 高质量占比列：tooltip 说明（α-1 列加进来后顺移至 14）
+                if c_idx == 14:
                     item.setForeground(QColor("#bfbfbf"))
                     item.setToolTip("等 Phase 7 AI 评分员（ai_scorer.py）落地")
                 self.tpl_table.setItem(r_idx, c_idx, item)
@@ -640,6 +644,7 @@ class PromptEvalPage(QWidget):
                 _fmt_pct(data.get("d4_avg")),
                 _fmt_pct(data.get("d5_avg")),
                 _fmt_pct(data.get("alpha_avg")),
+                _fmt_pct(data.get("alpha_avg_excl_d1")),
                 _fmt_rate(data.get("hit_rate_avg")),
                 "",  # 尾列由 setItemWidget 装按钮容器
             ])
@@ -656,9 +661,10 @@ class PromptEvalPage(QWidget):
             item.setData(_COL_COUNT, Qt.UserRole + 1, themes_n)
             item.setData(_COL_SCORE, Qt.UserRole + 1, scored_n)
             for c_idx, key in zip(
-                (_COL_D1, _COL_D2, _COL_D3, _COL_D4, _COL_D5, _COL_ALPHA),
+                (_COL_D1, _COL_D2, _COL_D3, _COL_D4, _COL_D5,
+                 _COL_ALPHA, _COL_ALPHA_M1),
                 ("d1_avg", "d2_avg", "d3_avg", "d4_avg",
-                 "d5_avg", "alpha_avg"),
+                 "d5_avg", "alpha_avg", "alpha_avg_excl_d1"),
             ):
                 v = data.get(key)
                 item.setData(c_idx, Qt.UserRole + 1,
@@ -679,9 +685,10 @@ class PromptEvalPage(QWidget):
             if bt == 1:
                 item.setForeground(_COL_NAME, QColor("#c80"))
             for c_idx, key in zip(
-                (_COL_D1, _COL_D2, _COL_D3, _COL_D4, _COL_D5, _COL_ALPHA),
+                (_COL_D1, _COL_D2, _COL_D3, _COL_D4, _COL_D5,
+                 _COL_ALPHA, _COL_ALPHA_M1),
                 ("d1_avg", "d2_avg", "d3_avg", "d4_avg",
-                 "d5_avg", "alpha_avg"),
+                 "d5_avg", "alpha_avg", "alpha_avg_excl_d1"),
             ):
                 self._paint_pct_cell(item, c_idx, data.get(key))
 
@@ -815,6 +822,7 @@ class PromptEvalPage(QWidget):
             _fmt_pct(t.get("d4")),
             _fmt_pct(t.get("d5")),
             _fmt_pct(t.get("alpha_avg")),
+            _fmt_pct(t.get("alpha_avg_excl_d1")),
             _fmt_rate(t.get("hit_rate_avg")),
             (
                 f"标的 {stocks_n} / 已打 {scored_pairs}"
@@ -835,8 +843,10 @@ class PromptEvalPage(QWidget):
             item.setToolTip(_COL_AUX, tip)
         # 题材级染色
         for c_idx, key in zip(
-            (_COL_D1, _COL_D2, _COL_D3, _COL_D4, _COL_D5, _COL_ALPHA),
-            ("d1", "d2", "d3", "d4", "d5", "alpha_avg"),
+            (_COL_D1, _COL_D2, _COL_D3, _COL_D4, _COL_D5,
+             _COL_ALPHA, _COL_ALPHA_M1),
+            ("d1", "d2", "d3", "d4", "d5",
+             "alpha_avg", "alpha_avg_excl_d1"),
         ):
             self._paint_pct_cell(item, c_idx, t.get(key))
         # 标的层 placeholder
@@ -899,7 +909,8 @@ class PromptEvalPage(QWidget):
             _fmt_pct(s.get("d3_pct")),
             _fmt_pct(s.get("d4_pct")),
             _fmt_pct(s.get("d5_pct")),
-            "—",
+            "—",  # α 列对标的不适用
+            "—",  # α-1 列对标的不适用（2026-05-28 18:40 加列后保留占位）
             hit_text,
             (s.get("reason") or "")[:120],
         ]
@@ -1437,6 +1448,7 @@ class PromptEvalPage(QWidget):
                         r.get("d3_avg"), r.get("d4_avg"),
                         r.get("d5_avg"),
                         r.get("alpha_avg"),
+                        r.get("alpha_avg_excl_d1"),
                         r.get("hit_rate_avg"),
                         r.get("direction_correct_rate"),
                         "",  # AI 高质量
@@ -1454,7 +1466,8 @@ class PromptEvalPage(QWidget):
                     "themes_count", "scored_pairs", "expected_pairs",
                     "score_status",
                     "d1_avg", "d2_avg", "d3_avg", "d4_avg", "d5_avg",
-                    "alpha_avg", "hit_rate_avg", "direction_correct_rate",
+                    "alpha_avg", "alpha_avg_excl_d1",
+                    "hit_rate_avg", "direction_correct_rate",
                     "file_path",
                 ])
                 for r in self._report_rows:
@@ -1472,6 +1485,7 @@ class PromptEvalPage(QWidget):
                         r.get("d3_avg"), r.get("d4_avg"),
                         r.get("d5_avg"),
                         r.get("alpha_avg"),
+                        r.get("alpha_avg_excl_d1"),
                         r.get("hit_rate_avg"),
                         r.get("direction_correct_rate"),
                         r.get("file_path") or "",
@@ -1488,7 +1502,8 @@ class PromptEvalPage(QWidget):
                     "sector_ts_code", "sector_match_conf",
                     "stocks_count", "scored_pairs",
                     "d1", "d2", "d3", "d4", "d5",
-                    "alpha_avg", "hit_rate_avg", "direction_correct_rate",
+                    "alpha_avg", "alpha_avg_excl_d1",
+                    "hit_rate_avg", "direction_correct_rate",
                     "sector_pct_avg",
                 ])
                 writer.writerow([])
@@ -1526,6 +1541,7 @@ class PromptEvalPage(QWidget):
                             t.get("d3"), t.get("d4"),
                             t.get("d5"),
                             t.get("alpha_avg"),
+                            t.get("alpha_avg_excl_d1"),
                             t.get("hit_rate_avg"),
                             t.get("direction_correct_rate"),
                             t.get("sector_pct_avg"),
