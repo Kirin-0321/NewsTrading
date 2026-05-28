@@ -254,8 +254,18 @@ def case_02_single_theme_d1() -> None:
     assert abs(res.hit_rate - 1.0 / 3) < 1e-6
     assert res.sector_pct == 1.85
     assert res.benchmark_pct == 0.5
+    # 2026-05-28 17:15 加权改造：
+    #   theme_pct = 0.6 * 1.85 + 0.4 * (4/3) = 1.11 + 0.53333... = 1.64333...
+    #   alpha     = theme_pct - benchmark_pct = 1.64333... - 0.5
+    expected_theme_pct = 0.6 * 1.85 + 0.4 * (4.0 / 3)
+    assert res.theme_pct is not None
+    assert abs(res.theme_pct - expected_theme_pct) < 1e-6, (
+        f"theme_pct 错: 期望 {expected_theme_pct}, 得到 {res.theme_pct}"
+    )
     assert res.alpha is not None
-    assert abs(res.alpha - (4.0 / 3 - 0.5)) < 1e-6
+    assert abs(res.alpha - (expected_theme_pct - 0.5)) < 1e-6, (
+        f"alpha 错: 期望 {expected_theme_pct - 0.5}, 得到 {res.alpha}"
+    )
     assert res.direction_correct == 1  # +80 强度 + 板块涨 = 同向
 
     # 写库验证
@@ -328,7 +338,11 @@ def case_05_cross_holiday_offset() -> None:
 
 
 def case_06_empty_stocks_no_crash() -> None:
-    """theme_stocks 为空 → stock_avg_pct=None, hit_rate=0 但不 crash。"""
+    """theme_stocks 为空 → stock_avg_pct=None, hit_rate=0 但不 crash。
+
+    2026-05-28 17:15 加权改造：标的全空时 theme_pct 退回 sector_pct（系数 1.0），
+    alpha 改用 theme_pct - benchmark；sector_pct 不为 None 时 alpha 也有值。
+    """
     from services.scoring.script_scorer import score_theme_on_date
     _make_theme(999807, report_date="99990430", stock_codes=[])
     res = score_theme_on_date(999807, "99990506",
@@ -337,9 +351,16 @@ def case_06_empty_stocks_no_crash() -> None:
     assert res.stock_weighted_pct is None
     assert res.total_count == 0
     assert res.hit_rate == 0.0
-    assert res.alpha is None
     # sector_pct 仍能查到（题材关联了 TEST_BK.DC）
     assert res.sector_pct == 1.85
+    # 新口径：theme_pct 退回 sector_pct
+    assert res.theme_pct is not None and abs(res.theme_pct - 1.85) < 1e-9, (
+        f"无标的兜底应 theme_pct=sector_pct=1.85，得到 {res.theme_pct}"
+    )
+    # alpha = theme_pct - benchmark = 1.85 - 0.5
+    assert res.alpha is not None and abs(res.alpha - 1.35) < 1e-9, (
+        f"无标的 alpha 应 = sector - benchmark = 1.35，得到 {res.alpha}"
+    )
 
 
 def case_07_null_sector() -> None:
@@ -361,6 +382,13 @@ def case_07_null_sector() -> None:
     )
     assert res.direction_correct is None, (
         f"sector_pct=None 应得 direction=None，得到 {res.direction_correct}"
+    )
+    # 2026-05-28 17:15 加权改造：sector_pct=None 时 theme_pct=None，alpha=None
+    assert res.theme_pct is None, (
+        f"sector_pct=None 应得 theme_pct=None，得到 {res.theme_pct}"
+    )
+    assert res.alpha is None, (
+        f"theme_pct=None 应得 alpha=None，得到 {res.alpha}"
     )
 
 
@@ -442,6 +470,95 @@ def case_10_cascade_delete() -> None:
 
 
 # ---------------------------------------------------------------------------
+# 2026-05-28 17:15 加权改造专项用例
+# ---------------------------------------------------------------------------
+
+
+def case_11_compute_theme_pct_pure() -> None:
+    """`_compute_theme_pct` 纯函数三分支精确验证。
+
+    覆盖：
+        ① sector=None             → None
+        ② stock_avg=None          → sector （兜底系数 1.0）
+        ③ both 有值               → 0.6·sector + 0.4·stock_avg
+    """
+    from services.scoring.script_scorer import _compute_theme_pct
+    # ① sector_pct = None
+    assert _compute_theme_pct(None, 5.0) is None
+    assert _compute_theme_pct(None, None) is None
+    # ② stock_avg_pct = None → 退回 sector_pct（系数 1.0）
+    assert _compute_theme_pct(2.0, None) == 2.0
+    assert _compute_theme_pct(-1.5, None) == -1.5
+    # ③ both 有值：0.6·sector + 0.4·stock_avg
+    val = _compute_theme_pct(10.0, 5.0)
+    assert val is not None and abs(val - (0.6 * 10 + 0.4 * 5)) < 1e-9, val
+    val = _compute_theme_pct(-2.0, -3.0)
+    expected = 0.6 * (-2) + 0.4 * (-3)
+    assert val is not None and abs(val - expected) < 1e-9, val
+    # 边界：0 / 0
+    val = _compute_theme_pct(0.0, 0.0)
+    assert val == 0.0, val
+
+
+def case_12_score_writes_theme_pct_column() -> None:
+    """打分实跑后 ``theme_prediction_scores.theme_pct`` 列正确写入。
+
+    case_02 已断言 result.theme_pct 内存值，本用例额外验证表里持久化的列也
+    与算法结果一致（防止 _UPSERT_TPS 漏列）。
+    """
+    from services.scoring.script_scorer import score_theme_on_date
+    from services.storage.ai_inference_db import get_ai_inference_db
+
+    _make_theme(
+        999812, report_date="99990430",
+        stock_codes=["TEST_A.SH", "TEST_B.SH", "TEST_C.SH"],
+        strength_score=80,
+    )
+    res = score_theme_on_date(999812, "99990506",
+                              benchmark_ts_code="TEST_BENCH.SH")
+    with get_ai_inference_db().connect(readonly=True) as conn:
+        row = conn.execute(
+            "SELECT theme_pct, alpha "
+            "FROM theme_prediction_scores WHERE theme_id = ?",
+            (999812,),
+        ).fetchone()
+    assert row is not None, "落库后该行应存在"
+    assert row["theme_pct"] is not None
+    assert abs(row["theme_pct"] - res.theme_pct) < 1e-9, (
+        f"DB 中 theme_pct={row['theme_pct']} 与内存 {res.theme_pct} 不一致"
+    )
+    assert abs(row["alpha"] - res.alpha) < 1e-9
+
+
+def case_13_alpha_uses_theme_pct() -> None:
+    """alpha 应等于 ``theme_pct - benchmark_pct``（不再走 stock_weighted_pct）。
+
+    用 case_02 已经验证过的具体数值再校一遍口径切换：
+        sector_pct=1.85, stock_avg=4/3, benchmark=0.5
+        theme_pct = 0.6·1.85 + 0.4·(4/3) = 1.6433...
+        旧口径 alpha = stock_weighted - bench = 4/3 - 0.5 = 0.8333...
+        新口径 alpha = theme_pct - bench = 1.6433... - 0.5 = 1.1433...
+    """
+    from services.scoring.script_scorer import score_theme_on_date
+    _make_theme(999813, report_date="99990430",
+                stock_codes=["TEST_A.SH", "TEST_B.SH", "TEST_C.SH"],
+                strength_score=50)
+    res = score_theme_on_date(999813, "99990506",
+                              benchmark_ts_code="TEST_BENCH.SH")
+    expected_theme_pct = 0.6 * 1.85 + 0.4 * (4.0 / 3)
+    expected_alpha = expected_theme_pct - 0.5
+    old_alpha = (4.0 / 3) - 0.5
+    assert res.alpha is not None
+    assert abs(res.alpha - expected_alpha) < 1e-6, (
+        f"新 alpha 期望 {expected_alpha}，得到 {res.alpha}"
+    )
+    # 防误回归：alpha 不应再等于旧口径值
+    assert abs(res.alpha - old_alpha) > 1e-3, (
+        f"alpha 仍等于旧 stock_weighted-bench 口径 {old_alpha}，未切换成功"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
 
@@ -458,6 +575,10 @@ _CASES: List[Tuple[str, Callable[[], None]]] = [
     ("08_idempotent_upsert", case_08_idempotent_upsert),
     ("09_attach_detach_no_pollution", case_09_attach_detach_no_pollution),
     ("10_cascade_delete", case_10_cascade_delete),
+    # 2026-05-28 17:15 加权改造
+    ("11_compute_theme_pct_pure", case_11_compute_theme_pct_pure),
+    ("12_score_writes_theme_pct_column", case_12_score_writes_theme_pct_column),
+    ("13_alpha_uses_theme_pct", case_13_alpha_uses_theme_pct),
 ]
 
 

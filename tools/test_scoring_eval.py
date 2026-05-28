@@ -200,6 +200,8 @@ def _seed_dataset() -> None:
                 tid = int(tcur.lastrowid)
 
                 # 3 个打分（D+1 / D+3 / D+5）；score_date 用 YYYYMMDD 8 字符
+                # 2026-05-28 17:15 加权改造：theme_pct 同步落库
+                #   theme_pct = 0.6·sector + 0.4·stock_avg = 0.6·2 + 0.4·1.5 = 1.8
                 for d_off in (1, 3, 5):
                     sd = (
                         base_dt + timedelta(days=d_off)
@@ -209,15 +211,16 @@ def _seed_dataset() -> None:
                         "(theme_id, prompt_id, prompt_version, "
                         " report_date, score_date, days_offset, "
                         " sector_pct, stock_avg_pct, stock_weighted_pct, "
+                        " theme_pct, "
                         " hit_count, total_count, hit_rate, "
                         " benchmark_pct, alpha, direction_correct, "
                         " created_at) "
-                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
                         "        ?, ?, ?, ?, ?)",
                         (
                             tid, pid, pv,
                             rdate_dash, sd, d_off,
-                            2.0, 1.5, 2.0,
+                            2.0, 1.5, 2.0, 1.8,
                             3, 5, 0.6,
                             1.0, 1.0, 1,
                             now_iso,
@@ -616,11 +619,12 @@ def case_14_delete_backtest_cascade() -> None:
                     "(theme_id, prompt_id, prompt_version, "
                     " report_date, score_date, days_offset, "
                     " sector_pct, stock_avg_pct, stock_weighted_pct, "
+                    " theme_pct, "
                     " hit_count, total_count, hit_rate, "
                     " benchmark_pct, alpha, direction_correct, "
                     " created_at) "
                     "VALUES (?, 'TEST_EV_DEL_BT', 'v1', "
-                    "        ?, ?, ?, 1.0, 1.0, 1.0, 1, 1, 1.0, "
+                    "        ?, ?, ?, 1.0, 1.0, 1.0, 1.0, 1, 1, 1.0, "
                     "        0.5, 0.5, 1, ?)",
                     (tid, rdate, sd, d_off, now_iso),
                 )
@@ -1064,16 +1068,18 @@ def _seed_weighted_dataset() -> None:
                 "(theme_id, prompt_id, prompt_version, "
                 " report_date, score_date, days_offset, "
                 " sector_pct, stock_avg_pct, stock_weighted_pct, "
+                " theme_pct, "
                 " hit_count, total_count, hit_rate, "
                 " benchmark_pct, alpha, direction_correct, "
                 " created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     tid, _PREFIX_W + "P", "v1",
                     rdate, sd, 1,
                     d1v,
-                    99.0,  # ⚠ stock_weighted_pct 故意设 99，验证不再被读
-                    99.0,
+                    77.0,  # ⚠ stock_avg_pct 故意设 77，验证报告级 d1 不再读它
+                    99.0,  # ⚠ stock_weighted_pct 故意设 99，验证 v2 切走过这一字段
+                    d1v,   # 2026-05-28 17:15 加权改造：theme_pct 才是报告级真值
                     1, 1, 1.0,
                     0.0, d1v, 1,
                     now_iso,
@@ -1141,7 +1147,12 @@ def case_21_theme_eval_uses_sector_pct() -> None:
 def case_22_report_eval_weighted_aggregation() -> None:
     """报告级 d1_avg 应按 |strength_score| 加权（仅看多 strength>0 参与）。
 
-    期望：(10*80 + 2*40) / (80+40) = 7.333...
+    2026-05-28 17:15 加权改造后：
+        d1 来自 theme_pct（夹具特意把 theme_pct=d1v 与 sector_pct=d1v 一致），
+        故期望仍为 (10*80 + 2*40) / (80+40) = 7.333...
+
+    防回归点：夹具把 stock_avg_pct=77 / stock_weighted_pct=99 故意伪造大数；
+    若 SQL 误读这两个字段中的任何一个，结果都不会等于 7.333。
     """
     _cleanup_weighted()
     _seed_weighted_dataset()
@@ -1232,13 +1243,14 @@ def case_24_report_eval_all_short_returns_null() -> None:
                     "(theme_id, prompt_id, prompt_version, "
                     " report_date, score_date, days_offset, "
                     " sector_pct, stock_avg_pct, stock_weighted_pct, "
+                    " theme_pct, "
                     " hit_count, total_count, hit_rate, "
                     " benchmark_pct, alpha, direction_correct, created_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         tid, _PREFIX_W + "S", "v1",
                         rdate, sd, 1,
-                        -2.0, -2.0, -2.0,
+                        -2.0, -2.0, -2.0, -2.0,
                         0, 1, 0.0,
                         0.0, -2.0, 1,
                         now_iso,

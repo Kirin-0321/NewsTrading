@@ -7,15 +7,16 @@
 * ``theme_prediction_scores`` ：单题材单日 1 行（6 个核心指标 + AI 复审栏）
 * ``theme_stock_scores``      ：单标的单日 1 行（明细，给题材详情 Tab 用）
 
-6 个核心指标
-------------
+7 个核心指标（2026-05-28 17:15 加权改造后）
+-------------------------------------------
 | 字段 | 含义 |
 |------|------|
 | ``sector_pct`` | 题材对应板块当日涨跌幅（%） |
 | ``stock_avg_pct`` | 标的算术平均涨幅（%） |
 | ``stock_weighted_pct`` | 一期等权 = 算术平均；二期可按强度加权 |
+| ``theme_pct`` | **题材综合涨幅**（报告级评分用）= 0.6·sector_pct + 0.4·stock_avg_pct；标的 NULL 时退回 sector_pct |
 | ``hit_rate`` | 涨幅 ≥ ``hit_threshold_pct`` 的标的占比 |
-| ``alpha`` | ``stock_weighted_pct - benchmark_pct`` |
+| ``alpha`` | ``theme_pct - benchmark_pct``（2026-05-28 17:15 起从 stock_weighted_pct 切换到 theme_pct） |
 | ``direction_correct`` | 强度方向与板块涨跌方向同号则 1，反向 0，无法判定 NULL |
 
 防穿越约束
@@ -62,6 +63,10 @@ DEFAULT_HIT_THRESHOLD_PCT = 3.0
 #: benchmark 指数代码（上证综指）
 DEFAULT_BENCHMARK_TS_CODE = "000001.SH"
 
+#: theme_pct 合成系数（2026-05-28 17:15 加权改造）
+THEME_PCT_SECTOR_WEIGHT = 0.6
+THEME_PCT_STOCK_WEIGHT = 0.4
+
 
 # ---------------------------------------------------------------------------
 # 数据结构
@@ -86,6 +91,9 @@ class ThemeDailyScore:
     sector_pct: Optional[float]
     stock_avg_pct: Optional[float]
     stock_weighted_pct: Optional[float]
+    #: 题材综合涨幅（报告级评分用） = 0.6·sector_pct + 0.4·stock_avg_pct；
+    #: stock_avg_pct 缺失时退回 sector_pct；sector_pct 也缺失时为 None
+    theme_pct: Optional[float]
 
     hit_count: int
     total_count: int
@@ -202,8 +210,10 @@ def score_theme_on_date(
             conn, benchmark_ts_code, score_date,
         )
 
-        if stock_weighted_pct is not None and benchmark_pct is not None:
-            alpha: Optional[float] = stock_weighted_pct - benchmark_pct
+        theme_pct = _compute_theme_pct(sector_pct, stock_avg_pct)
+
+        if theme_pct is not None and benchmark_pct is not None:
+            alpha: Optional[float] = theme_pct - benchmark_pct
         else:
             alpha = None
 
@@ -241,6 +251,7 @@ def score_theme_on_date(
             sector_pct=sector_pct,
             stock_avg_pct=stock_avg_pct,
             stock_weighted_pct=stock_weighted_pct,
+            theme_pct=theme_pct,
             hit_count=hit_count,
             total_count=total_count,
             hit_rate=hit_rate,
@@ -327,6 +338,35 @@ def score_themes_batch(
 # ---------------------------------------------------------------------------
 
 
+def _compute_theme_pct(
+    sector_pct: Optional[float],
+    stock_avg_pct: Optional[float],
+) -> Optional[float]:
+    """计算题材综合涨幅 ``theme_pct``（报告级评分用）。
+
+    公式（2026-05-28 17:15 加权改造）::
+
+        sector_pct IS NULL                     → None
+        stock_avg_pct IS NULL（无标的有效数据）→ sector_pct
+        else                                    → 0.6 * sector_pct + 0.4 * stock_avg_pct
+
+    Args:
+        sector_pct: 题材绑定板块当日涨跌幅（%），None=板块未绑定/数据缺失。
+        stock_avg_pct: 题材内标的算术平均涨跌幅（%），None=零标的或全标的当日 NULL。
+
+    Returns:
+        合成涨幅 ``theme_pct``；sector_pct 缺失时为 None。
+    """
+    if sector_pct is None:
+        return None
+    if stock_avg_pct is None:
+        return float(sector_pct)
+    return (
+        THEME_PCT_SECTOR_WEIGHT * float(sector_pct)
+        + THEME_PCT_STOCK_WEIGHT * float(stock_avg_pct)
+    )
+
+
 def _load_theme(conn: sqlite3.Connection, theme_id: int) -> sqlite3.Row:
     row = conn.execute(
         "SELECT id, report_date, prompt_id, prompt_version, "
@@ -396,15 +436,17 @@ _UPSERT_TPS = """
 INSERT INTO theme_prediction_scores
     (theme_id, prompt_id, prompt_version, report_date, score_date,
      days_offset, sector_pct, stock_avg_pct, stock_weighted_pct,
+     theme_pct,
      hit_count, total_count, hit_rate,
      benchmark_pct, alpha, direction_correct,
      created_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(theme_id, score_date) DO UPDATE SET
     days_offset = excluded.days_offset,
     sector_pct = excluded.sector_pct,
     stock_avg_pct = excluded.stock_avg_pct,
     stock_weighted_pct = excluded.stock_weighted_pct,
+    theme_pct = excluded.theme_pct,
     hit_count = excluded.hit_count,
     total_count = excluded.total_count,
     hit_rate = excluded.hit_rate,
@@ -440,6 +482,7 @@ def _write_scores(
             result.report_date, result.score_date, result.days_offset,
             result.sector_pct, result.stock_avg_pct,
             result.stock_weighted_pct,
+            result.theme_pct,
             result.hit_count, result.total_count, result.hit_rate,
             result.benchmark_pct, result.alpha,
             result.direction_correct,

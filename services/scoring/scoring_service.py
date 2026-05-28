@@ -1,18 +1,21 @@
 """打分服务入口（Phase 2 Step 2.2 + 2026-05-27 评估页改造 + 2026-05-28 树形展开扩展
-+ 2026-05-28 11:30 板块行情接入 + 加权平均改造）。
++ 2026-05-28 11:30 板块行情接入 + 加权平均改造 + 2026-05-28 17:15 报告级题材综合涨幅切换）。
 
 把 :mod:`services.scoring.script_scorer` 单题材单日的算法包装成 7 个对外
 API，给 CLI / scheduled_runner / GUI 复用：
 
-D+N 列口径（2026-05-28 改造后）
--------------------------------
+D+N 列口径（2026-05-28 17:15 报告级切换 theme_pct 后）
+------------------------------------------------------
 * **标的级**（第 3 层 ``get_stock_scores_for_theme``）：``theme_stock_scores.pct_chg``
   即个股当日涨跌幅（不变）
 * **题材级**（第 2 层 ``get_theme_eval_for_report``）：``sector_pct`` 即题材
-  绑定板块的当日涨跌幅（**改自** stock_weighted_pct 即标的均值）
-* **报告级 / 模板级**（第 1 层 ``get_report_eval`` / ``get_template_eval``）：
-  按 ``|strength_score|`` 加权平均，**仅 strength > 0 的看多题材**参与；
-  全部题材 strength≤0 时 D+N=NULL（NULLIF 兜底）
+  绑定板块的当日涨跌幅（不变，保持 v2 口径）
+* **报告级**（``get_report_eval``）：``theme_pct`` 即「板块 0.6 + 标的均值 0.4」
+  的综合涨幅（无标的兜底 1.0×板块），按 ``|strength_score|`` 加权，
+  仅 strength > 0 的看多题材参与；全部 strength≤0 时 D+N=NULL（NULLIF 兜底）。
+  **从 17:15 起 d1_avg ~ d5_avg 不再读 sector_pct，改读 theme_pct。**
+* **模板级**（``get_template_eval``）：``sector_pct`` 加权（不变，保持 v2 口径，
+  与报告级故意差异化以保留板块视角）
 
 | API | 用途 |
 |------|------|
@@ -78,6 +81,21 @@ class BatchScoringResult:
     days_covered: int
     elapsed_ms: int
     errors: List[str] = field(default_factory=list)
+
+
+@dataclass
+class BatchUnfinishedResult(BatchScoringResult):
+    """「一键打分未完成报告」聚合结果。
+
+    在 :class:`BatchScoringResult` 基础上加 3 个 report 维度计数，
+    便于 GUI 状态栏与 CLI 输出告知主人：「扫了多少 / 真正动手多少 /
+    跳过多少」。``BatchScoringResult`` 自带的 themes_* / pairs_* 字段
+    继续累计跨报告的合计值。
+    """
+
+    reports_targeted: int = 0  # 命中筛选条件的 (none + partial) 报告数
+    reports_done: int = 0      # 实际成功打分的报告数
+    reports_skipped: int = 0   # 命中但被跳过（无题材 / 等）的报告数
 
 
 # ---------------------------------------------------------------------------
@@ -559,8 +577,9 @@ def get_report_eval(
         )
         time_params = [cutoff_compact]
 
-    # 2026-05-28 v2 改造：
-    #   * 题材级 D+N 用 sector_pct 替换 stock_weighted_pct
+    # 2026-05-28 v2 改造（11:30）+ 17:15 题材综合涨幅切换：
+    #   * 报告级 D+N 用 theme_pct（= 0.6·sector_pct + 0.4·stock_avg_pct，无标的兜底
+    #     = sector_pct）替换原 sector_pct，与题材级第 2 层故意差异化
     #   * 报告级聚合用 |strength_score| 加权，仅 strength > 0 的题材参与
     sql = f"""
     WITH per_theme AS (
@@ -569,15 +588,15 @@ def get_report_eval(
             tp.report_path,
             tp.strength_score,
             MAX(CASE WHEN tps.days_offset=1
-                     THEN tps.sector_pct END) AS d1,
+                     THEN tps.theme_pct END) AS d1,
             MAX(CASE WHEN tps.days_offset=2
-                     THEN tps.sector_pct END) AS d2,
+                     THEN tps.theme_pct END) AS d2,
             MAX(CASE WHEN tps.days_offset=3
-                     THEN tps.sector_pct END) AS d3,
+                     THEN tps.theme_pct END) AS d3,
             MAX(CASE WHEN tps.days_offset=4
-                     THEN tps.sector_pct END) AS d4,
+                     THEN tps.theme_pct END) AS d4,
             MAX(CASE WHEN tps.days_offset=5
-                     THEN tps.sector_pct END) AS d5,
+                     THEN tps.theme_pct END) AS d5,
             AVG(tps.alpha) AS alpha_avg,
             AVG(tps.hit_rate) AS hit_rate_avg,
             AVG(CASE WHEN tps.direction_correct IS NOT NULL
@@ -801,6 +820,120 @@ def rescore_one_report(
         days_covered=len(days_covered_set),
         elapsed_ms=int((time.perf_counter() - t0) * 1000),
         errors=errors,
+    )
+
+
+def rescore_unfinished_reports(
+    *,
+    days: int = 30,
+    time_dim: str = "report_date",
+    is_backtest_filter: Optional[int] = None,
+    days_back: int = 5,
+    hit_threshold_pct: float = DEFAULT_HIT_THRESHOLD_PCT,
+    benchmark_ts_code: str = DEFAULT_BENCHMARK_TS_CODE,
+    score_date_override: Optional[str] = None,
+) -> BatchUnfinishedResult:
+    """批量给「未打完」的报告补齐 D+1~D+days_back 打分。
+
+    业务定位：
+        评估页「⚡ 一键打分未完成」按钮 / 调度补齐 CLI 共用入口。
+        与 :func:`rescore_range` 的区别——区间会无差别覆盖**所有**
+        题材（包括已 ``full`` 的报告），本函数只挑当前筛选范围内
+        ``score_status ∈ {none, partial}`` 且 ``themes_count > 0``
+        的报告，逐个调 :func:`rescore_one_report` 增量补齐。
+
+    Args:
+        days / time_dim / is_backtest_filter:
+            与 :func:`get_report_eval` 同名参数完全等价，决定"哪些
+            报告会被纳入候选"。
+        days_back: 每个报告回算几天 D+N（默认 5）。
+        hit_threshold_pct / benchmark_ts_code / score_date_override:
+            透传给 :func:`rescore_one_report`。
+
+    Returns:
+        :class:`BatchUnfinishedResult`：themes_* / pairs_* 是跨报告
+        的合计值；reports_targeted / reports_done / reports_skipped
+        对应"命中候选 / 实际打分成功 / 跳过（无题材或调用异常）"。
+
+    设计要点：
+        * 候选名单一次性算完（避免长事务期间数据漂移）
+        * 单报告失败不阻断后续：异常计入 errors，继续下一个
+        * 已 ``full`` 的报告完全不动，不浪费市场 API 配额
+    """
+    t0 = time.perf_counter()
+    candidates = get_report_eval(
+        days=days,
+        prompt_id=None,
+        is_backtest_filter=is_backtest_filter,
+        time_dim=time_dim,
+    )
+    targets = [
+        r for r in candidates
+        if (r.get("score_status") in ("none", "partial"))
+        and int(r.get("themes_count") or 0) > 0
+    ]
+    reports_targeted = len(targets)
+
+    themes_total_acc = 0
+    themes_scored_acc = 0
+    pairs_attempted_acc = 0
+    pairs_succeeded_acc = 0
+    days_covered_acc = 0  # 简单累加（跨报告允许重复天数）
+    errors_acc: List[str] = []
+    reports_done = 0
+    reports_skipped = 0
+
+    for r in targets:
+        rid = int(r.get("report_id") or 0)
+        if rid <= 0:
+            reports_skipped += 1
+            continue
+        try:
+            sub = rescore_one_report(
+                rid,
+                days_back=days_back,
+                hit_threshold_pct=hit_threshold_pct,
+                benchmark_ts_code=benchmark_ts_code,
+                score_date_override=score_date_override,
+            )
+        except (ValueError, ScoringError) as exc:
+            reports_skipped += 1
+            errors_acc.append(f"report_id={rid}: {exc}")
+            continue
+
+        themes_total_acc += sub.themes_total
+        themes_scored_acc += sub.themes_scored
+        pairs_attempted_acc += sub.pairs_attempted
+        pairs_succeeded_acc += sub.pairs_succeeded
+        days_covered_acc += sub.days_covered
+        if sub.errors:
+            errors_acc.extend(sub.errors)
+        if sub.themes_scored > 0:
+            reports_done += 1
+        else:
+            reports_skipped += 1
+
+    elapsed_ms = int((time.perf_counter() - t0) * 1000)
+    _log.info(
+        "rescore_unfinished_reports targeted=%d done=%d skipped=%d "
+        "themes=%d pairs=%d/%d elapsed=%dms",
+        reports_targeted, reports_done, reports_skipped,
+        themes_scored_acc, pairs_succeeded_acc, pairs_attempted_acc,
+        elapsed_ms,
+    )
+
+    return BatchUnfinishedResult(
+        ok=(len(errors_acc) == 0),
+        themes_total=themes_total_acc,
+        themes_scored=themes_scored_acc,
+        pairs_attempted=pairs_attempted_acc,
+        pairs_succeeded=pairs_succeeded_acc,
+        days_covered=days_covered_acc,
+        elapsed_ms=elapsed_ms,
+        errors=errors_acc,
+        reports_targeted=reports_targeted,
+        reports_done=reports_done,
+        reports_skipped=reports_skipped,
     )
 
 
