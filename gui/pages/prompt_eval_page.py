@@ -10,7 +10,7 @@ UI 布局
 
     ┌──────────────────────────────────────────────────────────────┐
     │ 控制条：时间维度 radio | 时间范围 | 真/回测/全部 | 忽略版本   │
-    │         + 重打分 + 导出 + 刷新                                │
+    │         + ⚡ 一键打分未完成 + 🔁 重打分 + 导出 + 刷新           │
     ├──────────────────────────────────────────────────────────────┤
     │ 【上表 master】 模板汇总（按 prompt_id 聚合）                │
     │   模板 | 版本 | 样本 | D+1 D+2 D+3 D+4 D+5 | α | 命中率 |    │
@@ -20,6 +20,14 @@ UI 布局
     │   报告日期 | 真/回 | 题材数 | D+1~D+5 | α | 命中率 | 文件名   │
     │   （双击 → 跳到「题材预测」页查看该报告的题材列表）           │
     └──────────────────────────────────────────────────────────────┘
+
+按钮区分
+--------
+* **⚡ 一键打分未完成**（绿）：扫当前筛选范围 score_status ∈ {none,
+  partial} 的报告，调 ``rescore_unfinished_reports`` 增量补齐；已 full
+  报告**完全不动**，节省市场 API 配额。日常补齐首选。
+* **🔁 重打分（按筛选范围）**（红）：调 ``rescore_range`` 无差别覆盖
+  当前范围**所有题材**（含已 full）。仅在算法/字段口径变更后批量回填用。
 
 时间维度
 --------
@@ -34,8 +42,14 @@ UI 布局
        ├── get_template_eval(...)                  → 填上表
        └── get_report_eval(prompt_id=选中, ...)     → 填下表
 
+    _on_batch_score_unfinished()
+       ├── 预扫 get_report_eval(prompt_id=None) → 弹窗带数字
+       └── RescoreWorker(unfinished_filter=...)
+           → scoring_service.rescore_unfinished_reports(...)
+
     _on_rescore()
-       └── RescoreWorker → scoring_service.rescore_range(...)
+       └── RescoreWorker(start, end)
+           → scoring_service.rescore_range(...)
 
     _on_report_double_clicked()
        └── self.theme_drilldown_requested.emit(report_date, prompt_id)
@@ -341,11 +355,20 @@ class PromptEvalPage(QWidget):
         self.status_label.setStyleSheet("color: #666;")
         row2.addWidget(self.status_label, 1)
 
+        self.batch_score_btn = QPushButton("⚡ 一键打分未完成")
+        self.batch_score_btn.setStyleSheet(BUTTON_SUCCESS)
+        self.batch_score_btn.setToolTip(
+            "扫当前【时间范围】内 score_status ∈ {none, partial} 的报告，"
+            "逐个调 rescore_one_report 增量补齐；已 full 的报告不动。"
+        )
+        self.batch_score_btn.clicked.connect(self._on_batch_score_unfinished)
+        row2.addWidget(self.batch_score_btn)
+
         self.rescore_btn = QPushButton("🔁 重打分（按筛选范围）")
         self.rescore_btn.setStyleSheet(BUTTON_DANGER)
         self.rescore_btn.setToolTip(
             "对当前【时间范围】内的所有题材重跑 D+1~D+5 脚本打分。"
-            "不会重新调 AI 评分员。"
+            "会无差别覆盖已 full 的报告。不会重新调 AI 评分员。"
         )
         self.rescore_btn.clicked.connect(self._on_rescore)
         row2.addWidget(self.rescore_btn)
@@ -1187,6 +1210,93 @@ class PromptEvalPage(QWidget):
         self._rescore_worker.error.connect(self._on_rescore_error)
         self._rescore_worker.start()
 
+    def _on_batch_score_unfinished(self):
+        """顶栏「⚡ 一键打分未完成」：扫当前筛选范围内 none/partial 报告补齐。
+
+        与 :func:`_on_rescore` 区别：
+            * `_on_rescore` 调 ``rescore_range``，无差别覆盖已 full 的报告
+            * 本函数调 ``rescore_unfinished_reports``，只挑未打完的，节省
+              市场 API 调用量
+        """
+        if self._rescore_worker and self._rescore_worker.isRunning():
+            QMessageBox.information(
+                self, "正在打分", "已有打分任务在跑，请稍候"
+            )
+            return
+        f = self._current_filters()
+
+        # 预扫一次：统计 none / partial 报告数 + 题材合计，让确认弹窗带数字
+        try:
+            from services.scoring.scoring_service import get_report_eval
+            cand = get_report_eval(
+                days=f["days"],
+                prompt_id=None,
+                is_backtest_filter=f["is_backtest_filter"],
+                time_dim=f["time_dim"],
+            )
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(
+                self, "扫描失败", f"读取报告候选失败：{exc}"
+            )
+            return
+
+        targets = [
+            r for r in cand
+            if r.get("score_status") in ("none", "partial")
+            and int(r.get("themes_count") or 0) > 0
+        ]
+        if not targets:
+            QMessageBox.information(
+                self, "无需补齐",
+                f"最近 {f['days']} 天 / {f['time_dim']} 范围内没有未打完的报告，"
+                f"全部已 full 或无题材可打。",
+            )
+            return
+
+        themes_sum = sum(int(r.get("themes_count") or 0) for r in targets)
+        none_n = sum(1 for r in targets if r.get("score_status") == "none")
+        partial_n = sum(
+            1 for r in targets if r.get("score_status") == "partial"
+        )
+        bt_label = self.backtest_combo.currentText()
+        reply = QMessageBox.question(
+            self,
+            "确认一键打分未完成",
+            f"将扫描最近 {f['days']} 天 / {f['time_dim']} / {bt_label}：\n\n"
+            f"  • 候选未完成报告 <b>{len(targets)}</b> 份"
+            f"（初次 {none_n} / 续打 {partial_n}）\n"
+            f"  • 涉及题材合计约 {themes_sum} 个\n\n"
+            f"已 full 的报告不会被波及。\n"
+            f"不会重新调 AI 评分员（Phase 7 才有）。\n\n"
+            f"确定继续？",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        self._set_buttons_busy(True)
+        self.status_label.setText(
+            f"<span style='color:#06c'>⏳ 一键打分未完成中... "
+            f"目标 {len(targets)} 份报告</span>"
+        )
+        self._rescore_worker = RescoreWorker(
+            unfinished_filter={
+                "days": f["days"],
+                "time_dim": f["time_dim"],
+                "is_backtest_filter": f["is_backtest_filter"],
+            },
+            days_back=5,
+            hit_threshold_pct=3.0,
+        )
+        self._rescore_worker.stage.connect(
+            lambda msg: self.status_label.setText(
+                f"<span style='color:#06c'>⏳ {msg}</span>"
+            )
+        )
+        self._rescore_worker.finished_result.connect(self._on_rescore_done)
+        self._rescore_worker.error.connect(self._on_rescore_error)
+        self._rescore_worker.start()
+
     def _on_rescore(self):
         if self._rescore_worker and self._rescore_worker.isRunning():
             QMessageBox.information(
@@ -1233,6 +1343,7 @@ class PromptEvalPage(QWidget):
 
     def _set_buttons_busy(self, busy: bool):
         self.rescore_btn.setEnabled(not busy)
+        self.batch_score_btn.setEnabled(not busy)
         self.refresh_btn.setEnabled(not busy)
         self.range_combo.setEnabled(not busy)
         self.backtest_combo.setEnabled(not busy)
@@ -1249,16 +1360,26 @@ class PromptEvalPage(QWidget):
         days_cov = res.get("days_covered") or 0
         ms = res.get("elapsed_ms") or 0
         mode = res.get("mode") or "range"
-        prefix = (
-            f"✅ 单报告打分完成 (id={res.get('report_id')})"
-            if mode == "one_report"
-            else "✅ 区间打分完成"
-        )
+        if mode == "one_report":
+            prefix = f"✅ 单报告打分完成 (id={res.get('report_id')})"
+            extra = ""
+        elif mode == "unfinished":
+            done = res.get("reports_done") or 0
+            targeted = res.get("reports_targeted") or 0
+            skipped = res.get("reports_skipped") or 0
+            prefix = (
+                f"✅ 一键打分未完成完成: 报告 {done}/{targeted}"
+                f"（跳过 {skipped}）"
+            )
+            extra = ""
+        else:
+            prefix = "✅ 区间打分完成"
+            extra = ""
         color = "#0a0" if ok else "#c80"
         self.status_label.setText(
             f"<span style='color:{color}'>"
             f"{prefix}: 题材 {themes} / 对 {pairs}/{attempted} / "
-            f"覆盖 {days_cov} 天 / 耗时 {ms} ms"
+            f"覆盖 {days_cov} 天 / 耗时 {ms} ms{extra}"
             f"</span>"
         )
         if res.get("errors"):

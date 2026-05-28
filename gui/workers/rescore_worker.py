@@ -2,34 +2,40 @@
 
 业务定位
 --------
-评估页两种触发：
+评估页三种触发：
 
 1. 顶栏「🔁 重打分（区间）」→ ``RescoreWorker(report_date_start=...,
-   report_date_end=...)`` → ``rescore_range``（按 report_date 区间扫所有模板）
-2. 报告级表格「打分」按钮 → ``RescoreWorker(report_id=...)`` →
+   report_date_end=...)`` → ``rescore_range``（按 report_date 区间扫所有模板，
+   含已 full 的报告也会被无差别覆盖）
+2. 顶栏「⚡ 一键打分未完成」→ ``RescoreWorker(unfinished_filter={...})`` →
+   ``rescore_unfinished_reports``（只挑 score_status ∈ {none, partial} 的
+   报告逐个补齐，跳过已 full 的，节省市场 API 配额）
+3. 报告级表格「打分」按钮 → ``RescoreWorker(report_id=...)`` →
    ``rescore_one_report``（精准只动该 report 下题材，不波及其他报告）
 
-为啥要异步：``rescore_range`` 内部对每个 (theme, score_date) 都要查市场库 +
-算指标；样本量上百时阻塞 UI 几十秒。单报告通常 < 100 个 (theme, score_date)
-对，也几秒钟，仍然走异步避免 UI 卡顿。
+为啥要异步：``rescore_range`` / ``rescore_unfinished_reports`` 内部对每个
+(theme, score_date) 都要查市场库 + 算指标；样本量上百时阻塞 UI 几十秒。
+单报告通常 < 100 个 (theme, score_date) 对，也几秒钟，仍然走异步避免
+UI 卡顿。
 
 信号
 ----
 * ``stage(str)``：状态描述
-* ``finished_result(dict)``：``BatchScoringResult`` 字段字典
+* ``finished_result(dict)``：``BatchScoringResult`` / ``BatchUnfinishedResult``
+  字段字典（``mode`` 字段区分调用入口）
 * ``error(str)``：异常 traceback 摘要
 """
 
 from __future__ import annotations
 
 import traceback
-from typing import Optional
+from typing import Any, Dict, Optional
 
 from PyQt5.QtCore import QThread, pyqtSignal
 
 
 class RescoreWorker(QThread):
-    """重打分线程。两种模式互斥：传 report_id 走单报告，否则走区间。"""
+    """重打分线程。三模式互斥：``report_id`` / ``unfinished_filter`` / 区间。"""
 
     stage = pyqtSignal(str)
     finished_result = pyqtSignal(dict)
@@ -41,17 +47,25 @@ class RescoreWorker(QThread):
         report_date_end: Optional[str] = None,
         *,
         report_id: Optional[int] = None,
+        unfinished_filter: Optional[Dict[str, Any]] = None,
         days_back: int = 5,
         hit_threshold_pct: float = 3.0,
     ):
         super().__init__()
-        if report_id is None and not (
-            report_date_start and report_date_end
-        ):
+        modes_set = sum(
+            1 for x in (
+                report_id is not None,
+                unfinished_filter is not None,
+                bool(report_date_start and report_date_end),
+            ) if x
+        )
+        if modes_set != 1:
             raise ValueError(
-                "RescoreWorker 需要 report_id 或 (start, end) 之一"
+                "RescoreWorker 仅支持三选一：report_id / "
+                "unfinished_filter / (start, end)"
             )
         self.report_id = report_id
+        self.unfinished_filter = unfinished_filter
         self.report_date_start = report_date_start
         self.report_date_end = report_date_end
         self.days_back = days_back
@@ -61,6 +75,8 @@ class RescoreWorker(QThread):
         try:
             if self.report_id is not None:
                 self._run_one_report()
+            elif self.unfinished_filter is not None:
+                self._run_unfinished()
             else:
                 self._run_range()
         except Exception as exc:  # noqa: BLE001
@@ -114,4 +130,35 @@ class RescoreWorker(QThread):
             "days_covered": res.days_covered,
             "elapsed_ms": res.elapsed_ms,
             "errors": res.errors[:5],
+        })
+
+    def _run_unfinished(self):
+        f = self.unfinished_filter or {}
+        self.stage.emit(
+            f"扫描未完成报告（最近 {f.get('days', 30)} 天 / "
+            f"{f.get('time_dim', 'report_date')}）..."
+        )
+        from services.scoring.scoring_service import (
+            rescore_unfinished_reports,
+        )
+        res = rescore_unfinished_reports(
+            days=int(f.get("days", 30)),
+            time_dim=str(f.get("time_dim", "report_date")),
+            is_backtest_filter=f.get("is_backtest_filter"),
+            days_back=self.days_back,
+            hit_threshold_pct=self.hit_threshold_pct,
+        )
+        self.finished_result.emit({
+            "mode": "unfinished",
+            "ok": res.ok,
+            "themes_total": res.themes_total,
+            "themes_scored": res.themes_scored,
+            "pairs_attempted": res.pairs_attempted,
+            "pairs_succeeded": res.pairs_succeeded,
+            "days_covered": res.days_covered,
+            "elapsed_ms": res.elapsed_ms,
+            "errors": res.errors[:5],
+            "reports_targeted": res.reports_targeted,
+            "reports_done": res.reports_done,
+            "reports_skipped": res.reports_skipped,
         })
