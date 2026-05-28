@@ -4,7 +4,7 @@
 把它们映射到 ``sectors_top`` 里的板块，作为 ``sectors_top[].catalysts``
 字段填进 MarketSummary。
 
-这是「砍掉 70% AI 推理」的核心，详见 ``_tushare_field_audit.md`` §13：
+这是「砍掉 70% AI 推理」的核心，详见 ``doc/reports/05-26-2126-Tushare接口字段审计.md`` §13：
 
 * ``cls_stock_shock.reason`` 是财联社人工写的涨停原因（不用 AI 推理）。
 * ``cls_stock_shock.plate`` 是 JSON 字符串，含该股关联的所有 CLS 板块。
