@@ -2,7 +2,7 @@
 
 > **修复时间**：2026-05-28 19:30  
 > **影响版本**：`config/ai_config.json::theme_extraction.model = "deepseek-v4-flash"` 的所有调用方（GUI 手动回测页 / AI 分析页 / CLI `backtest_prompt` / 定时任务）  
-> **修复文件**：`core/theme_extractor.py`（1 行判定收紧）  
+> **修复文件**：`core/theme_extractor.py`（1 行判定收紧）+ `services/market/sector_grouping.py` / `services/market/ai_enricher.py`（同款防御性收紧，详见 §3.3）  
 > **诊断手段**：临时调试 CLI `tools/_debug_theme_extract.py`（逐阶段时间戳 + chunk watchdog；定位完根因后按规约用后即删）  
 > **回归**：`tools/test_theme_extract_retry.py` 5/5 + `tools/test_theme_normalize.py` 26/26 全绿  
 > **端到端**：临时 CLI 跑最新 backtest md 32.8s 跑完，13 题材 / 50 标的 / 35 新闻引用入库
@@ -113,6 +113,17 @@ if provider == "deepseek" and model.startswith("deepseek-v4"):
 
 - 19:30 修复：让 flash 模型**不再死寂**（治标本）
 - 18:20 修复：万一真断流时**自动重试 3 次**（兜底）
+
+### 3.3 配套防御（同款一刀切的另外两处）
+
+`startswith("deepseek-v4")` 一刀切的判定**全仓还有两处**，当前没暴露因为它们兜底 model 都是 pro，但任何时候有人把 `ai_config.json::providers.deepseek.model` 或 `market_fetch.model` 改成 flash 就会重蹈覆辙。本次一并收紧：
+
+| 文件 | 行号 | 调用场景 | 收紧方向 |
+|---|---|---|---|
+| `services/market/sector_grouping.py` | 1743→1746 | 板块语义聚类的 LLM 调用 | `startswith("deepseek-v4")` → `startswith("deepseek-v4-pro")` |
+| `services/market/ai_enricher.py` | 519→521 | 板块代码 / 龙虎榜席位富化的 LLM 调用 | 同上 |
+
+主分析 `core/ai_news_analyzer.py::_stream_chat:178` **保留** `startswith("deepseek-v4")`——因为主分析本来就需要根据 `enable_deep_thinking` 切换 `thinking:enabled/disabled`，是真实需要 thinking 能力分支的场景，而不是题材抽取/聚类/富化那种"分类抽取强制关 thinking"的一刀切。
 
 ### 3.3 调试手段（已用完即删）
 

@@ -515,8 +515,11 @@ def _call_chat_json(
         "stream": False,
     }
 
-    # DeepSeek V4 系列默认开启 thinking，AIEnricher 不需要
-    if provider == "deepseek" and model.startswith("deepseek-v4"):
+    # DeepSeek V4 系列默认开启 thinking，AIEnricher 不需要。
+    # 2026-05-28 19:30 hotfix 配套防御：deepseek-v4-flash 不支持 thinking 参数，
+    # 误发会触发 SSE 流死寂（详见 doc/bugfix/05-28-1930-题材抽取thinking误发flash致SSE死寂.md）。
+    # 收紧到只对 pro 显式关 thinking；其他 v4 变体（如 flash/lite）不传。
+    if provider == "deepseek" and model.startswith("deepseek-v4-pro"):
         create_kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
 
     # response_format = json_object，DeepSeek / OpenAI 都支持；不支持时降级即可
