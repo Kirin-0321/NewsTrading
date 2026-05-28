@@ -51,15 +51,15 @@ from __future__ import annotations
 import os
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional, Tuple
 
 from PyQt5.QtCore import QDate, QDateTime, Qt, QTimer
 from PyQt5.QtGui import QColor, QTextCursor
 from PyQt5.QtWidgets import (
     QAbstractItemView, QCheckBox, QComboBox, QDateEdit, QDateTimeEdit,
-    QGroupBox, QHBoxLayout, QHeaderView, QLabel, QMessageBox, QPushButton,
-    QSplitter, QTableWidget, QTableWidgetItem, QTextBrowser,
-    QVBoxLayout, QWidget,
+    QGroupBox, QHBoxLayout, QHeaderView, QLabel, QListWidget,
+    QListWidgetItem, QMessageBox, QPushButton, QSpinBox, QSplitter,
+    QTableWidget, QTableWidgetItem, QTextBrowser, QVBoxLayout, QWidget,
 )
 
 from gui.utils.styles import (
@@ -83,11 +83,20 @@ class ManualBacktestPage(QWidget):
     def __init__(self):
         super().__init__()
         self._suppress_window_signal = False
+        self._suppress_template_signal = False
         self._current_task_id: Optional[int] = None
         self._theme_section_marked_for_task: dict[int, bool] = {}
+        # 当前交易日范围解析结果（YYYYMMDD 列表，升序，已排除今天）
+        self._current_dates_cache: List[str] = []
         self.manager = BacktestTaskManager(self)
         self.init_ui()
+        # spin 与 manager 默认值都是 8；如以后 manager 默认变了，这里同步
+        if self.concurrency_spin.value() != self.manager.get_max_concurrent():
+            self.concurrency_spin.setValue(
+                self.manager.get_max_concurrent()
+            )
         self.load_template_list()
+        self._refresh_dates_count()
         self._apply_default_window()
         self._refresh_preview()
         self._wire_manager_signals()
@@ -109,9 +118,9 @@ class ManualBacktestPage(QWidget):
         layout.addWidget(title)
 
         subtitle = QLabel(
-            "选定 (模板 / 交易日 / 新闻窗 / 新闻状态) → 一键跑单次回测。"
-            "默认窗 = trade_date 14:00 ~ next_open 09:00（主人语义）。"
-            "右边界最大值 = 下一交易日 09:00（硬上限，防穿越）。"
+            "勾选 (模板 ✓多选 / 交易日范围 / 新闻状态) → 一键批量跑回测。"
+            "任务数 = 模板数 × 交易日数。默认窗 = 14:00 ~ next_open 09:00。"
+            "单日时可微调时间窗；多日批量强制走默认窗。"
         )
         subtitle.setStyleSheet("color: #666; font-size: 12px;")
         subtitle.setWordWrap(True)
@@ -136,29 +145,94 @@ class ManualBacktestPage(QWidget):
         layout.addWidget(splitter, 4)
 
     def _build_config_group(self) -> QGroupBox:
+        """回测参数面板：左右两栏布局（2026-05-28 17:55 重构）。
+
+        左栏 ≈ 1/3 宽：模板多选列表 + 全选/全不选/已选 N 按钮组
+        右栏 ≈ 2/3 宽：交易日范围 / 时间窗 / 并发 + 操作按钮（垂直排）
+        """
         group = QGroupBox("回测参数")
-        outer = QVBoxLayout(group)
+        outer = QHBoxLayout(group)
+        outer.setSpacing(12)
 
-        # 第 1 行：模板 + 交易日 + 精选新闻 + 重置默认窗
-        row1 = QHBoxLayout()
-        row1.addWidget(QLabel("模板:"))
-        self.template_combo = QComboBox()
-        self.template_combo.setStyleSheet(COMBOBOX_STYLE)
-        self.template_combo.setMinimumWidth(280)
-        row1.addWidget(self.template_combo)
-        row1.addSpacing(15)
+        # ============================================================
+        # 左栏：模板多选区
+        # ============================================================
+        left_box = QWidget()
+        left_layout = QHBoxLayout(left_box)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(6)
+        left_layout.addWidget(QLabel("模板（✓ 多选）:"))
 
-        row1.addWidget(QLabel("交易日:"))
-        self.date_edit = QDateEdit()
-        self.date_edit.setCalendarPopup(True)
-        self.date_edit.setDisplayFormat("yyyy-MM-dd")
-        self.date_edit.setStyleSheet(INPUT_STYLE)
-        self.date_edit.setMaximumDate(QDate.currentDate())
-        self.date_edit.setDate(QDate.currentDate().addDays(-1))
-        # 改 trade_date 自动重置时间窗为新默认值
-        self.date_edit.dateChanged.connect(self._on_trade_date_changed)
-        row1.addWidget(self.date_edit)
-        row1.addSpacing(15)
+        self.template_list = QListWidget()
+        self.template_list.setSelectionMode(QAbstractItemView.NoSelection)
+        self.template_list.setStyleSheet(
+            "QListWidget { border: 1px solid #d9d9d9; border-radius: 4px; "
+            "padding: 2px; background: white; } "
+            "QListWidget::item { padding: 2px 6px; }"
+        )
+        # 左右布局后纵向空间宽裕，从 110 撑到 160
+        self.template_list.setMinimumHeight(160)
+        self.template_list.setMinimumWidth(280)
+        self.template_list.itemChanged.connect(
+            self._on_template_check_changed
+        )
+        left_layout.addWidget(self.template_list, 1)
+
+        col_btns = QVBoxLayout()
+        col_btns.setSpacing(4)
+        self.tpl_select_all_btn = QPushButton("全选")
+        self.tpl_select_all_btn.clicked.connect(
+            lambda: self._set_all_templates_checked(True)
+        )
+        col_btns.addWidget(self.tpl_select_all_btn)
+        self.tpl_clear_btn = QPushButton("全不选")
+        self.tpl_clear_btn.clicked.connect(
+            lambda: self._set_all_templates_checked(False)
+        )
+        col_btns.addWidget(self.tpl_clear_btn)
+        self.tpl_count_label = QLabel("已选 0")
+        self.tpl_count_label.setStyleSheet("color: #666; font-size: 12px;")
+        self.tpl_count_label.setAlignment(Qt.AlignCenter)
+        col_btns.addWidget(self.tpl_count_label)
+        col_btns.addStretch()
+        left_layout.addLayout(col_btns)
+
+        outer.addWidget(left_box, 1)
+
+        # ============================================================
+        # 右栏：交易日范围 / 时间窗 / 并发 + 按钮（垂直排）
+        # ============================================================
+        right_box = QWidget()
+        right_layout = QVBoxLayout(right_box)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(8)
+
+        # 第 1 行：交易日范围 + 精选新闻 + Provider
+        row_dates = QHBoxLayout()
+        row_dates.addWidget(QLabel("交易日范围:"))
+        self.start_date_edit = QDateEdit()
+        self.start_date_edit.setCalendarPopup(True)
+        self.start_date_edit.setDisplayFormat("yyyy-MM-dd")
+        self.start_date_edit.setStyleSheet(INPUT_STYLE)
+        self.start_date_edit.setMaximumDate(QDate.currentDate())
+        self.start_date_edit.setDate(QDate.currentDate().addDays(-1))
+        self.start_date_edit.dateChanged.connect(self._on_date_range_changed)
+        row_dates.addWidget(self.start_date_edit)
+        row_dates.addWidget(QLabel("~"))
+        self.end_date_edit = QDateEdit()
+        self.end_date_edit.setCalendarPopup(True)
+        self.end_date_edit.setDisplayFormat("yyyy-MM-dd")
+        self.end_date_edit.setStyleSheet(INPUT_STYLE)
+        self.end_date_edit.setMaximumDate(QDate.currentDate())
+        self.end_date_edit.setDate(QDate.currentDate().addDays(-1))
+        self.end_date_edit.dateChanged.connect(self._on_date_range_changed)
+        row_dates.addWidget(self.end_date_edit)
+        self.dates_count_label = QLabel("（— 个交易日）")
+        self.dates_count_label.setStyleSheet(
+            "color: #1890ff; font-size: 12px; padding: 0 8px;"
+        )
+        row_dates.addWidget(self.dates_count_label)
+        row_dates.addSpacing(15)
 
         self.curated_checkbox = QCheckBox("仅精选新闻 (curated)")
         self.curated_checkbox.setChecked(True)
@@ -167,17 +241,23 @@ class ManualBacktestPage(QWidget):
             "取消：用 raw_news 全部（含 rejected / pending）"
         )
         self.curated_checkbox.stateChanged.connect(self._refresh_preview)
-        row1.addWidget(self.curated_checkbox)
-        # 「已存在则覆盖」checkbox 已于 2026-05-27 20:30 hotfix2 移除：
-        # 新策略下 GUI 永远走默认追加（同 (template, date) 多份共存，
-        # 文件名 `_backtest_{tpl}_{HHMMSS}` 自动去重），无需 UI 选项。
-        # 极少数破坏性清空场景请走 `python tools/backtest_prompt.py --overwrite`。
-        row1.addStretch()
-        outer.addLayout(row1)
+        row_dates.addWidget(self.curated_checkbox)
+        row_dates.addSpacing(15)
 
-        # 第 2 行：新闻窗左边界 + 右边界 + 重置默认 + Provider
-        row2 = QHBoxLayout()
-        row2.addWidget(QLabel("新闻窗左边界:"))
+        row_dates.addWidget(QLabel("Provider:"))
+        self.provider_combo = QComboBox()
+        self.provider_combo.setStyleSheet(COMBOBOX_STYLE)
+        self.provider_combo.addItems(["deepseek", "openai", "qwen"])
+        self.provider_combo.setCurrentText("deepseek")
+        self.provider_combo.setMinimumWidth(110)
+        row_dates.addWidget(self.provider_combo)
+        row_dates.addStretch()
+        right_layout.addLayout(row_dates)
+
+        # 第 2 行：新闻窗（仅单日时可调）+ 重置默认
+        row_window = QHBoxLayout()
+        self.window_hint_label = QLabel("时间窗（仅单日有效）:")
+        row_window.addWidget(self.window_hint_label)
         self.news_start_edit = QDateTimeEdit()
         self.news_start_edit.setCalendarPopup(True)
         self.news_start_edit.setDisplayFormat("yyyy-MM-dd HH:mm")
@@ -185,10 +265,10 @@ class ManualBacktestPage(QWidget):
         self.news_start_edit.dateTimeChanged.connect(
             self._on_window_changed
         )
-        row2.addWidget(self.news_start_edit)
-        row2.addSpacing(15)
+        row_window.addWidget(QLabel("左:"))
+        row_window.addWidget(self.news_start_edit)
+        row_window.addSpacing(10)
 
-        row2.addWidget(QLabel("右边界:"))
         self.news_end_edit = QDateTimeEdit()
         self.news_end_edit.setCalendarPopup(True)
         self.news_end_edit.setDisplayFormat("yyyy-MM-dd HH:mm")
@@ -199,8 +279,9 @@ class ManualBacktestPage(QWidget):
         self.news_end_edit.dateTimeChanged.connect(
             self._on_window_changed
         )
-        row2.addWidget(self.news_end_edit)
-        row2.addSpacing(10)
+        row_window.addWidget(QLabel("右:"))
+        row_window.addWidget(self.news_end_edit)
+        row_window.addSpacing(10)
 
         self.reset_window_btn = QPushButton("↺ 默认窗")
         self.reset_window_btn.setStyleSheet(BUTTON_SUCCESS)
@@ -208,52 +289,72 @@ class ManualBacktestPage(QWidget):
             "重置为主人默认：左 = trade_date 14:00 / 右 = next_open 09:00"
         )
         self.reset_window_btn.clicked.connect(self._apply_default_window)
-        row2.addWidget(self.reset_window_btn)
-        row2.addSpacing(15)
+        row_window.addWidget(self.reset_window_btn)
+        row_window.addStretch()
+        right_layout.addLayout(row_window)
 
-        row2.addWidget(QLabel("Provider:"))
-        self.provider_combo = QComboBox()
-        self.provider_combo.setStyleSheet(COMBOBOX_STYLE)
-        self.provider_combo.addItems(["deepseek", "openai", "qwen"])
-        self.provider_combo.setCurrentText("deepseek")
-        self.provider_combo.setMinimumWidth(120)
-        row2.addWidget(self.provider_combo)
-        row2.addStretch()
-        outer.addLayout(row2)
+        # 第 3 行：并发数 + 动作按钮
+        row_actions = QHBoxLayout()
+        row_actions.addWidget(QLabel("并发:"))
+        self.concurrency_spin = QSpinBox()
+        # blockSignals 包住初始 set，避免 setRange/setValue 在 queue_hint_label
+        # 创建前触发 _on_concurrency_changed → AttributeError
+        self.concurrency_spin.blockSignals(True)
+        self.concurrency_spin.setRange(
+            1, BacktestTaskManager.MAX_CONCURRENT_HARD_CAP
+        )
+        self.concurrency_spin.setValue(8)
+        self.concurrency_spin.setSuffix(" 路")
+        self.concurrency_spin.setToolTip(
+            "同时跑几个任务（1~64）。\n"
+            "DeepSeek 付费档实测 8 路稳定，60+ req/min 阈值内可上 32~64；\n"
+            "并发越高 LLM 偶发 5xx 概率轻微上升 + SQLite WAL 写入压力上升，\n"
+            "但失败只影响单个任务，不污染其他。"
+        )
+        self.concurrency_spin.blockSignals(False)
+        self.concurrency_spin.valueChanged.connect(
+            self._on_concurrency_changed
+        )
+        row_actions.addWidget(self.concurrency_spin)
+        row_actions.addSpacing(15)
 
-        # 第 3 行：动作按钮
-        row3 = QHBoxLayout()
         self.refresh_btn = QPushButton("🔄 刷新预览")
         self.refresh_btn.setStyleSheet(BUTTON_PRIMARY)
         self.refresh_btn.clicked.connect(self._refresh_preview)
-        row3.addWidget(self.refresh_btn)
+        row_actions.addWidget(self.refresh_btn)
 
-        self.dry_run_btn = QPushButton("🧪 dry-run 试算（不调 LLM）")
+        self.dry_run_btn = QPushButton("🧪 dry-run 试算")
         self.dry_run_btn.setStyleSheet(BUTTON_SUCCESS)
+        self.dry_run_btn.setToolTip("不调 LLM，仅看 snapshot 是否通")
         self.dry_run_btn.clicked.connect(
             lambda: self._on_run_clicked(dry_run=True)
         )
-        row3.addWidget(self.dry_run_btn)
+        row_actions.addWidget(self.dry_run_btn)
 
-        self.run_btn = QPushButton("🚀 正式跑回测（消耗 LLM）")
+        self.run_btn = QPushButton("🚀 正式跑回测")
         self.run_btn.setStyleSheet(BUTTON_PRIMARY)
         self.run_btn.setToolTip(
-            "支持连点：每次点击都进队列，后台同时跑 8 个，"
-            "其余排队等位"
+            "笛卡尔积：模板数 × 交易日数 = N 任务。\n"
+            "全部入队，按设定的并发数后台跑（消耗 LLM）。"
         )
         self.run_btn.clicked.connect(
             lambda: self._on_run_clicked(dry_run=False)
         )
-        row3.addWidget(self.run_btn, 1)
+        row_actions.addWidget(self.run_btn, 1)
+        right_layout.addLayout(row_actions)
 
-        self.queue_hint_label = QLabel(
-            "📋 多任务模式：连点排队 + 后台 8 并发"
-        )
+        # 第 4 行：任务数提示（横向占满，独立成行避免被按钮挤）
+        row_hint = QHBoxLayout()
+        self.queue_hint_label = QLabel("")
         self.queue_hint_label.setStyleSheet(
-            "color: #888; font-size: 12px; padding: 0 8px;"
+            "color: #1890ff; font-size: 12px; padding: 0 8px;"
         )
-        row3.addWidget(self.queue_hint_label)
-        outer.addLayout(row3)
+        row_hint.addWidget(self.queue_hint_label)
+        row_hint.addStretch()
+        right_layout.addLayout(row_hint)
+
+        right_layout.addStretch()
+        outer.addWidget(right_box, 2)
 
         return group
 
@@ -362,7 +463,7 @@ class ManualBacktestPage(QWidget):
         md_layout = QVBoxLayout(md_box)
         md_layout.setContentsMargins(0, 0, 0, 0)
         md_layout.setSpacing(4)
-        md_layout.addWidget(QLabel("📄 完成后报告 md 预览（最多 8000 字）："))
+        md_layout.addWidget(QLabel("📄 完成后报告 md 预览（完整内容）："))
         self.md_browser = QTextBrowser()
         self.md_browser.setStyleSheet(TEXTBROWSER_STYLE)
         md_layout.addWidget(self.md_browser, 1)
@@ -394,32 +495,94 @@ class ManualBacktestPage(QWidget):
     # =====================================================================
 
     def load_template_list(self):
-        """从 `core.ai_config.AIConfig` 拉所有 analysis 模板。"""
+        """从 `core.ai_config.AIConfig` 拉所有 analysis 模板，填到多选列表。
+
+        保留旧勾选状态（按 template_id 比对），首次加载时默认勾选 ``custom_6``。
+        """
         try:
             from core.ai_config import AIConfig
             config = AIConfig()
             templates = config.get_prompt_templates()
-            self.template_combo.blockSignals(True)
-            self.template_combo.clear()
-            for key, tmpl in templates.items():
-                display_name = tmpl.get("name", key)
-                self.template_combo.addItem(
-                    f"{display_name}  [{key}]", key,
-                )
-            self.template_combo.blockSignals(False)
-            for i in range(self.template_combo.count()):
-                if self.template_combo.itemData(i) == "custom_6":
-                    self.template_combo.setCurrentIndex(i)
-                    break
         except Exception as exc:  # noqa: BLE001
             QMessageBox.warning(
                 self, "加载模板失败",
                 f"无法加载 prompts/analysis/*.md: {exc}",
             )
+            return
+
+        prev_checked = self._collect_checked_template_ids()
+        first_load = self.template_list.count() == 0
+
+        self._suppress_template_signal = True
+        try:
+            self.template_list.clear()
+            for key, tmpl in templates.items():
+                display_name = tmpl.get("name", key)
+                item = QListWidgetItem(f"{display_name}　[{key}]")
+                item.setData(Qt.UserRole, key)
+                item.setData(Qt.UserRole + 1, display_name)
+                item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+                if first_load and not prev_checked:
+                    item.setCheckState(
+                        Qt.Checked if key == "custom_6" else Qt.Unchecked
+                    )
+                else:
+                    item.setCheckState(
+                        Qt.Checked if key in prev_checked else Qt.Unchecked
+                    )
+                self.template_list.addItem(item)
+        finally:
+            self._suppress_template_signal = False
+
+        self._refresh_template_count_label()
+
+    def _collect_checked_template_ids(self) -> set[str]:
+        out: set[str] = set()
+        for i in range(self.template_list.count()):
+            it = self.template_list.item(i)
+            if it.checkState() == Qt.Checked:
+                tid = it.data(Qt.UserRole)
+                if tid:
+                    out.add(str(tid))
+        return out
+
+    def _collect_checked_templates(self) -> List[Tuple[str, str]]:
+        """返回已勾选模板列表 [(template_id, display_label), ...]。"""
+        out: List[Tuple[str, str]] = []
+        for i in range(self.template_list.count()):
+            it = self.template_list.item(i)
+            if it.checkState() == Qt.Checked:
+                tid = str(it.data(Qt.UserRole) or "")
+                label = str(it.data(Qt.UserRole + 1) or tid)
+                if tid:
+                    out.append((tid, label))
+        return out
+
+    def _set_all_templates_checked(self, checked: bool) -> None:
+        self._suppress_template_signal = True
+        try:
+            state = Qt.Checked if checked else Qt.Unchecked
+            for i in range(self.template_list.count()):
+                self.template_list.item(i).setCheckState(state)
+        finally:
+            self._suppress_template_signal = False
+        self._refresh_template_count_label()
+
+    def _on_template_check_changed(self, _item: QListWidgetItem) -> None:
+        if self._suppress_template_signal:
+            return
+        self._refresh_template_count_label()
+
+    def _refresh_template_count_label(self) -> None:
+        n = len(self._collect_checked_template_ids())
+        total = self.template_list.count()
+        self.tpl_count_label.setText(f"已选 {n} / {total}")
+        self._refresh_queue_hint()
 
     def refresh(self):
         """主窗口切换到本页时调用：刷新模板列表 + 默认窗 + 预览。"""
         self.load_template_list()
+        self._refresh_dates_count()
         self._apply_default_window()
         self._refresh_preview()
 
@@ -427,8 +590,14 @@ class ManualBacktestPage(QWidget):
     # 时间窗 / 默认值管理
     # =====================================================================
 
-    def _on_trade_date_changed(self, _date: QDate):
-        """trade_date 变了 → 自动重置时间窗 + 刷预览。"""
+    def _on_date_range_changed(self, _date: QDate):
+        """日期范围变了 → 重算交易日数 + 默认时间窗（以 start 为锚） + 刷预览。"""
+        # 防止 start > end：若主人把 start 调到 end 之后，自动把 end 拉齐
+        if self.start_date_edit.date() > self.end_date_edit.date():
+            self.end_date_edit.blockSignals(True)
+            self.end_date_edit.setDate(self.start_date_edit.date())
+            self.end_date_edit.blockSignals(False)
+        self._refresh_dates_count()
         self._apply_default_window()
         self._refresh_preview()
 
@@ -437,14 +606,95 @@ class ManualBacktestPage(QWidget):
             return
         self._refresh_preview()
 
+    def _on_concurrency_changed(self, n: int) -> None:
+        """主人调并发 spinbox → 通知 manager（manager 内部会 clamp）。"""
+        actual = self.manager.set_max_concurrent(n)
+        if actual != n:
+            self.concurrency_spin.blockSignals(True)
+            try:
+                self.concurrency_spin.setValue(actual)
+            finally:
+                self.concurrency_spin.blockSignals(False)
+        self._refresh_queue_hint()
+
+    def _refresh_queue_hint(self) -> None:
+        """刷新「将创建 N 任务」的提示标签。"""
+        templates = self._collect_checked_templates()
+        n_dates = len(self._current_dates_cache)
+        n_tasks = len(templates) * n_dates
+        conc = self.concurrency_spin.value() if hasattr(
+            self, "concurrency_spin"
+        ) else 8
+        self.queue_hint_label.setText(
+            f"📋 {len(templates)} 模板 × {n_dates} 交易日 = "
+            f"{n_tasks} 任务 / 后台 {conc} 并发"
+        )
+
+    def _refresh_dates_count(self) -> None:
+        """根据当前 (start, end) 解析交易日列表（排除今天），刷新计数标签。"""
+        start_date = self.start_date_edit.date().toString("yyyyMMdd")
+        end_date = self.end_date_edit.date().toString("yyyyMMdd")
+        try:
+            from services.market.trade_date import trade_dates_between
+            from services.market.tushare_client import TushareClient
+            dates = trade_dates_between(
+                start_date, end_date, client=TushareClient(),
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._current_dates_cache = []
+            self.dates_count_label.setText(
+                f"<span style='color:#c00'>解析失败: {exc}</span>"
+            )
+            self._update_window_editability()
+            self._refresh_queue_hint()
+            return
+
+        today_str = datetime.now().strftime("%Y%m%d")
+        dates = [d for d in dates if d != today_str]
+        self._current_dates_cache = dates
+
+        if not dates:
+            self.dates_count_label.setText(
+                "<span style='color:#c80'>（区间内无可用交易日）</span>"
+            )
+        elif len(dates) == 1:
+            self.dates_count_label.setText(f"（单日: {dates[0]}）")
+        else:
+            self.dates_count_label.setText(
+                f"（{len(dates)} 个交易日: {dates[0]}~{dates[-1]}）"
+            )
+        self._update_window_editability()
+        self._refresh_queue_hint()
+
+    def _update_window_editability(self) -> None:
+        """单日 → 时间窗可调；多日 → 灰掉时间窗 + 默认窗按钮。"""
+        single_day = len(self._current_dates_cache) <= 1
+        for w in (
+            self.news_start_edit, self.news_end_edit,
+            self.reset_window_btn,
+        ):
+            w.setEnabled(single_day)
+        if single_day:
+            self.window_hint_label.setText("时间窗（单日可微调）:")
+            self.window_hint_label.setStyleSheet("")
+        else:
+            self.window_hint_label.setText(
+                "时间窗（多日批量 → 强制默认窗）:"
+            )
+            self.window_hint_label.setStyleSheet("color: #999;")
+
     def _apply_default_window(self):
         """按主人语义重算默认窗 + 右边界硬上限，刷到两个 datetime 控件。
 
-        - 左 = trade_date 14:00
-        - 右 = next_trade_date(trade_date) 09:00
+        - 左 = start_date 14:00
+        - 右 = next_trade_date(start_date) 09:00
         - 右边界 QDateTimeEdit.setMaximumDateTime = 同一个上限
+
+        多日批量场景下时间窗已被禁用，本函数只对锚点日 (start) 算一次默认值
+        让 GUI 显示有意义的初值，实际入队时会按各日重算（见
+        :func:`_resolve_per_date_window`）。
         """
-        trade_date = self.date_edit.date().toString("yyyyMMdd")
+        trade_date = self.start_date_edit.date().toString("yyyyMMdd")
         try:
             from services.market.tushare_client import TushareClient
             from services.scoring.snapshot import (
@@ -484,9 +734,17 @@ class ManualBacktestPage(QWidget):
     # =====================================================================
 
     def _current_inputs(self) -> dict:
+        """汇总当前 GUI 输入。
+
+        多模板/多日批量入口返回的 ``trade_date`` 取「锚点日 = start_date」，
+        仅供时间窗预览用；真正入队时按 ``self._current_dates_cache`` 笛卡尔积
+        + 每日重算时间窗（见 :func:`_resolve_per_date_window`）。
+        """
+        templates = self._collect_checked_templates()
         return {
-            "template_id": self.template_combo.currentData() or "",
-            "trade_date": self.date_edit.date().toString("yyyyMMdd"),
+            "templates": templates,                  # [(tid, label), ...]
+            "dates": list(self._current_dates_cache),  # YYYYMMDD 列表
+            "trade_date": self.start_date_edit.date().toString("yyyyMMdd"),
             "news_start_dt": self.news_start_edit.dateTime().toPyDateTime(),
             "news_end_dt": self.news_end_edit.dateTime().toPyDateTime(),
             "news_status": (
@@ -498,13 +756,16 @@ class ManualBacktestPage(QWidget):
     def _refresh_preview(self):
         """调 ``tools.snapshot_inspect.inspect_snapshot`` 渲染时间边界。
 
+        多日批量场景仅按 **锚点日 = start_date** 渲染时间边界示例，
+        让主人对默认窗有直观印象；真正入队时按各日重算。
+
         注意：这是同步调用，但 snapshot 重建本身只读 SQLite ~100ms 完成，
         不会卡住 GUI。
         """
         inputs = self._current_inputs()
-        if not inputs["template_id"]:
+        if not inputs["templates"]:
             self.preview_browser.setHtml(
-                "<i style='color:#999'>（请先选择模板）</i>"
+                "<i style='color:#999'>（请先勾选至少一个模板）</i>"
             )
             return
 
@@ -573,52 +834,147 @@ class ManualBacktestPage(QWidget):
     # 跑回测
     # =====================================================================
 
-    def _on_run_clicked(self, *, dry_run: bool):
-        """连点 N 次跑按钮：每次点击都把任务进队列，后台 8 并发跑。
+    def _resolve_per_date_window(
+        self, trade_date: str,
+    ) -> Optional[Tuple[datetime, datetime]]:
+        """对单个 trade_date 算「主人默认窗」：(14:00, next_open 09:00)。
 
-        2026-05-27 多任务队列改造：取消「已有一个在跑就拒绝」的串行锁，
-        改为无条件 enqueue；并发上限由 BacktestTaskManager 管理。
+        失败返回 None，调用方负责跳过该日 + 收集 errors。
+        """
+        try:
+            from services.market.tushare_client import TushareClient
+            from services.scoring.snapshot import (
+                compute_default_news_window,
+            )
+            return compute_default_news_window(
+                trade_date, client=TushareClient(),
+            )
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _on_run_clicked(self, *, dry_run: bool):
+        """笛卡尔积入队：勾选模板 × 解析交易日 = N 任务全部进队列。
+
+        - 单日（len(dates) == 1）：可用主人手填的时间窗（含微调）
+        - 多日批量：每日按 (14:00, next_open 09:00) 默认窗算
+
+        2026-05-28 批量改造：取消单模板单日的限制，改为多模板多日笛卡尔积。
+        并发上限继续由 BacktestTaskManager 管理（已支持运行时调）。
         """
         inputs = self._current_inputs()
-        if not inputs["template_id"]:
-            QMessageBox.warning(self, "缺参数", "请先选择模板")
+        templates = inputs["templates"]
+        dates = inputs["dates"]
+        if not templates:
+            QMessageBox.warning(self, "缺参数", "请先勾选至少一个模板")
             return
-
-        if inputs["news_end_dt"] > datetime.now():
+        if not dates:
             QMessageBox.warning(
-                self, "穿越保护",
-                f"news_end_dt={inputs['news_end_dt']} 还在未来，"
-                "不能回测未来时间窗",
-            )
-            return
-        if inputs["news_start_dt"] >= inputs["news_end_dt"]:
-            QMessageBox.warning(
-                self, "参数错误",
-                f"news_start_dt({inputs['news_start_dt']}) >= "
-                f"news_end_dt({inputs['news_end_dt']})",
+                self, "缺参数",
+                "解析后无可用交易日，请检查日期范围（今天会被自动排除）"
             )
             return
 
-        # 取下拉框当前显示文本作为友好标签（去掉" [key]"后缀）
-        raw_label = self.template_combo.currentText()
-        tmpl_label = raw_label.split("  [")[0] if raw_label else (
-            inputs["template_id"]
+        single_day = len(dates) == 1
+
+        # 单日时复用主人手填的时间窗，需做穿越/逆序校验
+        if single_day:
+            if inputs["news_end_dt"] > datetime.now():
+                QMessageBox.warning(
+                    self, "穿越保护",
+                    f"news_end_dt={inputs['news_end_dt']} 还在未来，"
+                    "不能回测未来时间窗",
+                )
+                return
+            if inputs["news_start_dt"] >= inputs["news_end_dt"]:
+                QMessageBox.warning(
+                    self, "参数错误",
+                    f"news_start_dt({inputs['news_start_dt']}) >= "
+                    f"news_end_dt({inputs['news_end_dt']})",
+                )
+                return
+
+        n_tasks = len(templates) * len(dates)
+
+        # 任务量大时弹一次确认（≥ 5 任务，避免主人手抖跑爆 API 配额）
+        if n_tasks >= 5 and not dry_run:
+            tmpl_names = "、".join(label for _tid, label in templates[:3])
+            if len(templates) > 3:
+                tmpl_names += f" 等 {len(templates)} 个"
+            reply = QMessageBox.question(
+                self, "确认批量回测",
+                f"将创建 <b>{n_tasks}</b> 个任务<br>"
+                f"&nbsp;&nbsp;模板（{len(templates)}）：{tmpl_names}<br>"
+                f"&nbsp;&nbsp;交易日（{len(dates)}）："
+                f"{dates[0]} ~ {dates[-1]}<br>"
+                f"&nbsp;&nbsp;时间窗：{'手填（单日）' if single_day else '主人默认（每日 14:00 ~ next_open 09:00）'}<br>"
+                f"&nbsp;&nbsp;并发：{self.concurrency_spin.value()} 路<br><br>"
+                f"将消耗 ~{n_tasks} 次 LLM 调用，确认继续？",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                return
+
+        # 批量解析每日窗口（多日时）。失败的 (date) 收集起来一并提示。
+        per_date_window: dict[str, Tuple[datetime, datetime]] = {}
+        failed_dates: List[str] = []
+        if single_day:
+            per_date_window[dates[0]] = (
+                inputs["news_start_dt"], inputs["news_end_dt"],
+            )
+        else:
+            for d in dates:
+                w = self._resolve_per_date_window(d)
+                if w is None:
+                    failed_dates.append(d)
+                else:
+                    # 多日的「未来穿越」防御：next_open 09:00 不能在未来
+                    # （比如选了今天，next_open 还没到）
+                    if w[1] > datetime.now():
+                        failed_dates.append(d + "(未来)")
+                        continue
+                    per_date_window[d] = w
+            if failed_dates:
+                QMessageBox.warning(
+                    self, "部分日期解析失败",
+                    f"以下 {len(failed_dates)} 个日期会被跳过：\n"
+                    f"  {', '.join(failed_dates[:10])}"
+                    + ("..." if len(failed_dates) > 10 else "")
+                    + "\n\n剩余日期继续入队"
+                )
+            if not per_date_window:
+                QMessageBox.warning(
+                    self, "无可用日期",
+                    "所有日期都解析失败，已取消入队"
+                )
+                return
+
+        # 笛卡尔积入队
+        prefix = "[dry-run] " if dry_run else ""
+        enqueued = 0
+        for tid, label in templates:
+            for d in dates:
+                if d not in per_date_window:
+                    continue
+                start_dt, end_dt = per_date_window[d]
+                self.manager.enqueue({
+                    "template_id": tid,
+                    "template_label": f"{prefix}{label}",
+                    "trade_date": d,
+                    "news_start_dt": start_dt,
+                    "news_end_dt": end_dt,
+                    "news_status": inputs["news_status"],
+                    "provider": inputs["provider"],
+                    "overwrite": False,
+                    "dry_run": dry_run,
+                })
+                enqueued += 1
+
+        # 入队完成提示（任务列表会自动选中最后一个；此处仅给个状态行）
+        self.status_label.setText(
+            f"<span style='color:#1890ff'>📋 已入队 {enqueued} 个任务"
+            f"（{len(templates)} 模板 × {len(dates)} 交易日，"
+            f"跳过 {len(failed_dates)}）</span>"
         )
-        if dry_run:
-            tmpl_label = f"[dry-run] {tmpl_label}"
-
-        # 入队（manager 内部决定立即跑还是 PENDING）
-        self.manager.enqueue({
-            "template_id": inputs["template_id"],
-            "template_label": tmpl_label,
-            "trade_date": inputs["trade_date"],
-            "news_start_dt": inputs["news_start_dt"],
-            "news_end_dt": inputs["news_end_dt"],
-            "news_status": inputs["news_status"],
-            "provider": inputs["provider"],
-            "overwrite": False,
-            "dry_run": dry_run,
-        })
 
     # =====================================================================
     # 任务列表 ↔ 下方三块联动（2026-05-27 多任务队列改造）
@@ -920,7 +1276,7 @@ class ManualBacktestPage(QWidget):
     # =====================================================================
 
     def _render_md(self, report_path: str):
-        """读 md 文件前 8000 字显示。"""
+        """读 md 文件完整内容显示（2026-05-28 移除 8000 字截断）。"""
         from services.storage.database import get_project_root
         abs_path = Path(get_project_root()) / report_path
         if not abs_path.exists():
@@ -935,12 +1291,7 @@ class ManualBacktestPage(QWidget):
                 f"<span style='color:#c00'>读取失败: {exc}</span>"
             )
             return
-        truncated = text[:8000]
-        suffix = (
-            f"\n\n...（共 {len(text)} 字，仅显示前 8000）"
-            if len(text) > 8000 else ""
-        )
-        self.md_browser.setMarkdown(truncated + suffix)
+        self.md_browser.setMarkdown(text)
 
     def _render_themes(self, report_path: str):
         """从 ai_inference.db 反查这份 md 抽到的题材。"""

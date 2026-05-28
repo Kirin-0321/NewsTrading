@@ -219,6 +219,10 @@ class BacktestTaskManager(QObject):
     # 类默认值（2026-05-27 21:30 hotfix：3 → 8）。
     # 通过 __init__(max_concurrent=...) 可覆盖（测试用）。
     _DEFAULT_MAX_CONCURRENT: int = 8
+    # 硬上限（2026-05-28 17:55 主人指令：16 → 64）。
+    # 实测 DeepSeek 付费档可承受 60+ req/min；64 路并发对应 ~60 req/min
+    # 仍在阈值内，主要瓶颈转为 LLM 5xx 偶发概率与本机 SQLite WAL 写入。
+    MAX_CONCURRENT_HARD_CAP: int = 64
 
     def __init__(
         self,
@@ -328,6 +332,28 @@ class BacktestTaskManager(QObject):
     def has_active(self) -> bool:
         """是否还有未到终态的任务（PENDING + RUNNING）。供页面退出时判断用。"""
         return any(not t.is_terminal for t in self._tasks.values())
+
+    def get_max_concurrent(self) -> int:
+        """当前并发上限（GUI 显示用）。"""
+        return self._max_concurrent
+
+    def set_max_concurrent(self, n: int) -> int:
+        """运行时调整并发上限。
+
+        Args:
+            n: 期望并发数（会被 clamp 到 [1, MAX_CONCURRENT_HARD_CAP]）
+
+        Returns:
+            实际生效的并发数
+
+        语义：
+            * 调大 → 立即 _pump 把 PENDING 拉起来填满空位
+            * 调小 → 不强杀已 RUNNING 的任务，等它们自然结束后停止派新单
+        """
+        n = max(1, min(int(n), self.MAX_CONCURRENT_HARD_CAP))
+        self._max_concurrent = n
+        self._pump()
+        return n
 
     def shutdown(self) -> None:
         """关 GUI 时调用：取消所有 PENDING，让 RUNNING 自然结束。

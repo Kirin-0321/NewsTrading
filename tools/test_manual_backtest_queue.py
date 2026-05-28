@@ -420,6 +420,95 @@ def case_09_fifo_order():
     _ok("case_09_fifo_order")
 
 
+def case_12_set_max_concurrent_grow():
+    """运行时调大并发：5 任务 / 初始 max=2 → 调到 5 → 立即全部 RUNNING。"""
+    _reset_fake()
+    _fake_config["sleep"] = 0.6
+    mgr = BacktestTaskManager(max_concurrent=2)
+    for i in range(1, 6):
+        mgr.enqueue(_make_kwargs("grow", f"2026070{i}"))
+
+    running = [t for t in mgr.list_tasks() if t.status == TaskStatus.RUNNING]
+    pending = [t for t in mgr.list_tasks() if t.status == TaskStatus.PENDING]
+    if len(running) != 2 or len(pending) != 3:
+        _err(
+            "case_12",
+            f"初始 RUNNING={len(running)} PENDING={len(pending)}，期望 2/3"
+        )
+        return
+
+    actual = mgr.set_max_concurrent(5)
+    if actual != 5:
+        _err("case_12", f"set_max_concurrent 返回 {actual}，期望 5")
+        return
+    QCoreApplication.instance().processEvents()
+    running = [t for t in mgr.list_tasks() if t.status == TaskStatus.RUNNING]
+    pending = [t for t in mgr.list_tasks() if t.status == TaskStatus.PENDING]
+    if len(running) != 5 or pending:
+        _err(
+            "case_12",
+            f"扩容后 RUNNING={len(running)} PENDING={len(pending)}，期望 5/0"
+        )
+        return
+    _wait_until(lambda: not mgr.has_active(), timeout_s=10)
+    _ok("case_12_set_max_concurrent_grow (2 → 5 立即拉满)")
+
+
+def case_13_set_max_concurrent_shrink():
+    """运行时调小并发：不强杀 RUNNING；新 PENDING 不再被派给空位。"""
+    _reset_fake()
+    _fake_config["sleep"] = 0.5
+    mgr = BacktestTaskManager(max_concurrent=4)
+    for i in range(1, 5):
+        mgr.enqueue(_make_kwargs("shrink", f"2026080{i}"))
+
+    running = [t for t in mgr.list_tasks() if t.status == TaskStatus.RUNNING]
+    if len(running) != 4:
+        _err("case_13", f"初始 RUNNING={len(running)}，期望 4")
+        return
+
+    mgr.set_max_concurrent(1)
+    mgr.enqueue(_make_kwargs("shrink", "20260810"))
+    mgr.enqueue(_make_kwargs("shrink", "20260811"))
+    QCoreApplication.instance().processEvents()
+    running = [t for t in mgr.list_tasks() if t.status == TaskStatus.RUNNING]
+    pending = [t for t in mgr.list_tasks() if t.status == TaskStatus.PENDING]
+    if len(running) != 4:
+        _err(
+            "case_13",
+            f"shrink 后 RUNNING={len(running)}，应保留所有原 RUNNING（=4）"
+        )
+        return
+    if len(pending) != 2:
+        _err(
+            "case_13",
+            f"shrink 后 PENDING={len(pending)}，期望 2"
+        )
+        return
+
+    _wait_until(lambda: not mgr.has_active(), timeout_s=15)
+    _ok("case_13_set_max_concurrent_shrink (4 → 1 不杀 RUNNING)")
+
+
+def case_14_set_max_concurrent_clamp():
+    """超出 [1, HARD_CAP] 范围 → 自动 clamp，返回实际生效值。"""
+    mgr = BacktestTaskManager()
+    cap = BacktestTaskManager.MAX_CONCURRENT_HARD_CAP
+    a1 = mgr.set_max_concurrent(0)
+    a2 = mgr.set_max_concurrent(-100)
+    a3 = mgr.set_max_concurrent(cap + 50)
+    if a1 != 1:
+        _err("case_14", f"clamp(0) → {a1}，期望 1")
+        return
+    if a2 != 1:
+        _err("case_14", f"clamp(-100) → {a2}，期望 1")
+        return
+    if a3 != cap:
+        _err("case_14", f"clamp(cap+50) → {a3}，期望 {cap}")
+        return
+    _ok(f"case_14_set_max_concurrent_clamp (clamp 到 [1, {cap}])")
+
+
 def case_10_signals_emitted():
     """串一遍：task_added / task_started / task_finished 都得 emit。"""
     _reset_fake()
@@ -466,6 +555,9 @@ def main() -> int:
         case_09_fifo_order,
         case_10_signals_emitted,
         case_11_default_concurrency_is_8,
+        case_12_set_max_concurrent_grow,
+        case_13_set_max_concurrent_shrink,
+        case_14_set_max_concurrent_clamp,
     ]
     print(f"[plan] {len(cases)} 用例")
     for fn in cases:
