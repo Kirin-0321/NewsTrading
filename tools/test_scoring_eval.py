@@ -45,7 +45,7 @@ from __future__ import annotations
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Callable, List, Tuple
+from typing import Callable, Dict, List, Tuple
 
 _ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_ROOT))
@@ -1116,6 +1116,10 @@ def case_21_theme_eval_uses_sector_pct() -> None:
 
     夹具刻意把 sector_pct=10 / stock_weighted_pct=99，得到 d1=10 即说明 SQL
     切到 sector_pct 字段了。
+
+    **2026-05-29 重设**：strength_score <= 0 的题材（T_short / T_neutral）
+    被 SQL 过滤，应只剩 2 个看多题材；且按 strength DESC 排序
+    （T_strong=80 在前，T_weak=40 在后）。
     """
     _cleanup_weighted()
     _seed_weighted_dataset()
@@ -1132,12 +1136,25 @@ def case_21_theme_eval_uses_sector_pct() -> None:
             ).fetchone()
         assert ar is not None
         themes = get_theme_eval_for_report(int(ar["id"]))
-        # 4 个题材
-        assert len(themes) == 4, f"期望 4 个题材，得到 {len(themes)}"
+        # 2026-05-29 重设：strength<=0 过滤后只剩 2 个看多题材
+        assert len(themes) == 2, (
+            f"strength>0 过滤后应只剩 2 个看多题材，得到 {len(themes)}"
+        )
+        # 排序：strength DESC → T_strong (80) 在前，T_weak (40) 在后
+        assert themes[0]["strength_score"] == 80, (
+            f"第 1 个应是 strength=80 的 T_strong，得到 {themes[0]}"
+        )
+        assert themes[1]["strength_score"] == 40, (
+            f"第 2 个应是 strength=40 的 T_weak，得到 {themes[1]}"
+        )
+        # 验证没有 strength<=0 的题材混入
+        for t in themes:
+            assert t["strength_score"] > 0, (
+                f"strength<=0 题材不应出现：{t}"
+            )
         for t in themes:
             d1 = t.get("d1")
             sw = t.get("sector_pct_avg")  # 也是 sector_pct 算出来
-            # T_strong=10, T_weak=2, T_short=-3, T_neutral=5
             assert d1 is not None, f"题材 {t['theme_name']} d1 不应为 None"
             assert d1 != 99.0, (
                 f"题材 d1={d1}，应来自 sector_pct（不是 stock_weighted_pct=99）"
@@ -1280,6 +1297,309 @@ def case_24_report_eval_all_short_returns_null() -> None:
         _cleanup_weighted()
 
 
+# ---------------------------------------------------------------------------
+# 2026-05-29 命中率与方向算法重设·聚合层专项用例
+# ---------------------------------------------------------------------------
+
+
+def _seed_hit_dir_dataset() -> None:
+    """专门为 case_25~28 构造的小夹具（前缀 TEST_HD_）。
+
+    构造：
+        - 1 份回测报告 prompt_id=TEST_HD_P / version=v1
+        - 1 个看多题材 strength=+60，配 2 只标的 + 3 天打分行 + 6 条标的明细
+          * D+1: stock1 hit=1, stock2 hit=0；theme_pct=+1.0%
+          * D+2: stock1 hit=1, stock2 hit=1；theme_pct=+0.5%
+          * D+3: stock1 hit=NULL（pct_chg 缺失）, stock2 hit=0；theme_pct=-2.0%
+          * direction_correct（取 D+3）= 累计 1.01 * 1.005 * 0.98 ≈ 0.9949 < 1 → 0
+        - 1 个看空题材 strength=-30（用于验证利空过滤）
+        - 1 个中性题材 strength=0（用于验证利空过滤）
+
+    期望聚合：
+        - 标的 stock1：命中率 = 2/2 = 1.0（有效天=2，命中=2，D+3 NULL 不计）
+        - 标的 stock2：命中率 = 1/3 ≈ 0.333
+        - 题材命中率 = (1.0 + 0.333) / 2 = 0.667
+        - 题材方向（取 D+3）= 0（累计 < 1）
+        - 报告命中率 = 0.667（只看 strength>0 题材）
+        - 报告方向 = 0/1 = 0
+    """
+    from services.storage.ai_inference_db import get_ai_inference_db
+    now_iso = datetime.now().isoformat(timespec="seconds")
+    today = datetime.now()
+    rdate = (today - timedelta(days=5)).strftime("%Y%m%d")
+    file_path = "data/AI_analysis/TEST_HD_r1.md"
+
+    ai = get_ai_inference_db()
+    with ai.connect() as conn:
+        cur = conn.execute(
+            "INSERT INTO ai_reports "
+            "(report_date, file_path, provider, model, "
+            " prompt_category, prompt_id, prompt_version, "
+            " news_count, theme_extracted, is_backtest, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                rdate, file_path, "mock", "mock-model",
+                "analysis", "TEST_HD_P", "v1", 3, 1, 1, now_iso,
+            ),
+        )
+        report_id = int(cur.lastrowid)
+
+        # 3 个题材
+        themes_meta = [
+            ("TEST_HD_T_long", 60),
+            ("TEST_HD_T_short", -30),
+            ("TEST_HD_T_neutral", 0),
+        ]
+        theme_ids: Dict[str, int] = {}
+        for tname, ss in themes_meta:
+            tcur = conn.execute(
+                "INSERT INTO theme_predictions "
+                "(report_id, report_date, report_path, theme_name, "
+                " strength_score, strength_level, reason, prompt_id, "
+                " prompt_version, is_backtest, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    f"TEST_HD_rep_{report_id}",
+                    rdate, file_path, tname, ss,
+                    "测试", "测试 reason", "TEST_HD_P", "v1", 1, now_iso,
+                ),
+            )
+            theme_ids[tname] = int(tcur.lastrowid)
+
+        long_tid = theme_ids["TEST_HD_T_long"]
+
+        # 看多题材绑 2 只标的
+        stock_codes = [("S1_LONG.SH",), ("S2_LONG.SH",)]
+        stock_ids: List[int] = []
+        for (code,) in stock_codes:
+            scur = conn.execute(
+                "INSERT INTO theme_stocks "
+                "(theme_id, stock_name, stock_code, normalized_code) "
+                "VALUES (?, ?, ?, ?)",
+                (long_tid, f"个股{code}", code, code),
+            )
+            stock_ids.append(int(scur.lastrowid))
+
+        # 看多题材 3 天打分行
+        sd_d1 = (today - timedelta(days=4)).strftime("%Y%m%d")
+        sd_d2 = (today - timedelta(days=3)).strftime("%Y%m%d")
+        sd_d3 = (today - timedelta(days=2)).strftime("%Y%m%d")
+        score_pacts = [
+            # (score_date, days_offset, theme_pct, direction_correct)
+            (sd_d1, 1, 1.0, 1),    # 累计 1.01 > 1 → 1
+            (sd_d2, 2, 0.5, 1),    # 累计 1.01*1.005 ≈ 1.015 > 1 → 1
+            (sd_d3, 3, -2.0, 0),   # 累计 1.015 * 0.98 ≈ 0.9947 < 1 → 0
+        ]
+        for sd, off, tpct, dc in score_pacts:
+            conn.execute(
+                "INSERT INTO theme_prediction_scores "
+                "(theme_id, prompt_id, prompt_version, report_date, "
+                " score_date, days_offset, sector_pct, stock_avg_pct, "
+                " stock_weighted_pct, theme_pct, hit_count, total_count, "
+                " hit_rate, benchmark_pct, benchmark_zz1000_pct, "
+                " direction_correct, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    long_tid, "TEST_HD_P", "v1", rdate, sd, off,
+                    tpct, tpct, tpct, tpct,
+                    1, 2, 0.5, 0.0, 0.5,
+                    dc, now_iso,
+                ),
+            )
+
+        # 标的明细 6 行：D+1 / D+2 / D+3 × 2 标的
+        # 主人设定：
+        #   stock1（S1_LONG）：D+1 hit=1, D+2 hit=1, D+3 hit=NULL（缺数据）
+        #   stock2（S2_LONG）：D+1 hit=0, D+2 hit=1, D+3 hit=0
+        # → stock1 累计命中率 = 2/2 = 1.0；stock2 累计命中率 = 1/3
+        # → 题材命中率 = (1.0 + 0.333) / 2 ≈ 0.667
+        details = [
+            # (theme_stock_id, normalized_code, score_date, off, pct, is_hit)
+            (stock_ids[0], "S1_LONG.SH", sd_d1, 1, 5.0, 1),
+            (stock_ids[0], "S1_LONG.SH", sd_d2, 2, 4.0, 1),
+            (stock_ids[0], "S1_LONG.SH", sd_d3, 3, None, None),
+            (stock_ids[1], "S2_LONG.SH", sd_d1, 1, 0.5, 0),
+            (stock_ids[1], "S2_LONG.SH", sd_d2, 2, 6.0, 1),
+            (stock_ids[1], "S2_LONG.SH", sd_d3, 3, -1.0, 0),
+        ]
+        for ts_id, code, sd, off, pct, hit in details:
+            conn.execute(
+                "INSERT INTO theme_stock_scores "
+                "(theme_stock_id, theme_id, normalized_code, "
+                " report_date, score_date, days_offset, pct_chg, is_hit, "
+                " created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (ts_id, long_tid, code, rdate, sd, off, pct, hit, now_iso),
+            )
+
+
+def _cleanup_hit_dir() -> None:
+    from services.storage.ai_inference_db import get_ai_inference_db
+    ai = get_ai_inference_db()
+    with ai.connect() as conn:
+        conn.execute(
+            "DELETE FROM theme_stock_scores "
+            "WHERE theme_id IN ("
+            "  SELECT id FROM theme_predictions "
+            "  WHERE prompt_id LIKE 'TEST_HD_%')"
+        )
+        conn.execute(
+            "DELETE FROM theme_prediction_scores "
+            "WHERE prompt_id LIKE 'TEST_HD_%'"
+        )
+        conn.execute(
+            "DELETE FROM theme_stocks "
+            "WHERE theme_id IN ("
+            "  SELECT id FROM theme_predictions "
+            "  WHERE prompt_id LIKE 'TEST_HD_%')"
+        )
+        conn.execute(
+            "DELETE FROM theme_predictions "
+            "WHERE prompt_id LIKE 'TEST_HD_%'"
+        )
+        conn.execute(
+            "DELETE FROM ai_reports WHERE prompt_id LIKE 'TEST_HD_%'"
+        )
+
+
+def case_25_theme_filter_skips_short_neutral() -> None:
+    """**2026-05-29 重设** get_theme_eval_for_report 过滤 strength<=0 题材。
+
+    夹具有 3 题材（+60 / -30 / 0），新 SQL 应只返回 1 个看多题材。
+    """
+    _cleanup_hit_dir()
+    _seed_hit_dir_dataset()
+    try:
+        from services.storage.ai_inference_db import get_ai_inference_db
+        from services.scoring.scoring_service import (
+            get_theme_eval_for_report,
+        )
+        ai = get_ai_inference_db()
+        with ai.connect(readonly=True) as conn:
+            ar = conn.execute(
+                "SELECT id FROM ai_reports WHERE prompt_id = ?",
+                ("TEST_HD_P",),
+            ).fetchone()
+        assert ar is not None
+        themes = get_theme_eval_for_report(int(ar["id"]))
+        assert len(themes) == 1, (
+            f"strength>0 过滤后应剩 1 题材，得到 {len(themes)}"
+        )
+        assert themes[0]["strength_score"] == 60
+        assert themes[0]["theme_name"] == "TEST_HD_T_long"
+    finally:
+        _cleanup_hit_dir()
+
+
+def case_26_theme_hit_and_direction_cumulative() -> None:
+    """**2026-05-29 重设** 题材级 hit_rate_avg + direction_correct_rate 新口径。
+
+    期望（基于夹具）：
+        - hit_rate_avg = (1.0 + 1/3) / 2 ≈ 0.6667
+          （stock1=2/2=1.0、stock2=1/3 ≈ 0.333）
+        - direction_correct_rate = 0（D+3 行 direction_correct=0）
+    """
+    _cleanup_hit_dir()
+    _seed_hit_dir_dataset()
+    try:
+        from services.storage.ai_inference_db import get_ai_inference_db
+        from services.scoring.scoring_service import (
+            get_theme_eval_for_report,
+        )
+        ai = get_ai_inference_db()
+        with ai.connect(readonly=True) as conn:
+            ar = conn.execute(
+                "SELECT id FROM ai_reports WHERE prompt_id = ?",
+                ("TEST_HD_P",),
+            ).fetchone()
+        assert ar is not None
+        themes = get_theme_eval_for_report(int(ar["id"]))
+        assert len(themes) == 1
+        t = themes[0]
+        hr = t.get("hit_rate_avg")
+        dr = t.get("direction_correct_rate")
+        expected_hr = (1.0 + 1.0 / 3) / 2  # ≈ 0.6667
+        assert hr is not None and abs(hr - expected_hr) < 1e-6, (
+            f"题材命中率期望 {expected_hr}，得到 {hr}"
+        )
+        assert dr == 0, (
+            f"题材方向（取 D+3 行 direction_correct=0）期望 0，得到 {dr}"
+        )
+    finally:
+        _cleanup_hit_dir()
+
+
+def case_27_report_eval_hit_dir_new_semantics() -> None:
+    """**2026-05-29 重设** get_report_eval.hit_rate_avg / direction_correct_rate 新口径。
+
+    只有 1 个看多题材打分 → 报告命中率 = 题材命中率 ≈ 0.667；
+    报告方向 = 题材方向 = 0。
+    """
+    _cleanup_hit_dir()
+    _seed_hit_dir_dataset()
+    try:
+        from services.scoring.scoring_service import get_report_eval
+        rows = get_report_eval(days=30, prompt_id="TEST_HD_P")
+        assert len(rows) == 1, f"应找到 1 份报告，得到 {len(rows)}"
+        r = rows[0]
+        hr = r.get("hit_rate_avg")
+        dr = r.get("direction_correct_rate")
+        expected_hr = (1.0 + 1.0 / 3) / 2
+        assert hr is not None and abs(hr - expected_hr) < 1e-6, (
+            f"报告命中率期望 {expected_hr}，得到 {hr}"
+        )
+        assert dr is not None and abs(float(dr) - 0.0) < 1e-9, (
+            f"报告方向期望 0（看多题材方向=0），得到 {dr}"
+        )
+    finally:
+        _cleanup_hit_dir()
+
+
+def case_28_stock_eval_returns_stock_hit_rate() -> None:
+    """**2026-05-29 重设** get_stock_scores_for_theme 新增 stock_hit_rate / valid_days。
+
+    期望：
+        - S1_LONG: valid_days=2, stock_hit_rate=1.0
+        - S2_LONG: valid_days=3, stock_hit_rate=1/3 ≈ 0.333
+    """
+    _cleanup_hit_dir()
+    _seed_hit_dir_dataset()
+    try:
+        from services.storage.ai_inference_db import get_ai_inference_db
+        from services.scoring.scoring_service import (
+            get_stock_scores_for_theme,
+        )
+        ai = get_ai_inference_db()
+        with ai.connect(readonly=True) as conn:
+            tp = conn.execute(
+                "SELECT id FROM theme_predictions "
+                "WHERE theme_name = ?",
+                ("TEST_HD_T_long",),
+            ).fetchone()
+        assert tp is not None
+        stocks = get_stock_scores_for_theme(int(tp["id"]))
+        assert len(stocks) == 2, f"应有 2 只标的，得到 {len(stocks)}"
+        by_code = {s["normalized_code"]: s for s in stocks}
+        s1 = by_code["S1_LONG.SH"]
+        s2 = by_code["S2_LONG.SH"]
+        assert s1.get("valid_days") == 2, (
+            f"S1 有效天数应 2，得到 {s1.get('valid_days')}"
+        )
+        assert (
+            s1.get("stock_hit_rate") is not None
+            and abs(s1["stock_hit_rate"] - 1.0) < 1e-9
+        ), f"S1 命中率应 1.0，得到 {s1.get('stock_hit_rate')}"
+        assert s2.get("valid_days") == 3, (
+            f"S2 有效天数应 3，得到 {s2.get('valid_days')}"
+        )
+        assert (
+            s2.get("stock_hit_rate") is not None
+            and abs(s2["stock_hit_rate"] - 1.0 / 3) < 1e-6
+        ), f"S2 命中率应 1/3，得到 {s2.get('stock_hit_rate')}"
+    finally:
+        _cleanup_hit_dir()
+
+
 _CASES: List[Tuple[str, Callable[[], None]]] = [
     ("01_template_default", case_01_template_default),
     ("02_template_backtest_only", case_02_template_backtest_only),
@@ -1312,6 +1632,15 @@ _CASES: List[Tuple[str, Callable[[], None]]] = [
      case_23_template_eval_weighted_aggregation),
     ("24_report_eval_all_short_returns_null",
      case_24_report_eval_all_short_returns_null),
+    # 2026-05-29 命中率与方向算法重设·聚合层
+    ("25_theme_filter_skips_short_neutral",
+     case_25_theme_filter_skips_short_neutral),
+    ("26_theme_hit_and_direction_cumulative",
+     case_26_theme_hit_and_direction_cumulative),
+    ("27_report_eval_hit_dir_new_semantics",
+     case_27_report_eval_hit_dir_new_semantics),
+    ("28_stock_eval_returns_stock_hit_rate",
+     case_28_stock_eval_returns_stock_hit_rate),
 ]
 
 

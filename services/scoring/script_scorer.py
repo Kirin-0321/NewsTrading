@@ -1,4 +1,4 @@
-"""脚本规则打分核心（Phase 2 Step 2.1）。
+"""脚本规则打分核心（2026-05-29 命中率与方向算法重设后）。
 
 业务定位
 --------
@@ -7,7 +7,14 @@
 * ``theme_prediction_scores`` ：单题材单日 1 行（6 个核心指标 + AI 复审栏）
 * ``theme_stock_scores``      ：单标的单日 1 行（明细，给题材详情 Tab 用）
 
-7 个核心指标（2026-05-28 22:30 α 体系金字塔重构后）
+利空 / 中性题材过滤（2026-05-29 重设）
+-------------------------------------
+所有 ``strength_score <= 0`` 的题材（看空 + 中性）在打分入口直接 raise
+:class:`SkippedTheme`，不写任何打分行。理由：A 股做不了空，这类预测
+不指导交易、也不该污染评估指标。详见
+`doc/design/05-29-0058-命中率与方向算法重设与利空过滤设计.md`。
+
+7 个核心指标（2026-05-29 命中率与方向算法重设后）
 -------------------------------------------
 | 字段 | 含义 |
 |------|------|
@@ -15,10 +22,10 @@
 | ``stock_avg_pct`` | 标的算术平均涨幅（%） |
 | ``stock_weighted_pct`` | 一期等权 = 算术平均；二期可按强度加权 |
 | ``theme_pct`` | **题材综合涨幅**（报告级评分用）= 0.6·sector_pct + 0.4·stock_avg_pct；标的 NULL 时退回 sector_pct |
-| ``hit_rate`` | 涨幅 ≥ ``hit_threshold_pct`` 的标的占比 |
+| ``hit_rate`` | **新口径**：当日 ``α = pct_chg − zz1000_pct > strength_score / 20`` 的标的数 / 当日有效标的数（pct_chg 与 zz1000 都非 None 的） |
 | ``benchmark_pct`` | 大盘基准涨跌幅（默认上证综指 ``000001.SH``，仅留作历史兜底；2026-05-28 22:30 起聚合层不再引用） |
-| ``benchmark_zz1000_pct`` | 中证1000（``000852.SH``）当日涨跌幅；α / α-1 / α+N 体系唯一基准 |
-| ``direction_correct`` | 强度方向与板块涨跌方向同号则 1，反向 0，无法判定 NULL |
+| ``benchmark_zz1000_pct`` | 中证1000（``000852.SH``）当日涨跌幅；α 命中阈值 + α 体系唯一基准 |
+| ``direction_correct`` | **新口径**：累计数 = ∏(1 + theme_pct_i / 100) 从 D+1 累乘到当前 score_date，累计 > 1 → 1（方向准确），否则 0；缺失日 theme_pct=NULL 视为因子 1 |
 
 衍生指标（**不存表**，2026-05-28 22:30 起全部 SQL 现推 + 中证1000 基准 + 报告→模板两步聚合）
 -------------------------------------------
@@ -136,6 +143,14 @@ class ScoringError(RuntimeError):
     """打分流程不可恢复错误（题材不存在、穿越等）。"""
 
 
+class SkippedTheme(Exception):
+    """题材被业务规则跳过（非技术失败）。
+
+    2026-05-29 起触发场景：``strength_score <= 0``（利空 + 中性题材）。
+    service 层捕获后应静默通过，不计入失败统计。
+    """
+
+
 # ---------------------------------------------------------------------------
 # 单题材单日打分
 # ---------------------------------------------------------------------------
@@ -164,6 +179,7 @@ def score_theme_on_date(
 
     Raises:
         ScoringError: 题材不存在 / score_date <= report_date。
+        SkippedTheme: ``strength_score <= 0`` 利空 / 中性题材，业务规则跳过（2026-05-29 起）。
         ValueError: score_date 格式非法。
     """
     _ensure_yyyymmdd(score_date)
@@ -171,6 +187,13 @@ def score_theme_on_date(
     with attached_dbs(primary="ai", attach=("market",)) as conn:
         theme = _load_theme(conn, theme_id)
         report_date = theme["report_date"]
+
+        strength = theme["strength_score"]
+        if strength is None or int(strength) <= 0:
+            raise SkippedTheme(
+                f"theme_id={theme_id} strength_score={strength} <= 0，"
+                f"利空 / 中性题材不参与打分（A 股不可做空）"
+            )
 
         if score_date <= report_date:
             raise ScoringError(
@@ -216,12 +239,9 @@ def score_theme_on_date(
             float(r["pct_chg"]) for r in stock_rows
             if r["pct_chg"] is not None
         ]
-        total_count = len(stock_rows)
         stock_avg_pct = (sum(pcts) / len(pcts)) if pcts else None
         # 一期等权 = 算术平均；二期可按强度分加权
         stock_weighted_pct = stock_avg_pct
-        hit_count = sum(1 for p in pcts if p >= hit_threshold_pct)
-        hit_rate = (hit_count / total_count) if total_count > 0 else 0.0
 
         sector_pct = _query_sector_pct(
             conn, theme["sector_ts_code"], score_date,
@@ -235,21 +255,26 @@ def score_theme_on_date(
 
         theme_pct = _compute_theme_pct(sector_pct, stock_avg_pct)
 
-        direction_correct = _compute_direction(
-            theme["strength_score"], sector_pct,
-        )
-
-        # 明细行（写 theme_stock_scores 用）
+        # is_hit 新口径（2026-05-29）：α = pct_chg - zz1000 > strength_score/20
+        # zz1000 缺失时所有 is_hit = None（不能判定）
+        alpha_threshold = float(strength) / 20.0
+        zz = benchmark_zz1000_pct
         stock_score_rows: List[
             Tuple[int, str, Optional[float], Optional[int]]
         ] = []
+        hit_count = 0
+        total_count = 0  # 有效标的数：pct_chg 与 zz 都非 None
         for r in stock_rows:
             pct = r["pct_chg"]
             is_hit: Optional[int]
-            if pct is None:
+            if pct is None or zz is None:
                 is_hit = None
             else:
-                is_hit = 1 if float(pct) >= hit_threshold_pct else 0
+                alpha = float(pct) - float(zz)
+                is_hit = 1 if alpha > alpha_threshold else 0
+                total_count += 1
+                if is_hit == 1:
+                    hit_count += 1
             stock_score_rows.append(
                 (
                     int(r["theme_stock_id"]),
@@ -258,6 +283,11 @@ def score_theme_on_date(
                     is_hit,
                 )
             )
+        hit_rate = (hit_count / total_count) if total_count > 0 else 0.0
+
+        # direction_correct 由二阶段写入流程在 _write_scores 内填好；这里
+        # 先占位 None（dry-run 时 result.direction_correct 也是 None）
+        direction_correct: Optional[int] = None
 
         result = ThemeDailyScore(
             theme_id=theme_id,
@@ -281,6 +311,18 @@ def score_theme_on_date(
 
         if write:
             _write_scores(conn, result)
+            # 二阶段：累计方向 → UPDATE 当前行
+            cum_dir = _compute_cumulative_direction(
+                conn, theme_id, score_date,
+            )
+            if cum_dir is not None:
+                conn.execute(
+                    "UPDATE theme_prediction_scores "
+                    "SET direction_correct = ? "
+                    "WHERE theme_id = ? AND score_date = ?",
+                    (cum_dir, theme_id, score_date),
+                )
+                result.direction_correct = cum_dir
 
     return result
 
@@ -338,6 +380,9 @@ def score_themes_batch(
                 )
                 scored_pairs += 1
                 rows_written += 1 + len(res.stock_rows)  # 主表 1 行 + 明细 N
+            except SkippedTheme:
+                # 利空 / 中性题材跳过，不计入失败
+                continue
             except (ScoringError, ValueError) as exc:
                 errors.append(f"theme={tid} score_date={sd}: {exc}")
 
@@ -431,23 +476,49 @@ def _query_benchmark_pct(
     return float(row["pct_chg"])
 
 
-def _compute_direction(
-    strength_score: Optional[int],
-    sector_pct: Optional[float],
+def _compute_cumulative_direction(
+    conn: sqlite3.Connection,
+    theme_id: int,
+    current_score_date: str,
 ) -> Optional[int]:
-    """方向正确：(强度>0 ∧ 板块涨) ∨ (强度<0 ∧ 板块跌) → 1，反向 → 0。
+    """累计方向判定（2026-05-29 新算法）。
 
-    强度 = 0 或 sector_pct = None 或 sector_pct = 0 → None（不可判定）。
+    公式::
+
+        累计数 = ∏ (1 + theme_pct_i / 100)  对所有 score_date <= 当前
+        累计数 > 1 → direction_correct = 1
+        累计数 <= 1 → direction_correct = 0
+
+    若所有 D+N 行的 theme_pct 都为 None → 返回 None（无法判定）；
+    个别 score_date 的 theme_pct 为 None 时按主人规则视为因子 1（不累乘）。
+
+    Args:
+        conn: ai 库连接（attached_dbs 上下文内）。
+        theme_id: 题材主键。
+        current_score_date: 包含当前行的截止 score_date（含）。
+
+    Returns:
+        1 / 0 / None。
     """
-    if strength_score is None or strength_score == 0:
+    rows = conn.execute(
+        "SELECT theme_pct FROM theme_prediction_scores "
+        "WHERE theme_id = ? AND score_date <= ? "
+        "ORDER BY score_date ASC",
+        (theme_id, current_score_date),
+    ).fetchall()
+    if not rows:
         return None
-    if sector_pct is None or sector_pct == 0.0:
+    product = 1.0
+    has_any_valid = False
+    for r in rows:
+        pct = r["theme_pct"]
+        if pct is None:
+            continue
+        has_any_valid = True
+        product *= (1.0 + float(pct) / 100.0)
+    if not has_any_valid:
         return None
-    if (strength_score > 0 and sector_pct > 0) or (
-        strength_score < 0 and sector_pct < 0
-    ):
-        return 1
-    return 0
+    return 1 if product > 1.0 else 0
 
 
 _UPSERT_TPS = """

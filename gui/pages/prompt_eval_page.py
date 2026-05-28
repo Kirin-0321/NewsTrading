@@ -923,23 +923,14 @@ class PromptEvalPage(QWidget):
         sector_code = t.get("sector_ts_code")
         match_conf = t.get("sector_match_conf")
 
-        # 2026-05-28 v2 角标：让主人一眼看出这条题材是否参与报告级加权
-        # 以及板块匹配是否可靠
+        # 2026-05-29 重设：strength<=0 题材已被 SQL 全量过滤，此处看不到看空 / 中性，
+        # 仅保留 strength_score is None 兜底（异常老数据）。
         prefix_badges: List[str] = ["🎯"]
         tooltip_lines: List[str] = []
 
-        # ① 报告级聚合参与状态：strength_score 决定
         if score is None:
-            tooltip_lines.append("⚠ 无 strength_score（不参与报告级加权）")
+            tooltip_lines.append("⚠ 无 strength_score（异常老数据）")
             prefix_badges.append("❓")
-        elif score < 0:
-            tooltip_lines.append(
-                f"🐻 看空题材 strength={score}（不参与报告级加权）"
-            )
-            prefix_badges.append("🐻")
-        elif score == 0:
-            tooltip_lines.append("⚪ 中性 strength=0（不参与报告级加权）")
-            prefix_badges.append("⚪")
 
         # ② 板块绑定状态：sector_ts_code + sector_match_conf
         if not sector_code:
@@ -986,6 +977,24 @@ class PromptEvalPage(QWidget):
             tip = "\n".join(tooltip_lines)
             item.setToolTip(_COL_NAME, tip)
             item.setToolTip(_COL_AUX, tip)
+        # 2026-05-29 命中率列加方向准确性 tooltip
+        hit_rate = t.get("hit_rate_avg")
+        dir_cum = t.get("direction_correct_rate")
+        hit_tip_parts: List[str] = []
+        if hit_rate is not None:
+            hit_tip_parts.append(
+                f"📊 题材命中率：{float(hit_rate) * 100:.1f}%"
+                f"（标的级累计命中率均值）"
+            )
+        if dir_cum is not None:
+            dir_text = "✓ 准确" if int(dir_cum) == 1 else "✗ 不准"
+            hit_tip_parts.append(
+                f"🧭 方向准确性：{dir_text}"
+                f"（D+N 题材综合涨幅累乘 {'>1' if dir_cum else '≤1'}）"
+            )
+        else:
+            hit_tip_parts.append("🧭 方向准确性：— (数据不足)")
+        item.setToolTip(_COL_HIT, "\n".join(hit_tip_parts))
         # 题材级染色
         for c_idx, key in zip(
             (_COL_D1, _COL_D2, _COL_D3, _COL_D4, _COL_D5,
@@ -994,6 +1003,12 @@ class PromptEvalPage(QWidget):
              "alpha_avg", "alpha_avg_excl_d1"),
         ):
             self._paint_pct_cell(item, c_idx, t.get(key))
+        # 2026-05-29 题材命中率单元格按方向着色（方向准确浅红、不准浅绿、缺数据无）
+        if dir_cum is not None:
+            if int(dir_cum) == 1:
+                item.setBackground(_COL_HIT, QColor("#fff1f0"))
+            else:
+                item.setBackground(_COL_HIT, QColor("#f6ffed"))
         # 标的层 placeholder
         if stocks_n > 0:
             ph = QTreeWidgetItem(["  (展开加载标的...)"])
@@ -1034,26 +1049,43 @@ class PromptEvalPage(QWidget):
     def _append_stock_child(
         self, parent: QTreeWidgetItem, s: Dict,
     ) -> None:
-        # 列 11（命中率/命中）改用"汇总命中率"（命中天数 / 已打分天数）
-        scored_days = int(s.get("scored_days") or 0)
-        hits = sum(
-            1 for k in ("d1_hit", "d2_hit", "d3_hit", "d4_hit", "d5_hit")
-            if (s.get(k) or 0) == 1
-        )
-        hit_text = (
-            f"{hits}/{scored_days}" if scored_days else "—"
-        )
+        # 2026-05-29 重设：命中率列显示"标的累计命中率"
+        #   命中率 = SUM(is_hit=1) / SUM(is_hit IS NOT NULL)
+        #   即"在有效打分天数中、α > strength/20 的比例"
+        valid_days = int(s.get("valid_days") or 0)
+        stock_hit_rate = s.get("stock_hit_rate")
+        if valid_days > 0 and stock_hit_rate is not None:
+            hits_n = int(round(float(stock_hit_rate) * valid_days))
+            hit_text = (
+                f"{hits_n}/{valid_days} "
+                f"({float(stock_hit_rate) * 100:.0f}%)"
+            )
+        elif valid_days > 0:
+            hit_text = f"0/{valid_days}"
+        else:
+            hit_text = "—"
+
+        # D/α+N 单元格内的命中标记 ✓/✗（小符号挤在双值后面）
+        def _hit_suffix(hit_val) -> str:
+            if hit_val == 1:
+                return " ✓"
+            if hit_val == 0:
+                return " ✗"
+            return ""
+
+        d_cells = []
+        for i in range(1, 6):
+            base = _fmt_pct_dual(s.get(f"d{i}_pct"), s.get(f"a{i}_pct"))
+            suf = _hit_suffix(s.get(f"d{i}_hit"))
+            d_cells.append(base + suf if base != "—" else base)
+
         cells = [
             f"📈 {s.get('stock_name') or '—'}",
             str(s.get("role") or "—"),
             str(s.get("normalized_code") or "—"),
             "—",  # 排名列对标的不适用
             "—",  # 强度分对标的不适用
-            _fmt_pct_dual(s.get("d1_pct"), s.get("a1_pct")),
-            _fmt_pct_dual(s.get("d2_pct"), s.get("a2_pct")),
-            _fmt_pct_dual(s.get("d3_pct"), s.get("a3_pct")),
-            _fmt_pct_dual(s.get("d4_pct"), s.get("a4_pct")),
-            _fmt_pct_dual(s.get("d5_pct"), s.get("a5_pct")),
+            d_cells[0], d_cells[1], d_cells[2], d_cells[3], d_cells[4],
             "—",  # α 列对标的不适用
             "—",  # α-1 列对标的不适用（2026-05-28 18:40 加列后保留占位）
             hit_text,
@@ -1071,12 +1103,20 @@ class PromptEvalPage(QWidget):
             ("d1_pct", "d2_pct", "d3_pct", "d4_pct", "d5_pct"),
         ):
             self._paint_pct_cell(item, c_idx, s.get(key))
-        # 命中标记列底色
-        if scored_days > 0:
-            if hits == scored_days:
-                item.setBackground(_COL_HIT, QColor("#fff1f0"))  # 全命中浅红
-            elif hits == 0:
-                item.setBackground(_COL_HIT, QColor("#f6ffed"))  # 全未命中浅绿
+        # 命中标记列底色：依累计命中率染色
+        if valid_days > 0 and stock_hit_rate is not None:
+            if stock_hit_rate >= 0.6:
+                item.setBackground(_COL_HIT, QColor("#fff1f0"))  # 高命中浅红
+            elif stock_hit_rate <= 0.2:
+                item.setBackground(_COL_HIT, QColor("#f6ffed"))  # 低命中浅绿
+        # 命中率单元格 tooltip：解释新口径
+        item.setToolTip(
+            _COL_HIT,
+            "📊 标的累计命中率\n"
+            "公式：命中天数 / 有效天数\n"
+            "命中条件：α = pct_chg − zz1000 > strength_score / 20\n"
+            "D/α+N 列尾的 ✓/✗ 表示当日是否命中"
+        )
         parent.addChild(item)
 
     @staticmethod

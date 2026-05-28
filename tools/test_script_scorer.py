@@ -1,13 +1,13 @@
-"""Phase 2 打分核心回归测试（16 用例，全部走伪数据，0 API 消耗）。
+"""Phase 2 打分核心回归测试（21 用例，全部走伪数据，0 API 消耗）。
 
 覆盖
 ----
 1. 穿越保护：score_date <= report_date 必 raise ScoringError
-2. 单题材 D+1 打分：标的涨幅平均值 / hit_rate / 写库行数全部精确匹配
-3. direction_correct：strength_score=+80 板块跌 → 0；-50 板块跌 → 1
-4. hit_rate 阈值：标的 [5, 1, -2] / 阈值 3 → hit_count=1 hit_rate=1/3
+2. 单题材 D+1 打分：6 指标全部正确 + 两张表都写入（2026-05-29 后 hit 走 α 阈值，注释更新）
+3. **2026-05-29 重设** SkippedTheme：strength_score=-50 / 0 都跳过不打分
+4. **2026-05-29 重设** α 阈值随 strength 自适应：
+   strength=100 阈值 5%，[5,1,-2] zz=0.8 全部不命中
 5. 跨节假日：report_date=99990430 score_date=99990506 → days_offset=1
-   （99990501-05 全休市的伪日历）
 6. theme_stocks 为空 → stock_avg_pct=None，不 crash
 7. sector_ts_code=NULL → sector_pct=None
 8. 幂等：同 (theme_id, score_date) 重跑 → 主表仍 1 行（UPSERT）
@@ -20,6 +20,12 @@
 14. benchmark_zz1000_pct 写入正确（2026-05-28 18:40 α-1 指标）
 15. 中证1000 当日缺数据时 benchmark_zz1000_pct=None 不 crash
 16. backfill_benchmark_zz1000 干跑/真跑 行为正确
+17. **2026-05-29 重设** 累乘累计方向：D+1 单日 +1.6% → 累计 > 1 → 1
+18. **2026-05-29 重设** 累乘累计方向：D+1 +1.6% + D+2 -0.5% → 累计 ≈ 1.011 → 1（同正）
+19. **2026-05-29 重设** is_hit 分母只算 pct_chg 有效标的（标的 pct_chg=None 不计入）
+20. **2026-05-29 重设** zz1000 缺数据 → 所有 is_hit=None，hit_rate=0
+21. **2026-05-29 重设** ``_compute_cumulative_direction``
+    跳过 theme_pct=NULL 行（视为因子 1）
 
 数据隔离
 --------
@@ -260,8 +266,6 @@ def case_02_single_theme_d1() -> None:
     assert abs(res.stock_avg_pct - 4.0 / 3) < 1e-6, (
         f"stock_avg_pct 错: {res.stock_avg_pct}"
     )
-    assert res.total_count == 3 and res.hit_count == 1
-    assert abs(res.hit_rate - 1.0 / 3) < 1e-6
     assert res.sector_pct == 1.85
     assert res.benchmark_pct == 0.5
     # 2026-05-28 17:15 加权改造：
@@ -273,7 +277,19 @@ def case_02_single_theme_d1() -> None:
     assert abs(res.theme_pct - expected_theme_pct) < 1e-6, (
         f"theme_pct 错: 期望 {expected_theme_pct}, 得到 {res.theme_pct}"
     )
-    assert res.direction_correct == 1  # +80 强度 + 板块涨 = 同向
+    # 2026-05-29 重设：direction_correct 改为累乘累计判定
+    #   theme_pct=+1.6433% → 累计 = 1 + 0.016433 ≈ 1.016 > 1 → 1
+    assert res.direction_correct == 1, (
+        f"D+1 单日 theme_pct>0 累乘应 > 1 → 1，得到 {res.direction_correct}"
+    )
+    # 同时验证 hit/total：strength=80, α阈值=4%, zz=0.8, α=[4.2, 0.2, -2.8]
+    # → 命中 1 个、有效 3 个（zz1000 有数据）
+    assert res.total_count == 3 and res.hit_count == 1, (
+        f"新口径下 hit/total 应是 1/3，得到 {res.hit_count}/{res.total_count}"
+    )
+    assert abs(res.hit_rate - 1.0 / 3) < 1e-6, (
+        f"新口径 hit_rate=1/3，得到 {res.hit_rate}"
+    )
 
     # 写库验证
     from services.storage.ai_inference_db import get_ai_inference_db
@@ -290,38 +306,76 @@ def case_02_single_theme_d1() -> None:
     assert n_detail == 3, f"明细表期望 3 行，得到 {n_detail}"
 
 
-def case_03_direction_correct_negative_strength() -> None:
-    """direction_correct：+80 强度板块跌 → 0；-50 强度板块跌 → 1。"""
-    from services.scoring.script_scorer import score_theme_on_date
-    # +80 vs 板块 99990507 跌 -0.5%
+def case_03_skipped_on_non_positive_strength() -> None:
+    """**2026-05-29 重设** strength_score <= 0 题材打分入口直接 raise SkippedTheme。
+
+    A 股做不了空，利空 / 中性预测既不指导买、也不指导卖，
+    打分阶段一刀切跳过，库里不写任何行。
+    """
+    from services.scoring.script_scorer import (
+        SkippedTheme, score_theme_on_date,
+    )
+    from services.storage.ai_inference_db import get_ai_inference_db
+
+    # 负强度（看空）
     _make_theme(999803, report_date="99990430",
-                stock_codes=["TEST_A.SH"], strength_score=80)
-    res1 = score_theme_on_date(999803, "99990507",
-                               benchmark_ts_code="TEST_BENCH.SH")
-    assert res1.direction_correct == 0, (
-        f"+80 vs -0.5% 应 direction=0，得到 {res1.direction_correct}"
-    )
-    # -50 vs 板块跌 → 1
-    _make_theme(999804, report_date="99990430",
                 stock_codes=["TEST_A.SH"], strength_score=-50)
-    res2 = score_theme_on_date(999804, "99990507",
-                               benchmark_ts_code="TEST_BENCH.SH")
-    assert res2.direction_correct == 1, (
-        f"-50 vs -0.5% 应 direction=1，得到 {res2.direction_correct}"
-    )
+    try:
+        score_theme_on_date(999803, "99990506",
+                            benchmark_ts_code="TEST_BENCH.SH")
+        raise AssertionError("strength=-50 应 raise SkippedTheme")
+    except SkippedTheme as exc:
+        assert "strength_score" in str(exc), f"异常消息应含 strength_score: {exc}"
+
+    # 0 强度（中性）
+    _make_theme(999804, report_date="99990430",
+                stock_codes=["TEST_A.SH"], strength_score=0)
+    try:
+        score_theme_on_date(999804, "99990506",
+                            benchmark_ts_code="TEST_BENCH.SH")
+        raise AssertionError("strength=0 应 raise SkippedTheme")
+    except SkippedTheme:
+        pass
+
+    # 验证库里没写入打分行（dry-run 兜底）
+    with get_ai_inference_db().connect(readonly=True) as conn:
+        n1 = conn.execute(
+            "SELECT COUNT(*) AS c FROM theme_prediction_scores "
+            "WHERE theme_id IN (?, ?)",
+            (999803, 999804),
+        ).fetchone()["c"]
+        n2 = conn.execute(
+            "SELECT COUNT(*) AS c FROM theme_stock_scores "
+            "WHERE theme_id IN (?, ?)",
+            (999803, 999804),
+        ).fetchone()["c"]
+    assert n1 == 0, f"SkippedTheme 不应写主表，实际写了 {n1} 行"
+    assert n2 == 0, f"SkippedTheme 不应写明细表，实际写了 {n2} 行"
 
 
-def case_04_hit_rate_threshold() -> None:
-    """case_02 已经验过 hit_count=1/total=3；再单独跑阈值=10% 边界。"""
+def case_04_alpha_threshold_adaptive() -> None:
+    """**2026-05-29 重设** α 阈值随 strength_score 自适应（公式：strength / 20）。
+
+    strength=100 → α 阈值 5%；伪行情 zz1000=0.8%、标的 [+5, +1, -2]
+    → α=[4.2, 0.2, -2.8]，全部 < 5%，hit_count=0 / hit_rate=0。
+
+    （注：传入的 hit_threshold_pct=10.0 参数本期已废弃，固定从 strength
+    现推；测试同时验证旧参数不再生效。）
+    """
     from services.scoring.script_scorer import score_theme_on_date
     _make_theme(999805, report_date="99990430",
-                stock_codes=["TEST_A.SH", "TEST_B.SH", "TEST_C.SH"])
+                stock_codes=["TEST_A.SH", "TEST_B.SH", "TEST_C.SH"],
+                strength_score=100)
     res = score_theme_on_date(999805, "99990506",
-                              hit_threshold_pct=10.0,
+                              hit_threshold_pct=10.0,  # 已废弃但接口兼容保留
                               benchmark_ts_code="TEST_BENCH.SH")
+    # strength=100, α阈值=5%, zz=0.8, α=[4.2, 0.2, -2.8] 都 < 5
     assert res.hit_count == 0, (
-        f"阈值 10%, 实际涨幅 [5, 1, -2] 都不达 → hit_count=0，"
+        f"strength=100 阈值 5%, α=[4.2, 0.2, -2.8] 都不达 → hit_count=0，"
         f"得到 {res.hit_count}"
+    )
+    assert res.total_count == 3, (
+        f"3 个标的 + zz1000 有效 → total_count=3，得到 {res.total_count}"
     )
     assert res.hit_rate == 0.0
 
@@ -667,6 +721,217 @@ def case_16_backfill_benchmark_zz1000() -> None:
 
 
 # ---------------------------------------------------------------------------
+# 2026-05-29 命中率与方向算法重设专项用例
+# ---------------------------------------------------------------------------
+
+
+def case_17_cumulative_direction_d1_only() -> None:
+    """**2026-05-29 重设** 累乘累计方向：D+1 单日 +1.6% → 累计 ≈ 1.016 > 1 → 1。
+
+    与 case_02 重合度验证一遍：单跑 D+1 即可让 direction_correct 落库 = 1。
+    """
+    from services.scoring.script_scorer import score_theme_on_date
+    from services.storage.ai_inference_db import get_ai_inference_db
+    _make_theme(999817, report_date="99990430",
+                stock_codes=["TEST_A.SH", "TEST_B.SH", "TEST_C.SH"],
+                strength_score=50)
+    score_theme_on_date(999817, "99990506",
+                        benchmark_ts_code="TEST_BENCH.SH")
+    with get_ai_inference_db().connect(readonly=True) as conn:
+        row = conn.execute(
+            "SELECT direction_correct, theme_pct FROM theme_prediction_scores "
+            "WHERE theme_id = ?",
+            (999817,),
+        ).fetchone()
+    # theme_pct = 0.6*1.85 + 0.4*(4/3) ≈ 1.6433
+    # 累计 = 1.016433 > 1 → 1
+    assert row is not None
+    assert row["direction_correct"] == 1, (
+        f"D+1 单日 theme_pct=+1.6433% 累乘 > 1 应 direction=1，"
+        f"得到 {row['direction_correct']}"
+    )
+
+
+def case_18_cumulative_direction_two_days() -> None:
+    """**2026-05-29 重设** 累乘累计方向：D+1 + D+2 两天累乘判定。
+
+    伪数据：
+        D+1 (99990506) theme_pct ≈ +1.6433%
+        D+2 (99990507) theme_pct ≈ -0.5·0.6 + (sector=-0.5/stock_avg)
+            实际：stock_avg = (3 + (-0.5) + 2) / 3 = 1.5;
+                  theme_pct = 0.6*(-0.5) + 0.4*1.5 = -0.3 + 0.6 = +0.3%
+        累计 = 1.016433 × 1.003 ≈ 1.0195 > 1 → 1（两天同向正收益）
+    """
+    from services.scoring.script_scorer import score_theme_on_date
+    from services.storage.ai_inference_db import get_ai_inference_db
+    _make_theme(999818, report_date="99990430",
+                stock_codes=["TEST_A.SH", "TEST_B.SH", "TEST_C.SH"],
+                strength_score=50)
+    score_theme_on_date(999818, "99990506",
+                        benchmark_ts_code="TEST_BENCH.SH")
+    score_theme_on_date(999818, "99990507",
+                        benchmark_ts_code="TEST_BENCH.SH")
+    with get_ai_inference_db().connect(readonly=True) as conn:
+        rows = conn.execute(
+            "SELECT score_date, direction_correct, theme_pct "
+            "FROM theme_prediction_scores WHERE theme_id = ? "
+            "ORDER BY score_date ASC",
+            (999818,),
+        ).fetchall()
+    assert len(rows) == 2, f"期望 D+1/D+2 共 2 行，得到 {len(rows)}"
+    # D+1 行：累计 = 1.016 > 1 → 1
+    assert rows[0]["direction_correct"] == 1, (
+        f"D+1 行 direction 应 = 1，得到 {rows[0]['direction_correct']}"
+    )
+    # D+2 行：累计 = 1.016 * 1.003 ≈ 1.019 > 1 → 1
+    assert rows[1]["direction_correct"] == 1, (
+        f"D+2 累乘后仍 > 1 应 direction=1，得到 {rows[1]['direction_correct']}"
+    )
+
+
+def case_19_hit_denominator_excludes_missing_pct() -> None:
+    """**2026-05-29 重设** is_hit 分母只算 pct_chg 有效标的（无效标的不计入）。
+
+    设置：3 个标的，其中 TEST_C 在 99990506 没有 fact_stock_daily 行（pct_chg=NULL）。
+    伪数据现有 A/B/C 三只都有 99990506 数据 → 这里临时构造一个新标的 TEST_X 没有
+    fact_stock_daily 数据，验证它进 stock_score_rows 但 is_hit=None 不计入 total。
+    """
+    from services.scoring.script_scorer import score_theme_on_date
+    from services.storage.ai_inference_db import get_ai_inference_db
+    # 4 只标的：3 只有数据 + 1 只没数据（TEST_X.SH 未在 _FAKE_STOCK_DAILY）
+    _make_theme(999819, report_date="99990430",
+                stock_codes=["TEST_A.SH", "TEST_B.SH", "TEST_C.SH",
+                             "TEST_X.SH"],
+                strength_score=80)
+    res = score_theme_on_date(999819, "99990506",
+                              benchmark_ts_code="TEST_BENCH.SH")
+    # TEST_X.SH pct_chg=None → 不计入 total_count
+    assert res.total_count == 3, (
+        f"3 个有效 + 1 个缺数据 → total_count=3，得到 {res.total_count}"
+    )
+    # strength=80, 阈值=4%, zz=0.8, α=[4.2, 0.2, -2.8] → hit=1
+    assert res.hit_count == 1, (
+        f"3 个有效中 1 个命中 → hit_count=1，得到 {res.hit_count}"
+    )
+    # 验证 stock_score_rows 仍有 4 行（明细表 1:1 写入），其中 1 行 is_hit=None
+    with get_ai_inference_db().connect(readonly=True) as conn:
+        rows = conn.execute(
+            "SELECT pct_chg, is_hit FROM theme_stock_scores "
+            "WHERE theme_id = ?",
+            (999819,),
+        ).fetchall()
+    assert len(rows) == 4, f"明细表期望 4 行，得到 {len(rows)}"
+    none_hit_count = sum(1 for r in rows if r["is_hit"] is None)
+    assert none_hit_count == 1, (
+        f"应有 1 行 is_hit=None（TEST_X 缺 pct_chg），得到 {none_hit_count}"
+    )
+
+
+def case_20_is_hit_null_when_zz_missing() -> None:
+    """**2026-05-29 重设** zz1000 缺数据 → 所有 is_hit=None，hit_count=0。
+
+    99990507 故意没造 000852.SH 数据（在 _FAKE_INDEX_DAILY 里只造了 99990506）。
+    score 99990507 时 zz1000 应为 None，is_hit 应全部 None，hit_count=0/total=0。
+    """
+    from services.scoring.script_scorer import score_theme_on_date
+    from services.storage.ai_inference_db import get_ai_inference_db
+    _make_theme(999820, report_date="99990430",
+                stock_codes=["TEST_A.SH", "TEST_B.SH"],
+                strength_score=80)
+    res = score_theme_on_date(999820, "99990507",
+                              benchmark_ts_code="TEST_BENCH.SH")
+    assert res.benchmark_zz1000_pct is None, "99990507 zz1000 应缺数据"
+    assert res.hit_count == 0, (
+        f"zz1000 缺 → hit_count=0，得到 {res.hit_count}"
+    )
+    assert res.total_count == 0, (
+        f"zz1000 缺 → 所有标的 is_hit=None → total_count=0，得到 {res.total_count}"
+    )
+    with get_ai_inference_db().connect(readonly=True) as conn:
+        rows = conn.execute(
+            "SELECT is_hit FROM theme_stock_scores WHERE theme_id = ?",
+            (999820,),
+        ).fetchall()
+    assert all(r["is_hit"] is None for r in rows), (
+        f"zz 缺时所有明细 is_hit 应 None，得到 {[r['is_hit'] for r in rows]}"
+    )
+
+
+def case_21_cumulative_skips_null_theme_pct() -> None:
+    """**2026-05-29 重设** _compute_cumulative_direction 跳过 NULL theme_pct（视为因子 1）。
+
+    构造：D+1 theme_pct=NULL（伪造），D+2 theme_pct=+0.3%
+    → 累计 = 1.0 × 1.003 ≈ 1.003 > 1 → 1（NULL 行被跳过当因子 1）
+
+    本测试直接调用底层函数，绕过 score_theme_on_date 的写入流程。
+    """
+    from services.scoring.script_scorer import _compute_cumulative_direction
+    from services.storage.cross_db import attached_dbs
+    from services.storage.ai_inference_db import get_ai_inference_db
+
+    # 直接 INSERT 两行测试数据
+    adb = get_ai_inference_db()
+    with adb.connect() as conn:
+        # 先确保父行存在（FK 约束）
+        conn.execute(
+            "INSERT OR REPLACE INTO theme_predictions "
+            "(id, report_id, report_date, report_path, theme_name, "
+            " strength_score, strength_level, reason, prompt_id, prompt_version, "
+            " sector_ts_code, is_backtest, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))",
+            (
+                999821, "test_999821.md", "99990430",
+                "/test/999821.md", "测试题材999821",
+                30, "5_中性偏多", "测试", "TEST_PROMPT", "1.0",
+                "TEST_BK.DC", 1,
+            ),
+        )
+        # 清空可能的残留
+        conn.execute(
+            "DELETE FROM theme_prediction_scores WHERE theme_id = ?",
+            (999821,),
+        )
+        # D+1 行：theme_pct=NULL
+        conn.execute(
+            "INSERT INTO theme_prediction_scores "
+            "(theme_id, prompt_id, prompt_version, report_date, score_date, "
+            " days_offset, theme_pct, hit_count, total_count, hit_rate, "
+            " created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, NULL, 0, 0, 0.0, datetime('now'))",
+            (999821, "TEST_PROMPT", "1.0", "99990430", "99990506", 1),
+        )
+        # D+2 行：theme_pct=+0.3
+        conn.execute(
+            "INSERT INTO theme_prediction_scores "
+            "(theme_id, prompt_id, prompt_version, report_date, score_date, "
+            " days_offset, theme_pct, hit_count, total_count, hit_rate, "
+            " created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, 0.3, 0, 0, 0.0, datetime('now'))",
+            (999821, "TEST_PROMPT", "1.0", "99990430", "99990507", 2),
+        )
+
+    # 验证：累计跳过 NULL → 累计=1.003 > 1 → 1
+    with attached_dbs(primary="ai", attach=("market",)) as conn:
+        cum = _compute_cumulative_direction(conn, 999821, "99990507")
+    assert cum == 1, (
+        f"NULL 行视为因子 1 + 0.3% → 累计 1.003 > 1 应 = 1，得到 {cum}"
+    )
+
+    # 反例：所有行都 NULL → return None
+    with adb.connect() as conn:
+        conn.execute(
+            "UPDATE theme_prediction_scores SET theme_pct = NULL "
+            "WHERE theme_id = ?",
+            (999821,),
+        )
+    with attached_dbs(primary="ai", attach=("market",)) as conn:
+        cum_none = _compute_cumulative_direction(conn, 999821, "99990507")
+    assert cum_none is None, (
+        f"所有行 theme_pct=NULL → 应 return None，得到 {cum_none}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
 
@@ -674,9 +939,9 @@ def case_16_backfill_benchmark_zz1000() -> None:
 _CASES: List[Tuple[str, Callable[[], None]]] = [
     ("01_anti_lookahead", case_01_anti_lookahead),
     ("02_single_theme_d1", case_02_single_theme_d1),
-    ("03_direction_correct_negative_strength",
-     case_03_direction_correct_negative_strength),
-    ("04_hit_rate_threshold", case_04_hit_rate_threshold),
+    ("03_skipped_on_non_positive_strength",
+     case_03_skipped_on_non_positive_strength),
+    ("04_alpha_threshold_adaptive", case_04_alpha_threshold_adaptive),
     ("05_cross_holiday_offset", case_05_cross_holiday_offset),
     ("06_empty_stocks_no_crash", case_06_empty_stocks_no_crash),
     ("07_null_sector", case_07_null_sector),
@@ -692,6 +957,17 @@ _CASES: List[Tuple[str, Callable[[], None]]] = [
     ("15_benchmark_zz1000_missing_is_none",
      case_15_benchmark_zz1000_missing_is_none),
     ("16_backfill_benchmark_zz1000", case_16_backfill_benchmark_zz1000),
+    # 2026-05-29 命中率与方向算法重设
+    ("17_cumulative_direction_d1_only",
+     case_17_cumulative_direction_d1_only),
+    ("18_cumulative_direction_two_days",
+     case_18_cumulative_direction_two_days),
+    ("19_hit_denominator_excludes_missing_pct",
+     case_19_hit_denominator_excludes_missing_pct),
+    ("20_is_hit_null_when_zz_missing",
+     case_20_is_hit_null_when_zz_missing),
+    ("21_cumulative_skips_null_theme_pct",
+     case_21_cumulative_skips_null_theme_pct),
 ]
 
 

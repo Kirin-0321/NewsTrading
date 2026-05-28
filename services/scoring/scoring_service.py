@@ -79,6 +79,7 @@ from services.scoring.script_scorer import (
     DEFAULT_BENCHMARK_TS_CODE,
     DEFAULT_HIT_THRESHOLD_PCT,
     ScoringError,
+    SkippedTheme,
     score_theme_on_date,
 )
 from services.storage.ai_inference_db import get_ai_inference_db
@@ -293,6 +294,10 @@ def _run_scoring_for_range(
                 pairs_succeeded += 1
                 days_covered_set.add(sd)
                 scored_themes.add(theme_id)
+            except SkippedTheme:
+                # 利空 / 中性题材业务规则跳过，不计入失败
+                pairs_attempted -= 1  # 回退：不视为尝试
+                continue
             except (ScoringError, ValueError) as exc:
                 errors.append(
                     f"theme={theme_id} score_date={sd}: {exc}"
@@ -447,7 +452,34 @@ def get_template_eval(
         "NULL AS prompt_version" if ignore_version else "prompt_version"
     )
     sql = f"""
-    WITH per_theme AS (
+    WITH stock_hit AS (
+        -- 2026-05-29 标的级累计命中率（命中天数 / 有效天数）
+        SELECT
+            theme_id,
+            theme_stock_id,
+            CAST(SUM(CASE WHEN is_hit IS NOT NULL THEN is_hit END) AS REAL)
+              / NULLIF(SUM(CASE WHEN is_hit IS NOT NULL THEN 1 END), 0)
+              AS stock_hit_rate
+        FROM theme_stock_scores
+        GROUP BY theme_id, theme_stock_id
+    ),
+    theme_hit AS (
+        -- 2026-05-29 题材命中率 = 标的命中率均值
+        SELECT theme_id, AVG(stock_hit_rate) AS theme_hit_rate
+        FROM stock_hit
+        WHERE stock_hit_rate IS NOT NULL
+        GROUP BY theme_id
+    ),
+    theme_direction AS (
+        -- 2026-05-29 题材累计方向：取最大 days_offset 行的 direction_correct
+        SELECT theme_id,
+               (SELECT direction_correct FROM theme_prediction_scores t2
+                 WHERE t2.theme_id = theme_prediction_scores.theme_id
+                 ORDER BY t2.days_offset DESC LIMIT 1) AS theme_dir_cum
+        FROM theme_prediction_scores
+        GROUP BY theme_id
+    ),
+    per_theme AS (
         SELECT
             tp.id AS theme_id,
             tp.report_path,
@@ -476,13 +508,13 @@ def get_template_eval(
                      THEN tps.theme_pct - tps.benchmark_zz1000_pct END) AS ta4,
             MAX(CASE WHEN tps.days_offset=5
                      THEN tps.theme_pct - tps.benchmark_zz1000_pct END) AS ta5,
-            AVG(tps.hit_rate) AS hit_rate_avg,
-            AVG(CASE WHEN tps.direction_correct IS NOT NULL
-                     THEN CAST(tps.direction_correct AS REAL) END)
-                 AS dir_rate
+            MAX(th.theme_hit_rate) AS theme_hit_rate,
+            MAX(td.theme_dir_cum) AS theme_dir_cum
         FROM theme_predictions tp
         LEFT JOIN theme_prediction_scores tps
                ON tps.theme_id = tp.id
+        LEFT JOIN theme_hit th ON th.theme_id = tp.id
+        LEFT JOIN theme_direction td ON td.theme_id = tp.id
         WHERE {time_where} {backtest_clause}
         GROUP BY tp.id, tp.prompt_id, tp.prompt_version,
                  tp.strength_score, tp.report_date, tp.report_path
@@ -531,7 +563,13 @@ def get_template_eval(
             SUM(CASE WHEN strength_score > 0 AND ta5 IS NOT NULL
                      THEN ta5 * ABS(strength_score) END)
               / NULLIF(SUM(CASE WHEN strength_score > 0 AND ta5 IS NOT NULL
-                                THEN ABS(strength_score) END), 0) AS ra5
+                                THEN ABS(strength_score) END), 0) AS ra5,
+            -- 2026-05-29 报告命中率 = 报告内 strength>0 题材命中率均值
+            AVG(CASE WHEN strength_score > 0
+                     THEN theme_hit_rate END) AS report_hit_rate,
+            -- 2026-05-29 报告方向准确性 = 报告内 strength>0 题材累计方向均值
+            AVG(CASE WHEN strength_score > 0
+                     THEN CAST(theme_dir_cum AS REAL) END) AS report_dir
         FROM per_theme
         GROUP BY report_path, prompt_id, prompt_version
     ),
@@ -541,9 +579,7 @@ def get_template_eval(
             {pv_select},
             COUNT(*) AS themes_total,
             SUM(is_scored) AS scored_themes,
-            MAX(theme_report_date) AS last_report_date,
-            AVG(hit_rate_avg) AS hit_rate_avg,
-            AVG(dir_rate) AS direction_correct_rate
+            MAX(theme_report_date) AS last_report_date
         FROM per_theme
         GROUP BY {join_keys}
     ),
@@ -554,7 +590,9 @@ def get_template_eval(
             AVG(rd1) AS d1_avg, AVG(rd2) AS d2_avg, AVG(rd3) AS d3_avg,
             AVG(rd4) AS d4_avg, AVG(rd5) AS d5_avg,
             AVG(ra1) AS a1_avg, AVG(ra2) AS a2_avg, AVG(ra3) AS a3_avg,
-            AVG(ra4) AS a4_avg, AVG(ra5) AS a5_avg
+            AVG(ra4) AS a4_avg, AVG(ra5) AS a5_avg,
+            AVG(report_hit_rate) AS hit_rate_avg,
+            AVG(report_dir) AS direction_correct_rate
         FROM per_report
         GROUP BY {join_keys}
     )
@@ -583,8 +621,8 @@ def get_template_eval(
               + (CASE WHEN a.a4_avg IS NOT NULL THEN 1 ELSE 0 END)
               + (CASE WHEN a.a5_avg IS NOT NULL THEN 1 ELSE 0 END), 0)
           AS alpha_avg_excl_d1,
-        b.hit_rate_avg,
-        b.direction_correct_rate,
+        a.hit_rate_avg,
+        a.direction_correct_rate,
         b.last_report_date
     FROM tpl_basics b
     LEFT JOIN tpl_aggs a USING ({join_keys})
@@ -705,10 +743,37 @@ def get_report_eval(
     #   * 报告级 α   = AVG over 5 days of (报告 α+N)，忽略 NULL
     #   * 报告级 α-1 = AVG over D+2..D+5 of (报告 α+N)，忽略 NULL
     #   * 不再读 tps.alpha 单日字段（已 DROP COLUMN，迁移 004）
-    # 嵌套结构：per_theme（题材内透视） → per_report（题材→报告加权）
-    #         → 外层 SELECT 推导 alpha_avg / alpha_avg_excl_d1
+    # 2026-05-29 命中率与方向算法重设：
+    #   * 题材命中率 theme_hit_rate = 标的级累计命中率（命中天数/有效天数）均值
+    #   * 题材方向 theme_dir_cum = 取最大 days_offset 行的 direction_correct
+    #   * 报告命中率 hit_rate_avg = 报告内 strength>0 题材命中率均值
+    #   * 报告方向 direction_correct_rate = 报告内 strength>0 题材累计方向均值
     sql = f"""
-    WITH per_theme AS (
+    WITH stock_hit AS (
+        SELECT
+            theme_id,
+            theme_stock_id,
+            CAST(SUM(CASE WHEN is_hit IS NOT NULL THEN is_hit END) AS REAL)
+              / NULLIF(SUM(CASE WHEN is_hit IS NOT NULL THEN 1 END), 0)
+              AS stock_hit_rate
+        FROM theme_stock_scores
+        GROUP BY theme_id, theme_stock_id
+    ),
+    theme_hit AS (
+        SELECT theme_id, AVG(stock_hit_rate) AS theme_hit_rate
+        FROM stock_hit
+        WHERE stock_hit_rate IS NOT NULL
+        GROUP BY theme_id
+    ),
+    theme_direction AS (
+        SELECT theme_id,
+               (SELECT direction_correct FROM theme_prediction_scores t2
+                 WHERE t2.theme_id = theme_prediction_scores.theme_id
+                 ORDER BY t2.days_offset DESC LIMIT 1) AS theme_dir_cum
+        FROM theme_prediction_scores
+        GROUP BY theme_id
+    ),
+    per_theme AS (
         SELECT
             tp.id AS theme_id,
             tp.report_path,
@@ -733,14 +798,14 @@ def get_report_eval(
                      THEN tps.theme_pct - tps.benchmark_zz1000_pct END) AS ta4,
             MAX(CASE WHEN tps.days_offset=5
                      THEN tps.theme_pct - tps.benchmark_zz1000_pct END) AS ta5,
-            AVG(tps.hit_rate) AS hit_rate_avg,
-            AVG(CASE WHEN tps.direction_correct IS NOT NULL
-                     THEN CAST(tps.direction_correct AS REAL) END)
-                 AS dir_rate,
+            MAX(th.theme_hit_rate) AS theme_hit_rate,
+            MAX(td.theme_dir_cum) AS theme_dir_cum,
             COUNT(tps.id) AS scored_pairs_one
         FROM theme_predictions tp
         LEFT JOIN theme_prediction_scores tps
                ON tps.theme_id = tp.id
+        LEFT JOIN theme_hit th ON th.theme_id = tp.id
+        LEFT JOIN theme_direction td ON td.theme_id = tp.id
         GROUP BY tp.id, tp.report_path, tp.strength_score
     ),
     per_report AS (
@@ -824,8 +889,13 @@ def get_report_eval(
                                   AND per_theme.ta5 IS NOT NULL
                                 THEN ABS(per_theme.strength_score) END), 0)
               AS a5_avg,
-            AVG(per_theme.hit_rate_avg) AS hit_rate_avg,
-            AVG(per_theme.dir_rate) AS direction_correct_rate
+            -- 2026-05-29 报告命中率 = 报告内 strength>0 题材命中率均值
+            AVG(CASE WHEN per_theme.strength_score > 0
+                     THEN per_theme.theme_hit_rate END) AS hit_rate_avg,
+            -- 2026-05-29 报告方向准确性 = 报告内 strength>0 题材累计方向均值
+            AVG(CASE WHEN per_theme.strength_score > 0
+                     THEN CAST(per_theme.theme_dir_cum AS REAL) END)
+              AS direction_correct_rate
         FROM ai_reports ar
         LEFT JOIN per_theme
                ON per_theme.report_path = ar.file_path
@@ -998,6 +1068,9 @@ def rescore_one_report(
                 pairs_succeeded += 1
                 days_covered_set.add(sd)
                 scored_themes.add(theme_id)
+            except SkippedTheme:
+                pairs_attempted -= 1
+                continue
             except (ScoringError, ValueError) as exc:
                 errors.append(
                     f"theme={theme_id} score_date={sd}: {exc}"
@@ -1194,11 +1267,16 @@ def get_theme_eval_for_report(report_id: int) -> List[Dict]:
         命中 ``theme_predictions(report_path)`` 索引 + 子查询 GROUP BY
         ``theme_id``，单报告（5~20 题材）耗时 < 50ms。
     """
-    # 2026-05-28 22:30 题材级独立体系（与上层报告/模板差异化）：
+    # 2026-05-29 命中率与方向算法重设：
     #   * D+N = sector_pct（保持 v2）
     #   * α+N = sector_pct - benchmark_zz1000_pct（与 D+N 同基础）
-    #   * α   = AVG over 5 days of α+N（即 AVG(sector - zz1000)）
-    #   * α-1 = AVG over D+2..D+5 of α+N（剔除 D+1）
+    #   * α   = AVG over 5 days of α+N
+    #   * α-1 = AVG over D+2..D+5 of α+N
+    #   * **hit_rate_avg**：标的级累计命中率（命中天数/有效天数）跨题材均值
+    #   * **direction_correct_rate**：取最大 days_offset 行的 direction_correct
+    #     （累乘累计判定 1/0），无打分行时 NULL
+    #   * WHERE tp.strength_score > 0 过滤利空/中性题材
+    #   * ORDER BY strength DESC, priority_rank ASC NULLS LAST
     sql = """
     WITH per_theme_scores AS (
         SELECT
@@ -1229,10 +1307,11 @@ def get_theme_eval_for_report(report_id: int) -> List[Dict]:
             AVG(CASE WHEN tps.days_offset BETWEEN 2 AND 5
                      THEN tps.sector_pct - tps.benchmark_zz1000_pct END)
                  AS alpha_avg_excl_d1,
-            AVG(tps.hit_rate) AS hit_rate_avg,
-            AVG(CASE WHEN tps.direction_correct IS NOT NULL
-                     THEN CAST(tps.direction_correct AS REAL) END)
-                 AS dir_rate,
+            -- 题材级方向：取最大 days_offset 行的 direction_correct
+            -- （累乘累计判定，演进最后一帧即题材最终判定）
+            (SELECT direction_correct FROM theme_prediction_scores t2
+              WHERE t2.theme_id = tps.theme_id
+              ORDER BY t2.days_offset DESC LIMIT 1) AS direction_cumulative,
             AVG(tps.sector_pct) AS sector_pct_avg,
             COUNT(tps.id) AS scored_pairs
         FROM theme_prediction_scores tps
@@ -1241,6 +1320,25 @@ def get_theme_eval_for_report(report_id: int) -> List[Dict]:
     stock_count AS (
         SELECT theme_id, COUNT(*) AS n
         FROM theme_stocks
+        GROUP BY theme_id
+    ),
+    -- 2026-05-29 标的级累计命中率（命中天数/有效天数）→ 题材内均值
+    per_theme_hit_rate AS (
+        SELECT
+            theme_id,
+            AVG(stock_hit_rate) AS hit_rate_avg
+        FROM (
+            SELECT
+                theme_id,
+                theme_stock_id,
+                CAST(SUM(CASE WHEN is_hit IS NOT NULL THEN is_hit END)
+                     AS REAL)
+                  / NULLIF(SUM(CASE WHEN is_hit IS NOT NULL THEN 1 END), 0)
+                  AS stock_hit_rate
+            FROM theme_stock_scores
+            GROUP BY theme_id, theme_stock_id
+        )
+        WHERE stock_hit_rate IS NOT NULL
         GROUP BY theme_id
     )
     SELECT
@@ -1261,16 +1359,21 @@ def get_theme_eval_for_report(report_id: int) -> List[Dict]:
         pts.a1, pts.a2, pts.a3, pts.a4, pts.a5,
         pts.alpha_avg,
         pts.alpha_avg_excl_d1,
-        pts.hit_rate_avg,
-        pts.dir_rate AS direction_correct_rate,
+        phr.hit_rate_avg,
+        pts.direction_cumulative AS direction_correct_rate,
         pts.sector_pct_avg
     FROM ai_reports ar
     INNER JOIN theme_predictions tp
             ON tp.report_path = ar.file_path
     LEFT JOIN per_theme_scores pts ON pts.theme_id = tp.id
+    LEFT JOIN per_theme_hit_rate phr ON phr.theme_id = tp.id
     LEFT JOIN stock_count       sc  ON sc.theme_id = tp.id
     WHERE ar.id = ?
-    ORDER BY tp.id ASC
+      AND tp.strength_score > 0
+    ORDER BY tp.strength_score DESC,
+             CASE WHEN tp.priority_rank IS NULL THEN 1 ELSE 0 END,
+             tp.priority_rank ASC,
+             tp.id ASC
     """
 
     ai = get_ai_inference_db()
@@ -1322,6 +1425,7 @@ def get_stock_scores_for_theme(theme_id: int) -> List[Dict]:
     # 2026-05-28 22:00 加入 a_n_pct（pct_chg - 中证1000 当日 pct）
     # 标的本身没存 zz1000，借同一 theme_id+score_date 的 theme_prediction_scores
     # 行 join 取 benchmark_zz1000_pct
+    # 2026-05-29 加入 stock_hit_rate / valid_days：标的级累计命中率
     sql = """
     WITH per_stock_pivot AS (
         SELECT
@@ -1356,7 +1460,13 @@ def get_stock_scores_for_theme(theme_id: int) -> List[Dict]:
                      THEN tss.is_hit END) AS d4_hit,
             MAX(CASE WHEN tss.days_offset=5
                      THEN tss.is_hit END) AS d5_hit,
-            COUNT(tss.id) AS scored_days
+            COUNT(tss.id) AS scored_days,
+            -- 2026-05-29 标的级累计命中率（命中天数 / 有效天数）
+            SUM(CASE WHEN tss.is_hit IS NOT NULL THEN 1 END) AS valid_days,
+            CAST(SUM(CASE WHEN tss.is_hit IS NOT NULL THEN tss.is_hit END)
+                 AS REAL)
+              / NULLIF(SUM(CASE WHEN tss.is_hit IS NOT NULL THEN 1 END), 0)
+              AS stock_hit_rate
         FROM theme_stock_scores tss
         LEFT JOIN theme_prediction_scores tps
                ON tps.theme_id = tss.theme_id
@@ -1374,7 +1484,9 @@ def get_stock_scores_for_theme(theme_id: int) -> List[Dict]:
         psp.d1_pct, psp.d2_pct, psp.d3_pct, psp.d4_pct, psp.d5_pct,
         psp.a1_pct, psp.a2_pct, psp.a3_pct, psp.a4_pct, psp.a5_pct,
         psp.d1_hit, psp.d2_hit, psp.d3_hit, psp.d4_hit, psp.d5_hit,
-        COALESCE(psp.scored_days, 0) AS scored_days
+        COALESCE(psp.scored_days, 0) AS scored_days,
+        COALESCE(psp.valid_days, 0) AS valid_days,
+        psp.stock_hit_rate
     FROM theme_stocks ts
     LEFT JOIN per_stock_pivot psp ON psp.theme_stock_id = ts.id
     WHERE ts.theme_id = ?
@@ -1395,6 +1507,89 @@ def get_stock_scores_for_theme(theme_id: int) -> List[Dict]:
 
 
 _ALLOWED_TIME_DIMS = ("score_date", "report_date")
+
+
+@dataclass
+class PurgeResult:
+    """:func:`purge_scoring_data` 的返回结构。
+
+    Attributes:
+        rows_main: 待删 / 已删的 ``theme_prediction_scores`` 行数。
+        rows_detail: 待删 / 已删的 ``theme_stock_scores`` 行数。
+        backup_path: 真删模式下创建的备份文件路径（dry_run=True 时为 None）。
+        dry_run: True 表示只统计未实际删除。
+    """
+
+    rows_main: int
+    rows_detail: int
+    backup_path: Optional[str]
+    dry_run: bool
+
+
+def purge_scoring_data(*, dry_run: bool = False) -> PurgeResult:
+    """整库清空 ``theme_prediction_scores`` + ``theme_stock_scores``。
+
+    用于 2026-05-29 打分算法重设上线：旧口径打分行必须全部清空避免
+    新旧口径混算。本函数不动 ``theme_predictions`` / ``ai_reports`` /
+    ``theme_stocks`` 三张表——题材抽取数据完好保留，调度器跑下次
+    打分时按新口径自动重写。
+
+    Args:
+        dry_run: True 时只统计待删行数，不实际删除；False 时先备份再删。
+
+    Returns:
+        :class:`PurgeResult`。
+
+    Raises:
+        AIInferenceDBError: 备份失败或 DDL 异常。
+    """
+    ai = get_ai_inference_db()
+    ai.ensure_schema()
+    # 1. 先统计
+    with ai.connect(readonly=True) as conn:
+        n_main = conn.execute(
+            "SELECT COUNT(*) AS c FROM theme_prediction_scores"
+        ).fetchone()["c"]
+        n_detail = conn.execute(
+            "SELECT COUNT(*) AS c FROM theme_stock_scores"
+        ).fetchone()["c"]
+
+    if dry_run:
+        return PurgeResult(
+            rows_main=int(n_main),
+            rows_detail=int(n_detail),
+            backup_path=None,
+            dry_run=True,
+        )
+
+    # 2. 备份再删除
+    from datetime import datetime as _dt
+    from pathlib import Path as _Path
+    backup_dir = _Path("data/backups")
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    stamp = _dt.now().strftime("%Y%m%d_%H%M%S")
+    backup_path = (
+        backup_dir / f"ai_inference.db.purge_scoring.{stamp}.bak"
+    )
+    ai.backup_to(backup_path)
+
+    with ai.connect() as conn:
+        # 子表先删（虽有 CASCADE，但显式更可控）
+        conn.execute("DELETE FROM theme_stock_scores")
+        conn.execute("DELETE FROM theme_prediction_scores")
+
+    _log.warning(
+        "purge_scoring_data 已清空 theme_prediction_scores=%d 行 + "
+        "theme_stock_scores=%d 行，备份 -> %s",
+        n_main, n_detail, backup_path,
+    )
+
+    return PurgeResult(
+        rows_main=int(n_main),
+        rows_detail=int(n_detail),
+        backup_path=str(backup_path),
+        dry_run=False,
+    )
 
 
 def _validate_time_dim(time_dim: str) -> None:
