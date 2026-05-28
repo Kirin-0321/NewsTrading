@@ -1,0 +1,79 @@
+---
+description: 本轮工作完成后由辉夜主动 git commit（不 push），免去主人手动提交的负担
+alwaysApply: true
+---
+
+# 自动 git commit（本轮意图收尾时）
+
+主人懒得每次手动提交，**本轮工作完成后由辉夜主动 `git commit`**。仅此一项授权，等同于主人在每轮对话里 explicit 要求 commit，覆盖默认的"未明确要求不得提交"约束。
+
+## 触发时机
+
+**在做最后一轮回复（即将向主人交付结果）前，执行一次提交动作。** 满足以下任一条件视为「本轮意图完成」：
+
+- 所有 `todo_list` 项目状态变为 `completed`
+- 主人只下达一条简单指令且已执行完毕（无需 todos）
+- 主人在对话中明确说「搞完了 / 收工 / 提交一下 / commit 一下」
+
+## 豁免清单（命中任一立即跳过，不空提交）
+
+1. ✅ `git status` 显示工作区无任何改动 → 跳过，不报错
+2. ✅ 本轮纯属探索 / 调研 / 答疑（只用 Read / Grep / Glob，未触发任何文件写入）→ 跳过
+3. ✅ 主人本轮明确说「先别提交 / 这次不要 commit / 还在调试 / 我自己提」→ 跳过
+4. ⛔ 待提交改动中检测到疑似敏感文件（`.env`、`credentials*`、`*.key`、`*secret*`、`*.pem`、token 类文件）→ **拒绝自动提交**，告知主人并请其手动处理
+
+## 红线（任何情况下都不得越界）
+
+- ❌ 禁止 `git push`（push 永远由主人手动执行）
+- ❌ 禁止 `--no-verify` 跳过 pre-commit hook
+- ❌ 禁止 `git commit --amend`，除非满足《系统约束·Git Safety Protocol》全部条件
+- ❌ 禁止 `git reset --hard` / `git push --force` 等破坏性操作
+- ❌ 禁止修改 `.gitignore` 把改动「藏起来」再提交
+- ❌ 禁止越过 pre-commit 失败硬提：hook 拒绝就修问题、再开新 commit，不要 amend 失败的那次
+
+## 标准动作流（每次都跑一遍）
+
+```
+1. git status                          # 看清状态、过敏感文件
+2. git diff --stat / git diff          # 总结本轮改了什么
+3. git log --oneline -5                # 参考最近 commit 风格
+4. （命中豁免？是 → 跳过并在回复里说一声「无改动，跳过提交」）
+5. git add <相关文件>                  # 不要 git add . 一把梭，按本轮实际改的加
+6. git commit -m "..."                 # 用 HEREDOC 传 message，见下方模板
+7. git status                          # 验证提交成功
+8. 把 commit 的 hash + 简述 写进给主人的最终回复
+```
+
+## commit message 模板（中文，仿现有风格）
+
+参考本仓库现有 commit 风格：**开头动词 + 主要变更 + 目的 / 影响**，详尽但不啰嗦。
+
+```
+git commit -m "$(cat <<'EOF'
+<动词>+<主对象>+<核心变更>。<附带影响 / 关联文件 / 设计意图>。
+EOF
+)"
+```
+
+开头动词词表：`新增 / 更新 / 修复 / 重构 / 优化 / 删除 / 文档`
+
+**示例**：
+
+- `新增 板块走势 Tab，支持选中题材后实时刷新板块数据，优化用户决策路径。`
+- `修复 龙虎榜个股名称缺失问题，从 raw_json 兜底补齐 ts_name 字段。`
+- `重构 三库结构，拆分 ai_inference.db 与 market.db，明确 AI 衍生数据归属。`
+- `文档 新增盘后报告板块表字段扩充施工方案，含 Phase 拆解与验收 checklist。`
+
+## 给主人的最终回复里必须带上
+
+```
+📦 已提交：<commit hash 前 7 位> <commit message 首行>
+```
+
+让主人一眼看到本轮工作已经入库，他想 push 就 push、想 reset 就 reset。
+
+## 与其他规则的协作
+
+- 触发 `doc-workflow.mdc` 条款 A 时（改了文档），同步更新引用方后**一并打进同一 commit**
+- 触发 `cli-first-development.mdc` 时（新增 service + CLI），service 与 CLI 必须同 commit
+- 多 Phase 大型施工：每个 Phase 完成视为一次「本轮意图完成」，分阶段 commit
