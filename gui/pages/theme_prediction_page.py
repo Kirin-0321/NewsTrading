@@ -644,16 +644,14 @@ class ThemePredictionPage(QWidget):
         # 等大比例，布局完成后左右约各占一半
         self.news_splitter.setSizes([10000, 10000])
 
-        # 打分明细 Tab（一期占位，等 plan M3 打分系统上线后填充）
+        # 打分明细 Tab：接通 scoring_service.get_theme_score_detail（2026-05-29）
+        # 选中题材后渲染顶部摘要 + 逐日表（HTML）。未打分时显示空态。
         self.score_detail_browser = QTextBrowser()
         self.score_detail_browser.setStyleSheet(TEXTBROWSER_STYLE)
         self.score_detail_browser.setHtml(
             '<div style="padding:20px;color:#8c8c8c;">'
-            '📊 <b>打分明细</b>（plan M3 打分系统未上线）<br><br>'
-            '上线后此处将展示该题材 5 天追踪期的逐日表现：<br>'
-            '• 板块涨幅 vs 标的平均涨幅 vs 大盘涨幅 三线对比<br>'
-            '• D+1~D+5 脚本分 + 命中率 + Alpha<br>'
-            '• D+5 AI 评分员定性评语<br>'
+            '📊 <b>打分明细</b><br><br>'
+            '请在上表选中一个题材以查看其 D+1~D+5 逐日打分。'
             '</div>'
         )
 
@@ -1039,6 +1037,9 @@ class ThemePredictionPage(QWidget):
                     item.setData(Qt.UserRole, detail_payload)
                 self.news_table.setItem(r, c, item)
 
+        # 打分明细 Tab：用 theme.id 反查 theme_prediction_scores
+        self._render_score_detail(theme)
+
         # 板块走势 Tab：用题材的 sector_ts_code + report_date 刷新
         self._reload_sector_trend(
             sector_ts_code=theme.get("sector_ts_code") or "",
@@ -1130,10 +1131,247 @@ class ThemePredictionPage(QWidget):
         self.stock_table.setRowCount(0)
         self.news_table.setRowCount(0)
         self.news_content_browser.clear()
+        # 打分明细 Tab 回到空态
+        self.score_detail_browser.setHtml(
+            '<div style="padding:20px;color:#8c8c8c;">'
+            '📊 <b>打分明细</b><br><br>'
+            '请在上表选中一个题材以查看其 D+1~D+5 逐日打分。'
+            '</div>'
+        )
         # 板块走势 Tab 一并清空
         self.trend_header.setText("（请在上表选中一个题材以查看其板块走势）")
         self.trend_sparkline.clear()
         self.trend_table.setRowCount(0)
+
+    # ---------- 打分明细 Tab ----------
+
+    def _render_score_detail(self, theme: dict) -> None:
+        """渲染选中题材的 D+1~D+5 逐日打分到「📊 打分明细」Tab。
+
+        数据源：``scoring_service.get_theme_score_detail(theme_id)`` →
+        ``theme_prediction_scores`` 表行（已按 score_date / days_offset 升序）。
+
+        渲染结构（setHtml 单 widget，KISS 避免再造一个表格 widget）：
+
+        * 顶部摘要：题材名 / 报告日 / 强度 / 已打分天数 / 平均命中率 / 累计方向
+        * 中部表格：偏移 / 交易日 / 板块% / 题材% / 中证1000% / α+N / 命中率 / 累计方向
+
+        空态分两种：
+        * ``theme.id`` 缺失（极端老数据，几乎不会发生）→ 提示数据异常
+        * 表为空 → 提示「该题材尚未打分，去评估页一键打分」
+        """
+        theme_id = theme.get("id")
+        if theme_id is None:
+            self.score_detail_browser.setHtml(
+                '<div style="padding:20px;color:#c00;">'
+                '题材 id 缺失，无法反查打分明细（数据异常）'
+                '</div>'
+            )
+            return
+
+        try:
+            from services.scoring.scoring_service import (
+                get_theme_score_detail,
+            )
+            rows = get_theme_score_detail(int(theme_id))
+        except Exception as exc:  # noqa: BLE001
+            self.score_detail_browser.setHtml(
+                f'<div style="padding:20px;color:#c00;">'
+                f'查询打分明细失败：{exc}'
+                f'</div>'
+            )
+            return
+
+        theme_name = theme.get("theme_name") or "—"
+        report_date = theme.get("report_date") or "—"
+        strength_score = theme.get("strength_score")
+        strength_level = theme.get("strength_level") or "—"
+
+        if not rows:
+            self.score_detail_browser.setHtml(
+                '<div style="padding:20px;color:#8c8c8c;">'
+                f'📊 <b>{theme_name}</b>（{report_date}）<br><br>'
+                '该题材尚未打分。<br><br>'
+                '<span style="color:#1890ff;">'
+                '👉 切到「📊 模板评估」页 → 选中对应报告 → '
+                '点行内「⚡初次打分」按钮，即可生成 D+1~D+5 追踪数据。'
+                '</span>'
+                '</div>'
+            )
+            return
+
+        # 顶部摘要计算
+        hit_rates = [
+            r["hit_rate"] for r in rows
+            if r.get("hit_rate") is not None
+        ]
+        avg_hr = sum(hit_rates) / len(hit_rates) if hit_rates else None
+        # direction_correct 是累计判定（05-29 算法重设），取最后一天的值即可
+        last_dir = rows[-1].get("direction_correct") if rows else None
+
+        head_lines = [
+            f'<span style="font-size:14px;font-weight:600;">'
+            f'📊 {theme_name}</span>',
+            f'<span style="color:#595959;">　报告日 {report_date}</span>',
+        ]
+        if strength_score is not None:
+            head_lines.append(
+                f'<span style="color:#595959;">　强度 '
+                f'{int(strength_score):+d}（{strength_level}）</span>'
+            )
+        head_lines.append(
+            f'<span style="color:#595959;">　已打分 {len(rows)} 天</span>'
+        )
+        if avg_hr is not None:
+            head_lines.append(
+                f'<span style="color:#595959;">　平均命中率 '
+                f'<b>{avg_hr * 100:.1f}%</b></span>'
+            )
+        if last_dir is not None:
+            dir_text = (
+                '<span style="color:#cf1322;">✓ 正确</span>'
+                if int(last_dir) == 1
+                else '<span style="color:#389e0d;">✗ 不准</span>'
+            )
+            head_lines.append(
+                f'<span style="color:#595959;">　累计方向 {dir_text}</span>'
+            )
+        header_html = '<div style="margin-bottom:10px;">' + ''.join(
+            head_lines
+        ) + '</div>'
+
+        # 逐日表
+        thead = (
+            '<tr style="background:#fafafa;">'
+            '<th style="padding:4px 8px;text-align:right;">偏移</th>'
+            '<th style="padding:4px 8px;">交易日</th>'
+            '<th style="padding:4px 8px;text-align:right;">板块%</th>'
+            '<th style="padding:4px 8px;text-align:right;">题材%</th>'
+            '<th style="padding:4px 8px;text-align:right;">中证1000%</th>'
+            '<th style="padding:4px 8px;text-align:right;">α+N</th>'
+            '<th style="padding:4px 8px;text-align:right;">命中率</th>'
+            '<th style="padding:4px 8px;text-align:center;">累计方向</th>'
+            '</tr>'
+        )
+
+        body_rows = []
+        for r in rows:
+            offset = r.get("days_offset")
+            sd = r.get("score_date") or ""
+            sec = r.get("sector_pct")
+            tpct = r.get("theme_pct")
+            zz = r.get("benchmark_zz1000_pct")
+            alpha = (
+                tpct - zz if tpct is not None and zz is not None else None
+            )
+            hr = r.get("hit_rate")
+            hc = r.get("hit_count")
+            tc = r.get("total_count")
+            dc = r.get("direction_correct")
+
+            body_rows.append(
+                '<tr>'
+                f'<td style="padding:3px 8px;text-align:right;">D+{offset}</td>'
+                f'<td style="padding:3px 8px;color:#8c8c8c;">{sd}</td>'
+                f'<td style="padding:3px 8px;text-align:right;">'
+                f'{self._fmt_pct_colored(sec)}</td>'
+                f'<td style="padding:3px 8px;text-align:right;">'
+                f'{self._fmt_pct_colored(tpct)}</td>'
+                f'<td style="padding:3px 8px;text-align:right;color:#8c8c8c;">'
+                f'{self._fmt_pct_plain(zz)}</td>'
+                f'<td style="padding:3px 8px;text-align:right;">'
+                f'{self._fmt_pct_colored(alpha)}</td>'
+                f'<td style="padding:3px 8px;text-align:right;">'
+                f'{self._fmt_hit(hr, hc, tc)}</td>'
+                f'<td style="padding:3px 8px;text-align:center;">'
+                f'{self._fmt_direction(dc)}</td>'
+                '</tr>'
+            )
+
+        table_html = (
+            '<table border="0" cellspacing="0" cellpadding="0" '
+            'style="border-collapse:collapse;width:100%;font-size:12px;">'
+            + thead + ''.join(body_rows) + '</table>'
+        )
+
+        # AI 评分员评语（如有，挂在尾部）
+        ai_comments = [
+            (r.get("days_offset"), r.get("ai_review_label"),
+             r.get("ai_review_comment"))
+            for r in rows
+            if r.get("ai_review_label") or r.get("ai_review_comment")
+        ]
+        ai_html = ""
+        if ai_comments:
+            ai_lines = []
+            for off, lbl, cmt in ai_comments:
+                ai_lines.append(
+                    f'<div style="margin-top:6px;">'
+                    f'<b>D+{off} {lbl or ""}</b>：'
+                    f'<span style="color:#595959;">{cmt or ""}</span>'
+                    f'</div>'
+                )
+            ai_html = (
+                '<div style="margin-top:14px;padding-top:8px;'
+                'border-top:1px solid #f0f0f0;">'
+                '<div style="color:#1890ff;font-weight:600;">'
+                '🤖 AI 评分员评语</div>'
+                + ''.join(ai_lines) + '</div>'
+            )
+
+        self.score_detail_browser.setHtml(
+            '<div style="padding:8px 12px;">'
+            + header_html + table_html + ai_html
+            + '</div>'
+        )
+
+    @staticmethod
+    def _fmt_pct_colored(v) -> str:
+        if v is None:
+            return '<span style="color:#bfbfbf;">—</span>'
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return '<span style="color:#bfbfbf;">—</span>'
+        color = "#cf1322" if f > 0 else ("#389e0d" if f < 0 else "#595959")
+        return f'<span style="color:{color};">{f:+.2f}%</span>'
+
+    @staticmethod
+    def _fmt_pct_plain(v) -> str:
+        if v is None:
+            return "—"
+        try:
+            return f"{float(v):+.2f}%"
+        except (TypeError, ValueError):
+            return "—"
+
+    @staticmethod
+    def _fmt_hit(hr, hc, tc) -> str:
+        if hr is None and (hc is None or tc is None):
+            return '<span style="color:#bfbfbf;">—</span>'
+        if tc is None or int(tc) == 0:
+            return '<span style="color:#bfbfbf;">无标的</span>'
+        try:
+            rate = float(hr) * 100 if hr is not None else 0.0
+        except (TypeError, ValueError):
+            rate = 0.0
+        color = "#cf1322" if rate >= 50 else "#595959"
+        return (
+            f'<span style="color:{color};">'
+            f'{int(hc or 0)}/{int(tc)} ({rate:.0f}%)</span>'
+        )
+
+    @staticmethod
+    def _fmt_direction(v) -> str:
+        if v is None:
+            return '<span style="color:#bfbfbf;">—</span>'
+        try:
+            iv = int(v)
+        except (TypeError, ValueError):
+            return '<span style="color:#bfbfbf;">—</span>'
+        if iv == 1:
+            return '<span style="color:#cf1322;">✓</span>'
+        return '<span style="color:#389e0d;">✗</span>'
 
     # ---------- 板块走势 Tab ----------
 
