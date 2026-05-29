@@ -246,9 +246,11 @@ class DataPage(QWidget):
         elif self.current_type == "rejected_db":
             self._refresh_rejected_db()
         elif self.current_type == "summaries_md":
-            self._refresh_md_files("data/summaries", ".md")
+            self._refresh_md_files("data/summaries", ".md", recursive=False)
         else:
-            self._refresh_md_files("data/analysis", ".md")
+            # AI 分析报告实际产出位置：data/AI_analysis/{月日}/*.md
+            # 需要递归扫描子目录（原代码写成 data/analysis 且不递归，长期无数据）
+            self._refresh_md_files("data/AI_analysis", ".md", recursive=True)
 
     def _refresh_raw_db(self):
         from services.storage import get_raw_store
@@ -331,25 +333,49 @@ class DataPage(QWidget):
         layout.addWidget(del_btn)
         return w
 
-    def _refresh_md_files(self, directory, extension):
+    def _refresh_md_files(self, directory, extension, recursive: bool = False):
+        """扫描目录下的 .md 文件填充列表。
+
+        Args:
+            directory: 扫描根目录（项目相对路径）
+            extension: 文件名后缀，如 ``.md``
+            recursive: 是否递归子目录。AI 分析报告按 ``{月日}/`` 分子目录存放，
+                必须 ``True``；summaries 单层平铺，``False`` 即可。
+        """
         self.file_table.setRowCount(0)
         if not os.path.exists(directory):
             self.stats_label.setText("目录不存在")
             return
 
         files = []
-        for filename in os.listdir(directory):
-            if not filename.endswith(extension):
-                continue
-            path = os.path.join(directory, filename)
-            stat = os.stat(path)
-            files.append({
-                "name": filename,
-                "path": path,
-                "size": stat.st_size,
-                "mtime": stat.st_mtime,
-                "count": "-",
-            })
+        if recursive:
+            for root, _dirs, filenames in os.walk(directory):
+                for filename in filenames:
+                    if not filename.endswith(extension):
+                        continue
+                    path = os.path.join(root, filename)
+                    stat = os.stat(path)
+                    rel = os.path.relpath(path, directory).replace("\\", "/")
+                    files.append({
+                        "name": rel,
+                        "path": path,
+                        "size": stat.st_size,
+                        "mtime": stat.st_mtime,
+                        "count": "-",
+                    })
+        else:
+            for filename in os.listdir(directory):
+                if not filename.endswith(extension):
+                    continue
+                path = os.path.join(directory, filename)
+                stat = os.stat(path)
+                files.append({
+                    "name": filename,
+                    "path": path,
+                    "size": stat.st_size,
+                    "mtime": stat.st_mtime,
+                    "count": "-",
+                })
 
         files.sort(key=lambda x: x["mtime"], reverse=True)
         for f in files:
@@ -449,10 +475,11 @@ class DataPage(QWidget):
                 content = f.read()
             dialog = QDialog(self)
             dialog.setWindowTitle(os.path.basename(path))
-            dialog.resize(800, 600)
+            dialog.resize(900, 700)
             v = QVBoxLayout(dialog)
             b = QTextBrowser()
-            b.setPlainText(content[:50000])
+            b.setOpenExternalLinks(True)
+            b.setMarkdown(content)
             b.setStyleSheet(TEXTBROWSER_STYLE)
             v.addWidget(b)
             btn = QDialogButtonBox(QDialogButtonBox.Ok)

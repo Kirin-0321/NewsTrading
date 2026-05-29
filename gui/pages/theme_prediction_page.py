@@ -117,6 +117,11 @@ _SECTOR_TREND_COLS = [
 # 评估窗口（D+1 ~ D+EVAL_DAYS）长度，与打分模块对齐
 _TREND_EVAL_DAYS = 5
 
+# 板块匹配置信度弱匹配阈值：低于该值视为「弱匹配 / 仅供参考」。
+# 与评估页 prompt_eval_page._render_theme_branch 的 ⚠ 角标判定保持一致
+# （历史上题材页用 0.7、评估页用 0.5 不对齐，05-29 统一为 0.5）。
+_SECTOR_WEAK_MATCH_CONF = 0.5
+
 
 class ThemePredictionPage(QWidget):
     """题材预测库页面。"""
@@ -883,8 +888,8 @@ class ThemePredictionPage(QWidget):
                 elif col == 3:  # 分数（按正负染色）
                     item.setForeground(self._score_color(score))
                 elif col == 4 and sector_code and sector_conf is not None \
-                        and sector_conf < 0.7:
-                    # 板块匹配置信度低 → 标橙提示需人工确认
+                        and sector_conf < _SECTOR_WEAK_MATCH_CONF:
+                    # 板块匹配置信度低 → 标橙提示需人工确认（与评估页 ⚠ 同阈值）
                     item.setForeground(QColor("#fa8c16"))
                 self.theme_table.setItem(row, col, item)
 
