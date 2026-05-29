@@ -1383,6 +1383,95 @@ def get_theme_eval_for_report(report_id: int) -> List[Dict]:
 
 
 # ---------------------------------------------------------------------------
+# 6B. 题材预测页筛选用：按 theme_ids 批量取聚合打分
+# ---------------------------------------------------------------------------
+
+
+def get_score_aggregates_by_theme_ids(
+    theme_ids: List[int],
+) -> Dict[int, Dict]:
+    """按题材 id 列表批量取聚合打分（命中率 / 累计方向 / α / 已打分天数）。
+
+    业务定位：
+        题材预测页（v3）筛选条 "命中率下限 / 方向准确性 / α" 需要在主表
+        渲染前一次性取回所有题材的聚合打分，本函数提供。
+
+    实现要点：
+        * 复用 :func:`get_theme_eval_for_report` 的 ``per_theme_scores`` /
+          ``per_theme_hit_rate`` 两个 CTE 结构
+        * 与 ``get_theme_eval_for_report`` 的差异：
+          - 不 JOIN ``theme_predictions`` / ``ai_reports``（主数据已在 GUI 手里）
+          - 不强制 ``strength_score > 0`` 过滤（让 GUI 自己决定显不显示利空）
+          - 入参是 ID 列表（IN 查询），不是 ai_reports.id 单 ID
+        * 返回字典，未打分的题材**不放进字典**（上层据此判定 None）
+
+    Args:
+        theme_ids: ``theme_predictions.id`` 列表（int），允许空 / 含重复
+
+    Returns:
+        ``{theme_id: {"hit_rate_avg": float, "direction_correct": int,
+        "alpha_avg": float, "scored_pairs": int}}``
+
+    SQL 性能:
+        单次 IN 查询 + 两个 CTE，百级 theme_ids < 50ms。
+    """
+    cleaned = sorted({int(t) for t in theme_ids if t is not None})
+    if not cleaned:
+        return {}
+
+    placeholders = ",".join("?" * len(cleaned))
+    sql = f"""
+    WITH per_theme_scores AS (
+        SELECT
+            tps.theme_id,
+            (SELECT direction_correct FROM theme_prediction_scores t2
+              WHERE t2.theme_id = tps.theme_id
+              ORDER BY t2.days_offset DESC LIMIT 1) AS direction_cumulative,
+            AVG(CASE WHEN tps.days_offset BETWEEN 1 AND 5
+                     THEN tps.sector_pct - tps.benchmark_zz1000_pct END)
+                AS alpha_avg,
+            COUNT(tps.id) AS scored_pairs
+        FROM theme_prediction_scores tps
+        WHERE tps.theme_id IN ({placeholders})
+        GROUP BY tps.theme_id
+    ),
+    per_theme_hit_rate AS (
+        SELECT
+            theme_id,
+            AVG(stock_hit_rate) AS hit_rate_avg
+        FROM (
+            SELECT
+                theme_id,
+                theme_stock_id,
+                CAST(SUM(CASE WHEN is_hit IS NOT NULL THEN is_hit END)
+                     AS REAL)
+                  / NULLIF(SUM(CASE WHEN is_hit IS NOT NULL THEN 1 END), 0)
+                  AS stock_hit_rate
+            FROM theme_stock_scores
+            WHERE theme_id IN ({placeholders})
+            GROUP BY theme_id, theme_stock_id
+        )
+        WHERE stock_hit_rate IS NOT NULL
+        GROUP BY theme_id
+    )
+    SELECT
+        pts.theme_id,
+        phr.hit_rate_avg,
+        pts.direction_cumulative AS direction_correct,
+        pts.alpha_avg,
+        pts.scored_pairs
+    FROM per_theme_scores pts
+    LEFT JOIN per_theme_hit_rate phr ON phr.theme_id = pts.theme_id
+    """
+
+    params = list(cleaned) + list(cleaned)  # 两处 IN 占位
+    ai = get_ai_inference_db()
+    with ai.connect(readonly=True) as conn:
+        rows = conn.execute(sql, params).fetchall()
+    return {int(r["theme_id"]): dict(r) for r in rows}
+
+
+# ---------------------------------------------------------------------------
 # 7. 评估页树形第 3 层：一个题材下每只标的的逐日涨跌
 # ---------------------------------------------------------------------------
 
