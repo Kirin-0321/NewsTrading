@@ -61,8 +61,8 @@ from PyQt5.QtWidgets import (
     QAbstractItemView, QCheckBox, QComboBox, QDateTimeEdit,
     QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget,
     QListWidgetItem, QMessageBox, QPushButton, QSizePolicy,
-    QSpinBox, QSplitter, QTableWidget, QTableWidgetItem, QTextBrowser,
-    QTextEdit, QVBoxLayout, QWidget,
+    QSpinBox, QSplitter, QTableWidget, QTableWidgetItem, QTabWidget,
+    QTextBrowser, QTextEdit, QVBoxLayout, QWidget,
 )
 
 from gui.utils.paths import find_typora_executable, resolve_project_path
@@ -458,7 +458,13 @@ class AIAnalysisPage(QWidget):
         return group
 
     def _build_result_group(self) -> QGroupBox:
-        group = QGroupBox("📝 分析结果（选中任务流式）")
+        """分析结果区：双 Tab —— 「📡 实时流式」+「📄 成品报告」。
+
+        - 实时流式 Tab：保留原 ``result_browser``（``insertPlainText`` 流式追加）
+        - 成品报告 Tab：新增 ``md_browser``，SUCCESS 后用 ``setMarkdown`` 渲染
+          排版后的报告，与手动回测页同款体验，免去开外部 Typora 一步。
+        """
+        group = QGroupBox("📝 分析结果（选中任务）")
         layout = QVBoxLayout(group)
 
         toolbar = QHBoxLayout()
@@ -473,13 +479,23 @@ class AIAnalysisPage(QWidget):
         toolbar.addWidget(self.open_report_btn)
         layout.addLayout(toolbar)
 
+        self.result_tabs = QTabWidget()
+        self.result_tabs.setSizePolicy(
+            QSizePolicy.Expanding, QSizePolicy.Expanding
+        )
+
         self.result_browser = QTextBrowser()
         self.result_browser.setStyleSheet(TEXTBROWSER_STYLE)
         self.result_browser.setMinimumHeight(180)
-        self.result_browser.setSizePolicy(
-            QSizePolicy.Expanding, QSizePolicy.Expanding
-        )
-        layout.addWidget(self.result_browser)
+        self.result_tabs.addTab(self.result_browser, "📡 实时流式")
+
+        self.md_browser = QTextBrowser()
+        self.md_browser.setStyleSheet(TEXTBROWSER_STYLE)
+        self.md_browser.setOpenExternalLinks(True)
+        self.md_browser.setMinimumHeight(180)
+        self.result_tabs.addTab(self.md_browser, "📄 成品报告")
+
+        layout.addWidget(self.result_tabs)
         return group
 
     # =====================================================================
@@ -1179,7 +1195,7 @@ class AIAnalysisPage(QWidget):
             self.result_browser.insertPlainText(chunk)
         self.result_browser.moveCursor(QTextCursor.End)
 
-        # 状态条 + 打开报告按钮
+        # 状态条 + 打开报告按钮 + 成品报告 md 预览
         self._update_status_label_for(task)
         result = task.result or {}
         report_file = result.get("report_file")
@@ -1188,9 +1204,11 @@ class AIAnalysisPage(QWidget):
             if abs_path and os.path.exists(abs_path):
                 self.open_report_btn.setEnabled(True)
                 self._last_report_path = abs_path
+                self._render_md(abs_path)
                 return
         self.open_report_btn.setEnabled(False)
         self._last_report_path = None
+        self.md_browser.clear()
 
     def _update_status_label_for(self, task: AnalysisTask) -> None:
         color = STATUS_COLOR[task.status]
@@ -1232,8 +1250,26 @@ class AIAnalysisPage(QWidget):
         )
         self.progress_browser.clear()
         self.result_browser.clear()
+        self.md_browser.clear()
         self.open_report_btn.setEnabled(False)
         self._last_report_path = None
+
+    def _render_md(self, abs_path: str) -> None:
+        """读取报告 md 完整内容到「📄 成品报告」Tab。
+
+        Args:
+            abs_path: 报告绝对路径（``_refresh_for_selected_task`` 已 resolve
+                + ``os.path.exists`` 校验，这里只兜读取异常）。
+        """
+        try:
+            from pathlib import Path
+            text = Path(abs_path).read_text(encoding="utf-8")
+        except Exception as exc:  # noqa: BLE001
+            self.md_browser.setHtml(
+                f"<span style='color:#c00'>读取报告失败：{exc}</span>"
+            )
+            return
+        self.md_browser.setMarkdown(text)
 
     # --- 删除任务 -----------------------------------------------------------
 
