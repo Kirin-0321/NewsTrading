@@ -140,6 +140,9 @@ class ThemePredictionPage(QWidget):
         self._current_themes: list = []
         self._sort_col: Optional[int] = None
         self._sort_asc: bool = True
+        # 锁定到 ai_reports.id 的单报告精确浏览模式（评估页双击进入）；
+        # None = 普通"按日期+模板"浏览。详见 load_by_report_id 文档。
+        self._locked_report_id: Optional[int] = None
         self.init_ui()
         # RUNNING 任务用时实时刷新（参考手动回测同款 1s tick）
         self._elapsed_timer = QTimer(self)
@@ -555,6 +558,19 @@ class ThemePredictionPage(QWidget):
         group = QGroupBox("📊 已入库题材")
         layout = QVBoxLayout()
 
+        # 单报告 lock 指示条（评估页双击进入时显示，点击解除回到日期模式）
+        self.lock_indicator = QLabel("")
+        self.lock_indicator.setStyleSheet(
+            "background:#fffbe6;border:1px solid #ffe58f;"
+            "padding:6px 10px;color:#874d00;"
+        )
+        self.lock_indicator.setOpenExternalLinks(False)
+        self.lock_indicator.linkActivated.connect(
+            lambda _href: self._release_report_lock()
+        )
+        self.lock_indicator.setVisible(False)
+        layout.addWidget(self.lock_indicator)
+
         # 控制行：日期选择 + 模板筛选 + 刷新
         ctrl = QHBoxLayout()
         ctrl.addWidget(QLabel("报告日期:"))
@@ -781,16 +797,25 @@ class ThemePredictionPage(QWidget):
             self._clear_detail()
 
     def _on_date_changed(self, _idx: int):
+        # 用户切日期 → 自动解锁，回到普通浏览
+        if self._locked_report_id is not None:
+            self._release_report_lock(reload=False)
         date = self.date_combo.currentData()
         if date:
             self._reload_themes_for_date(date)
 
     def _on_prompt_changed(self, _idx: int):
+        # 用户切模板 → 自动解锁
+        if self._locked_report_id is not None:
+            self._release_report_lock(reload=False)
         date = self.date_combo.currentData()
         if date:
             self._reload_themes_for_date(date)
 
     def _reload_themes_for_date(self, report_date: str):
+        # lock 模式下 date/prompt 切换不应触发覆盖（load_by_report_id 接管）
+        if self._locked_report_id is not None:
+            return
         from services.storage import get_theme_store
         prompt_id = self.prompt_combo.currentData()
         themes = get_theme_store().get_by_date(
@@ -800,6 +825,110 @@ class ThemePredictionPage(QWidget):
         self._current_themes = themes
         self._render_theme_table(themes)
         self._clear_detail()
+
+    def load_by_report_id(
+        self,
+        ai_report_id: int,
+        *,
+        hint_date: str = "",
+        hint_prompt: str = "",
+    ) -> None:
+        """按 ``ai_reports.id`` 精确加载单份报告题材并进入 lock 模式。
+
+        业务定位：
+            评估页双击某行报告时，主窗口透传 ai_report_id 调本方法；
+            解决同日同模板多份报告题材混在一张表里的痛点。
+
+        Args:
+            ai_report_id: ``ai_reports.id``（int，>0）
+            hint_date: 该报告的 report_date（用于把 date_combo 同步过去，
+                解锁后用户能继续看全天题材）；空串则不动 combo
+            hint_prompt: 该报告的 prompt_id（同上，为 prompt_combo 提供提示）
+
+        实现要点：
+            * 设 _locked_report_id 标记 → _reload_themes_for_date 在 lock
+              下短路，避免被切 combo 触发重渲染
+            * 同步 combo 用 blockSignals 防循环触发
+            * 锁定期间禁用「删除当前报告题材」按钮（语义是按日期+模板删，
+              与 lock 模式语义不一致，避免误删）
+        """
+        from services.storage import get_theme_store
+        try:
+            themes = get_theme_store().get_by_ai_report_id(int(ai_report_id))
+        except Exception as exc:  # noqa: BLE001
+            self.lock_indicator.setText(
+                f'<span style="color:#c00;">'
+                f'加载 ai_report_id={ai_report_id} 失败：{exc}'
+                f'</span>'
+            )
+            self.lock_indicator.setVisible(True)
+            return
+
+        self._locked_report_id = int(ai_report_id)
+
+        # 同步 combo（不触发槽，避免立即解锁）
+        if hint_date:
+            for combo in (self.date_combo,):
+                combo.blockSignals(True)
+                for i in range(combo.count()):
+                    if combo.itemData(i) == hint_date:
+                        combo.setCurrentIndex(i)
+                        break
+                combo.blockSignals(False)
+        if hint_prompt:
+            self.prompt_combo.blockSignals(True)
+            for i in range(self.prompt_combo.count()):
+                if self.prompt_combo.itemData(i) == hint_prompt:
+                    self.prompt_combo.setCurrentIndex(i)
+                    break
+            self.prompt_combo.blockSignals(False)
+
+        # 渲染锁指示条 + 题材表 + 清空详情
+        from gui.utils.date_format import format_yyyymmdd_to_dash
+        from gui.utils.prompt_name_helper import friendly_prompt_name
+        date_show = (
+            format_yyyymmdd_to_dash(hint_date) if hint_date else "—"
+        )
+        prompt_show = (
+            friendly_prompt_name(hint_prompt, fallback=hint_prompt or "—")
+            if hint_prompt else "—"
+        )
+        self.lock_indicator.setText(
+            f'🔒 已锁定单报告浏览：'
+            f'<b>ai_reports.id={ai_report_id}</b>　'
+            f'<span style="color:#8c8c8c;">'
+            f'{date_show}　{prompt_show}　'
+            f'共 {len(themes)} 个题材</span>　'
+            f'<a href="#release" style="color:#1890ff;">[✕ 解除]</a>'
+        )
+        self.lock_indicator.setVisible(True)
+
+        self._reset_theme_sort()
+        self._current_themes = themes
+        self._render_theme_table(themes)
+        self._clear_detail()
+        # 锁定模式下禁用"按日期+模板"语义的删除按钮
+        if hasattr(self, "delete_btn"):
+            self.delete_btn.setEnabled(False)
+
+    def _release_report_lock(self, reload: bool = True) -> None:
+        """解除单报告锁定，回到「日期+模板」浏览模式。
+
+        Args:
+            reload: True = 按当前 date/prompt 立即重渲染；False = 由调用方
+                后续触发（避免双重 reload）
+        """
+        if self._locked_report_id is None:
+            return
+        self._locked_report_id = None
+        self.lock_indicator.setVisible(False)
+        self.lock_indicator.setText("")
+        if hasattr(self, "delete_btn"):
+            self.delete_btn.setEnabled(True)
+        if reload:
+            date = self.date_combo.currentData()
+            if date:
+                self._reload_themes_for_date(date)
 
     @staticmethod
     def _log_debug(msg: str) -> None:

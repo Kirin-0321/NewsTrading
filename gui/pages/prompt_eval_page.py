@@ -305,9 +305,10 @@ class _TplTableItem(QTableWidgetItem):
 class PromptEvalPage(QWidget):
     """模板评估页（master-detail 双表）。"""
 
-    #: 双击下表行时发出：(report_date YYYYMMDD, prompt_id)
-    #: 主窗口接住后切换到题材预测页并预选筛选器
-    theme_drilldown_requested = pyqtSignal(str, str)
+    #: 双击下表行时发出：(report_date YYYYMMDD, prompt_id, ai_report_id)
+    #: 主窗口接住后切换到题材预测页并按 ai_report_id 精确锁定该报告
+    #: （ai_report_id=0 退化为按 date+prompt 浏览）
+    theme_drilldown_requested = pyqtSignal(str, str, int)
 
     def __init__(self):
         super().__init__()
@@ -1280,9 +1281,14 @@ class PromptEvalPage(QWidget):
         data = payload.get("data") or {}
         rd = data.get("report_date") or ""
         pid = data.get("prompt_id") or ""
+        rid_raw = data.get("report_id")
+        try:
+            rid = int(rid_raw) if rid_raw is not None else 0
+        except (TypeError, ValueError):
+            rid = 0
         if not rd:
             return
-        self.theme_drilldown_requested.emit(rd, pid)
+        self.theme_drilldown_requested.emit(rd, pid, rid)
 
     def _on_delete_clicked(
         self, report_id: int, is_backtest: int, data: Dict,

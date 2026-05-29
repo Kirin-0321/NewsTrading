@@ -350,13 +350,51 @@ class ThemeStore:
             ).fetchone()[0]
 
     def get_by_report(self, report_id: str) -> List[Dict]:
-        """按报告 ID 取所有题材（含关联标的 / 新闻）。"""
+        """按 ``theme_predictions.report_id`` 文件名字符串取所有题材。
+
+        注意：``report_id`` 这里是文件名 string（不带 .md），**不是**
+        ``ai_reports.id``。需要按 ``ai_reports.id`` int 取的，用
+        :meth:`get_by_ai_report_id`。
+        """
         with get_ai_inference_db().connect() as conn:
             rows = conn.execute(
                 "SELECT * FROM theme_predictions WHERE report_id = ? "
                 "ORDER BY priority_rank IS NULL, priority_rank, "
                 "strength_score DESC",
                 (report_id,),
+            ).fetchall()
+            return [self._expand(conn, r) for r in rows]
+
+    def get_by_ai_report_id(self, ai_report_id: int) -> List[Dict]:
+        """按 ``ai_reports.id`` 精确取该报告下所有题材。
+
+        业务定位：
+            评估页双击某行报告 → 主窗口 ``_on_eval_drilldown`` 透传
+            ``ai_reports.id`` 到题材页，题材页据此 lock 到这一份报告，
+            解决"同日同模板多份报告题材混表"的痛点。
+
+        关联键：``theme_predictions.report_path = ai_reports.file_path``
+        （软关联，主表早期建表就这么定的，不是 FK）。
+
+        Args:
+            ai_report_id: ``ai_reports.id``（int）。不存在或无题材时返
+                回空列表，不抛错。
+
+        Returns:
+            与 :meth:`get_by_date` 同结构（dict + 关联 stocks / news），
+            排序按强度 DESC + priority_rank ASC，与主表自然顺序一致。
+        """
+        with get_ai_inference_db().connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT tp.* FROM theme_predictions tp
+                JOIN ai_reports ar ON ar.file_path = tp.report_path
+                WHERE ar.id = ?
+                ORDER BY tp.priority_rank IS NULL,
+                         tp.priority_rank,
+                         tp.strength_score DESC
+                """,
+                (ai_report_id,),
             ).fetchall()
             return [self._expand(conn, r) for r in rows]
 

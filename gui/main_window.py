@@ -194,19 +194,36 @@ class MainWindow(QMainWindow):
             if hasattr(page, 'refresh'):
                 page.refresh()
 
-    def _on_eval_drilldown(self, report_date: str, prompt_id: str) -> None:
-        """评估页双击报告行 → 切到题材预测页 + 预选 (date, prompt_id)。
+    def _on_eval_drilldown(
+        self, report_date: str, prompt_id: str, ai_report_id: int = 0,
+    ) -> None:
+        """评估页双击报告行 → 切到题材预测页。
 
         Args:
             report_date: ai_reports.report_date（与 theme_predictions
                 的同字段格式一致，可直接 itemData 等值匹配）
             prompt_id: 该报告的 prompt_id，用于预选模板下拉
+            ai_report_id: ``ai_reports.id``（int）。>0 时题材页按该报告
+                精确锁定（解决同日同模板多份报告题材混表）；=0 时退回
+                旧行为：仅预选 (date, prompt_id) 浏览。
         """
         theme_page = self.pages.get('theme_prediction')
         if theme_page is None:
             return
         self.show_page('theme_prediction')
-        # 预选 date_combo
+        # ai_report_id>0：交给题材页 lock 模式接管 date / prompt / 题材
+        if ai_report_id > 0 and hasattr(theme_page, 'load_by_report_id'):
+            try:
+                theme_page.load_by_report_id(
+                    ai_report_id,
+                    hint_date=report_date,
+                    hint_prompt=prompt_id,
+                )
+                return
+            except Exception as e:  # noqa: BLE001
+                print(f"[MainWindow] 题材页 lock 模式失败: {e}")
+                # 失败回退到日期模式
+        # 退化：预选 date_combo
         try:
             theme_page._reload_dates(prefer_date=report_date)
         except Exception as e:  # noqa: BLE001
