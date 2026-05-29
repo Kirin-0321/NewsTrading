@@ -55,7 +55,7 @@ _THEME_TABLE_COLS = [
     ("题材", 180),
     ("等级", 90),
     ("分数", 60),
-    ("板块代码", 90),
+    ("板块", 180),
     ("模板", 150),
     ("冷处理", 60),
     ("持续性", 70),
@@ -857,15 +857,21 @@ class ThemePredictionPage(QWidget):
 
     def _render_theme_table(self, themes: list):
         from gui.utils.prompt_name_helper import friendly_prompt_name
+        from services.market.sector_daily_query import get_sector_names
+
+        # 批量反查 dim_sector 中文名（market.db 跨库一次，避免逐行查）
+        name_map = get_sector_names(
+            [t.get("sector_ts_code") or "" for t in themes]
+        )
+
         self.theme_table.setRowCount(len(themes))
         for row, t in enumerate(themes):
             score = t.get("strength_score")
             sector_code = t.get("sector_ts_code") or ""
             sector_conf = t.get("sector_match_conf")
-            sector_text = (
-                f"{sector_code} ({sector_conf:.2f})"
-                if sector_code and sector_conf is not None
-                else sector_code
+            sector_name = name_map.get(sector_code, "")
+            sector_text = self._format_sector_cell(
+                sector_name, sector_code, sector_conf
             )
             cells = [
                 t.get("report_time") or "",
@@ -892,6 +898,25 @@ class ThemePredictionPage(QWidget):
                     # 板块匹配置信度低 → 标橙提示需人工确认（与评估页 ⚠ 同阈值）
                     item.setForeground(QColor("#fa8c16"))
                 self.theme_table.setItem(row, col, item)
+
+    @staticmethod
+    def _format_sector_cell(name: str, code: str, conf) -> str:
+        """板块单元格文案：``{中文名} ({代码} 0.95)``。
+
+        - 三者都有 → ``酿酒概念 (BK0477.DC 0.95)``
+        - 无中文名（dim_sector 未命中） → ``BK0477.DC (0.95)``（旧格式兜底）
+        - 无 conf → ``酿酒概念 (BK0477.DC)`` / ``BK0477.DC``
+        - 无 code → 空串
+        """
+        if not code:
+            return ""
+        conf_part = f"{conf:.2f}" if conf is not None else ""
+        if name:
+            return (
+                f"{name} ({code} {conf_part})" if conf_part
+                else f"{name} ({code})"
+            )
+        return f"{code} ({conf_part})" if conf_part else code
 
     @staticmethod
     def _format_score(score) -> str:

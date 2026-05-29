@@ -227,8 +227,53 @@ def _to_int(v: Any) -> Optional[int]:
         return None
 
 
+def get_sector_names(ts_codes: List[str]) -> Dict[str, str]:
+    """批量反查板块 ts_code → 中文名映射。
+
+    业务定位：
+        题材预测页 ``_render_theme_table`` 渲染前一次性取回当批板块名，
+        把 ``BK0477.DC`` 之类的代码显示成 ``白酒 (BK0477.DC)``。
+
+    Args:
+        ts_codes: 板块代码列表，允许重复 / 含空串 / 含 None；
+            内部会去重 + 过滤空值。
+
+    Returns:
+        ``{ts_code: name}``；查不到的键**不放进字典**（上层据此回退显示）。
+        参数为空或 ``dim_sector`` 无任何命中时返回空 dict（不抛错）。
+
+    SQL 性能:
+        单次 ``WHERE ts_code IN (...)`` 命中主键索引，
+        百级 ts_codes 单次查询 < 5ms。
+    """
+    cleaned = sorted({c for c in ts_codes if c})
+    if not cleaned:
+        return {}
+
+    placeholders = ",".join("?" * len(cleaned))
+    sql = (
+        f"SELECT ts_code, name FROM dim_sector "
+        f"WHERE ts_code IN ({placeholders})"
+    )
+    db = get_market_db()
+    try:
+        with db.connect(readonly=True) as conn:
+            rows = conn.execute(sql, cleaned).fetchall()
+    except Exception as exc:  # noqa: BLE001
+        _log.warning(
+            "get_sector_names 失败 ts_codes=%s: %s", cleaned[:5], exc
+        )
+        return {}
+    return {
+        str(r["ts_code"]): str(r["name"])
+        for r in rows
+        if r["name"]
+    }
+
+
 __all__ = [
     "SectorDailyRow",
     "SectorDailyHistory",
     "get_sector_daily_history",
+    "get_sector_names",
 ]

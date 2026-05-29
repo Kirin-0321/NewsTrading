@@ -15,10 +15,13 @@
     # 仅返回 JSON（脚本可消费，字段对齐 SectorDailyHistory.to_dict）
     python tools/sector_daily_query.py BK0871.DC --json
 
+    # 批量反查板块中文名（题材页板块名列用，stdout 总是 JSON）
+    python tools/sector_daily_query.py --names BK0871.DC,BK0477.DC
+
 退出码::
 
     0  success
-    1  板块查询无数据（rows 为空）
+    1  板块查询无数据（rows 为空）/ --names 模式下无任何命中
     2  参数错误
 """
 
@@ -40,6 +43,7 @@ if hasattr(sys.stdout, "reconfigure"):
 
 from services.market.sector_daily_query import (  # noqa: E402
     get_sector_daily_history,
+    get_sector_names,
 )
 
 
@@ -51,7 +55,13 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "ts_code",
-        help="板块代码，例 BK0477.DC（与 theme_predictions.sector_ts_code 对齐）",
+        help="板块代码，例 BK0477.DC（与 theme_predictions.sector_ts_code 对齐）；"
+             "在 --names 模式下作为逗号分隔的代码列表",
+    )
+    parser.add_argument(
+        "--names", action="store_true",
+        help="批量反查板块中文名模式：ts_code 视为逗号分隔列表，"
+             "stdout 总输出 JSON {ts_code: name}（其它参数被忽略）",
     )
     parser.add_argument(
         "--start", type=str, default=None,
@@ -87,6 +97,15 @@ def _validate_yyyymmdd(label: str, val) -> bool:
 
 def main(argv=None) -> int:
     args = _build_parser().parse_args(argv)
+
+    if args.names:
+        codes = [c.strip() for c in args.ts_code.split(",") if c.strip()]
+        if not codes:
+            print("[错误] --names 模式下 ts_code 不能为空", file=sys.stderr)
+            return 2
+        name_map = get_sector_names(codes)
+        print(json.dumps(name_map, ensure_ascii=False, indent=2))
+        return 0 if name_map else 1
 
     if not _validate_yyyymmdd("start", args.start):
         return 2
